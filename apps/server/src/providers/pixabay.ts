@@ -19,7 +19,6 @@ interface PixabayVideoHit {
   type: string; // "film" | "animation"
   tags: string;
   duration: number; // seconds
-  picture_id: string;
   videos: {
     large?: PixabayVideoVariant;
     medium: PixabayVideoVariant;
@@ -69,7 +68,11 @@ function pickVariant(
 
 function thumbnailUrl(hit: PixabayVideoHit): string | null {
   // Pixabay provides a thumbnail per variant; medium is the most reliable.
-  return hit.videos.medium?.thumbnail ?? hit.picture_id ? `https://pixabay.com/get/${hit.picture_id}.jpg` : null;
+  return hit.videos.medium?.thumbnail
+    ?? hit.videos.small?.thumbnail
+    ?? hit.videos.large?.thumbnail
+    ?? hit.videos.tiny?.thumbnail
+    ?? null;
 }
 
 const PIXABAY_LICENSE = "Pixabay Content License";
