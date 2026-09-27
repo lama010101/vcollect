@@ -108,7 +108,7 @@ export function getProject(id: string): Project | undefined {
       isVirtual: true,
     };
   }
-  const row = getProjectStmt().get(id) as ProjectRow | undefined;
+  const row = getProjectStmt().get(id) as unknown as ProjectRow | undefined;
   return row ? toProject(row) : undefined;
 }
 
@@ -116,7 +116,7 @@ export function getProject(id: string): Project | undefined {
 const getProjectRowStmt = lazy(`SELECT * FROM projects WHERE id = ?`);
 export function getProjectRow(id: string): ProjectRow | undefined {
   if (id === PROJECT_ID_ALL) return undefined;
-  return getProjectRowStmt().get(id) as ProjectRow | undefined;
+  return getProjectRowStmt().get(id) as unknown as ProjectRow | undefined;
 }
 
 const slugTakenStmt = lazy(`SELECT id FROM projects WHERE slug = ? OR id = ? LIMIT 1`);

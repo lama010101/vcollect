@@ -1,5 +1,7 @@
 // Thin fetch wrapper for the backend API.
-const base = "";
+// Same-origin "/api" in dev (Vite proxy) and when the backend serves the SPA.
+// Set VITE_API_URL to point the deployed frontend at a hosted backend.
+const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
 /** Extract a human-readable error message from a failed fetch response. */
 async function errorMessage(r: Response, url: string): Promise<string> {
@@ -614,8 +616,8 @@ export const api = {
   generateManifests: (projectId?: string) => postJson<unknown>(withProject("/api/manifests/generate", projectId)),
   review: (shotId: string, assetId: string, body: unknown) =>
     postJson<{ ok: boolean; status: string; reason?: string }>(`/api/review/${shotId}/${assetId}`, body),
-  assetFileUrl: (id: string) => `/api/assets/${id}/file`,
-  assetThumbUrl: (id: string) => `/api/assets/${id}/thumb`,
+  assetFileUrl: (id: string) => `${base}/api/assets/${id}/file`,
+  assetThumbUrl: (id: string) => `${base}/api/assets/${id}/thumb`,
   folders: (projectId?: string) => getJson<FoldersResponse>(withProject("/api/folders", projectId)),
   revealAsset: (id: string) => postJson<{ ok: boolean; error?: string }>(`/api/assets/${id}/reveal`),
   setAssetReady: (id: string, ready: boolean) =>
