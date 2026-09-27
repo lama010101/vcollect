@@ -1,0 +1,297 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===== Design tokens ===== */
+/* All theme colors live here as --twc-<palette>-<shade> variables. Tailwind
+ * maps each shade to rgb(var(--twc-*) / <alpha-value>) in tailwind.config.js,
+ * so switching themes is pure CSS: redefine the vars under [data-theme].
+ * Dark (default) = standard Tailwind palette values. */
+
+:root {
+  color-scheme: dark;
+  --color-bg: #0b1120;
+  --color-surface: #131c31;
+  --color-surface-2: #1a2438;
+  --color-border: #283549;
+  --color-accent: #38bdf8;
+  --color-text: #e2e8f0;
+  --color-scrollbar: #283549;
+  --color-scrollbar-hover: #384961;
+  --color-slider-track: #334155;
+  --color-slider-thumb: #0ea5e9;
+  --color-slider-thumb-border: #0c4a6e;
+  --color-input-bg: #0f172a;
+
+  /* slate */
+  --twc-slate-50: 248 250 252;   --twc-slate-100: 241 245 249;
+  --twc-slate-200: 226 232 240;  --twc-slate-300: 203 213 225;
+  --twc-slate-400: 148 163 184;  --twc-slate-500: 100 116 139;
+  --twc-slate-600: 71 85 105;    --twc-slate-700: 51 65 85;
+  --twc-slate-800: 30 41 59;     --twc-slate-900: 15 23 42;
+  --twc-slate-950: 2 6 23;
+  /* sky */
+  --twc-sky-50: 240 249 255;     --twc-sky-100: 224 242 254;
+  --twc-sky-200: 186 230 253;    --twc-sky-300: 125 211 252;
+  --twc-sky-400: 56 189 248;     --twc-sky-500: 14 165 233;
+  --twc-sky-600: 2 132 199;      --twc-sky-700: 3 105 161;
+  --twc-sky-800: 7 89 133;       --twc-sky-900: 12 74 110;
+  --twc-sky-950: 8 47 73;
+  /* emerald */
+  --twc-emerald-50: 236 253 245;  --twc-emerald-100: 209 250 229;
+  --twc-emerald-200: 167 243 208; --twc-emerald-300: 110 231 183;
+  --twc-emerald-400: 52 211 153;  --twc-emerald-500: 16 185 129;
+  --twc-emerald-600: 5 150 105;   --twc-emerald-700: 4 120 87;
+  --twc-emerald-800: 6 95 70;     --twc-emerald-900: 6 78 59;
+  --twc-emerald-950: 2 44 34;
+  /* rose */
+  --twc-rose-50: 255 241 242;    --twc-rose-100: 255 228 230;
+  --twc-rose-200: 254 205 211;   --twc-rose-300: 253 164 175;
+  --twc-rose-400: 251 113 133;   --twc-rose-500: 244 63 94;
+  --twc-rose-600: 225 29 72;     --twc-rose-700: 190 18 60;
+  --twc-rose-800: 159 18 57;     --twc-rose-900: 136 19 55;
+  --twc-rose-950: 76 5 25;
+  /* amber */
+  --twc-amber-50: 255 251 235;   --twc-amber-100: 254 243 199;
+  --twc-amber-200: 253 230 138;  --twc-amber-300: 252 211 77;
+  --twc-amber-400: 251 191 36;   --twc-amber-500: 245 158 11;
+  --twc-amber-600: 217 119 6;    --twc-amber-700: 180 83 9;
+  --twc-amber-800: 146 64 14;    --twc-amber-900: 120 53 15;
+  --twc-amber-950: 69 26 3;
+  /* violet */
+  --twc-violet-50: 245 243 255;  --twc-violet-100: 237 233 254;
+  --twc-violet-200: 221 214 254; --twc-violet-300: 196 181 253;
+  --twc-violet-400: 167 139 250; --twc-violet-500: 139 92 246;
+  --twc-violet-600: 124 58 237;  --twc-violet-700: 109 40 217;
+  --twc-violet-800: 91 33 182;   --twc-violet-900: 76 29 149;
+  --twc-violet-950: 46 16 101;
+  /* cyan */
+  --twc-cyan-50: 236 254 255;    --twc-cyan-100: 207 250 254;
+  --twc-cyan-200: 165 243 252;   --twc-cyan-300: 103 232 249;
+  --twc-cyan-400: 34 211 238;    --twc-cyan-500: 6 182 212;
+  --twc-cyan-600: 8 145 178;     --twc-cyan-700: 14 116 144;
+  --twc-cyan-800: 21 94 117;     --twc-cyan-900: 22 78 99;
+  --twc-cyan-950: 8 51 68;
+  /* teal */
+  --twc-teal-50: 240 253 250;    --twc-teal-100: 204 251 241;
+  --twc-teal-200: 153 246 228;   --twc-teal-300: 94 234 212;
+  --twc-teal-400: 45 212 191;    --twc-teal-500: 20 184 166;
+  --twc-teal-600: 13 148 136;    --twc-teal-700: 15 118 110;
+  --twc-teal-800: 17 94 89;      --twc-teal-900: 19 78 74;
+  --twc-teal-950: 4 47 46;
+  /* fuchsia */
+  --twc-fuchsia-50: 253 244 255; --twc-fuchsia-100: 250 232 255;
+  --twc-fuchsia-200: 245 208 254;--twc-fuchsia-300: 240 171 252;
+  --twc-fuchsia-400: 232 121 249;--twc-fuchsia-500: 217 70 239;
+  --twc-fuchsia-600: 192 38 211; --twc-fuchsia-700: 162 28 175;
+  --twc-fuchsia-800: 134 25 143; --twc-fuchsia-900: 112 26 117;
+  --twc-fuchsia-950: 74 4 78;
+}
+
+/* ===== Light theme ===== */
+/* slate inverts (950 ↔ 50). Accents remap non-linearly: deep shades used as
+ * tinted surfaces (800–950) become light tints; text shades (200–400) go
+ * darker for contrast; mid shades (500–700) stay vivid for buttons/badges. */
+[data-theme="light"] {
+  color-scheme: light;
+  --color-bg: #eef2f7;
+  --color-surface: #ffffff;
+  --color-surface-2: #f1f5f9;
+  --color-border: #d7e0ea;
+  --color-accent: #0284c7;
+  --color-text: #0f172a;
+  --color-scrollbar: #cbd5e1;
+  --color-scrollbar-hover: #94a3b8;
+  --color-slider-track: #cbd5e1;
+  --color-slider-thumb: #0284c7;
+  --color-slider-thumb-border: #bae6fd;
+  --color-input-bg: #ffffff;
+
+  /* slate — inverted ramp */
+  --twc-slate-50: 2 6 23;        --twc-slate-100: 15 23 42;
+  --twc-slate-200: 30 41 59;     --twc-slate-300: 51 65 85;
+  --twc-slate-400: 71 85 105;    --twc-slate-500: 100 116 139;
+  --twc-slate-600: 148 163 184;  --twc-slate-700: 203 213 225;
+  --twc-slate-800: 226 232 240;  --twc-slate-900: 241 245 249;
+  --twc-slate-950: 248 250 252;
+
+  /* accents — mapping: 50→950,100→900,200→800,300→700,400→600,500→500,
+     600→600,700→600,800→200,900→100,950→50 */
+  --twc-sky-50: 8 47 73;         --twc-sky-100: 12 74 110;
+  --twc-sky-200: 7 89 133;       --twc-sky-300: 3 105 161;
+  --twc-sky-400: 2 132 199;      --twc-sky-500: 14 165 233;
+  --twc-sky-600: 2 132 199;      --twc-sky-700: 2 132 199;
+  --twc-sky-800: 186 230 253;    --twc-sky-900: 224 242 254;
+  --twc-sky-950: 240 249 255;
+
+  --twc-emerald-50: 2 44 34;     --twc-emerald-100: 6 78 59;
+  --twc-emerald-200: 6 95 70;    --twc-emerald-300: 4 120 87;
+  --twc-emerald-400: 5 150 105;  --twc-emerald-500: 16 185 129;
+  --twc-emerald-600: 5 150 105;  --twc-emerald-700: 5 150 105;
+  --twc-emerald-800: 167 243 208;--twc-emerald-900: 209 250 229;
+  --twc-emerald-950: 236 253 245;
+
+  --twc-rose-50: 76 5 25;        --twc-rose-100: 136 19 55;
+  --twc-rose-200: 159 18 57;     --twc-rose-300: 190 18 60;
+  --twc-rose-400: 225 29 72;     --twc-rose-500: 244 63 94;
+  --twc-rose-600: 225 29 72;     --twc-rose-700: 225 29 72;
+  --twc-rose-800: 254 205 211;   --twc-rose-900: 255 228 230;
+  --twc-rose-950: 255 241 242;
+
+  --twc-amber-50: 69 26 3;       --twc-amber-100: 120 53 15;
+  --twc-amber-200: 146 64 14;    --twc-amber-300: 180 83 9;
+  --twc-amber-400: 217 119 6;    --twc-amber-500: 245 158 11;
+  --twc-amber-600: 217 119 6;    --twc-amber-700: 217 119 6;
+  --twc-amber-800: 253 230 138;  --twc-amber-900: 254 243 199;
+  --twc-amber-950: 255 251 235;
+
+  --twc-violet-50: 46 16 101;    --twc-violet-100: 76 29 149;
+  --twc-violet-200: 91 33 182;   --twc-violet-300: 109 40 217;
+  --twc-violet-400: 124 58 237;  --twc-violet-500: 139 92 246;
+  --twc-violet-600: 124 58 237;  --twc-violet-700: 124 58 237;
+  --twc-violet-800: 221 214 254; --twc-violet-900: 237 233 254;
+  --twc-violet-950: 245 243 255;
+
+  --twc-cyan-50: 8 51 68;        --twc-cyan-100: 22 78 99;
+  --twc-cyan-200: 21 94 117;     --twc-cyan-300: 14 116 144;
+  --twc-cyan-400: 8 145 178;     --twc-cyan-500: 6 182 212;
+  --twc-cyan-600: 8 145 178;     --twc-cyan-700: 8 145 178;
+  --twc-cyan-800: 165 243 252;   --twc-cyan-900: 207 250 254;
+  --twc-cyan-950: 236 254 255;
+
+  --twc-teal-50: 4 47 46;        --twc-teal-100: 19 78 74;
+  --twc-teal-200: 17 94 89;      --twc-teal-300: 15 118 110;
+  --twc-teal-400: 13 148 136;    --twc-teal-500: 20 184 166;
+  --twc-teal-600: 13 148 136;    --twc-teal-700: 13 148 136;
+  --twc-teal-800: 153 246 228;   --twc-teal-900: 204 251 241;
+  --twc-teal-950: 240 253 250;
+
+  --twc-fuchsia-50: 74 4 78;     --twc-fuchsia-100: 112 26 117;
+  --twc-fuchsia-200: 134 25 143; --twc-fuchsia-300: 162 28 175;
+  --twc-fuchsia-400: 192 38 211; --twc-fuchsia-500: 217 70 239;
+  --twc-fuchsia-600: 192 38 211; --twc-fuchsia-700: 192 38 211;
+  --twc-fuchsia-800: 245 208 254;--twc-fuchsia-900: 250 232 255;
+  --twc-fuchsia-950: 253 244 255;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* Custom scrollbar — subtle, SaaS-grade */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-scrollbar); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-scrollbar-hover); }
+
+/* ===== Reusable component classes ===== */
+@layer components {
+  /* Surface card */
+  .ui-card {
+    @apply rounded-xl bg-slate-800/60 border border-slate-700/60 backdrop-blur-sm;
+  }
+  .ui-card-hover {
+    @apply transition-all hover:border-slate-600 hover:bg-slate-800/80;
+  }
+  /* Button base */
+  .ui-btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg font-medium text-sm transition-all
+           disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-sky-500/40;
+  }
+  .ui-btn-primary {
+    @apply bg-sky-600 hover:bg-sky-500 text-white px-4 py-2;
+  }
+  .ui-btn-secondary {
+    @apply bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-2;
+  }
+  .ui-btn-danger {
+    @apply bg-rose-700 hover:bg-rose-600 text-white px-4 py-2;
+  }
+  .ui-btn-ghost {
+    @apply text-slate-400 hover:text-slate-200 hover:bg-slate-700/40 px-3 py-1.5;
+  }
+  .ui-btn-sm {
+    @apply text-xs px-2.5 py-1;
+  }
+  /* Input */
+  .ui-input {
+    @apply border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100
+           placeholder-slate-500 transition-colors
+           focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500/30;
+    background-color: var(--color-input-bg);
+  }
+  .ui-select {
+    @apply border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100
+           focus:outline-none focus:border-sky-500;
+    background-color: var(--color-input-bg);
+  }
+  /* Badge */
+  .ui-badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium;
+  }
+}
+
+/* Theme-aware input background for hand-rolled inputs (white in light mode,
+ * slate-900 in dark) — keeps them visible against card surfaces. */
+@layer utilities {
+  .bg-input { background-color: var(--color-input-bg); }
+}
+
+/* ===== Animations ===== */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in { animation: fadeIn 0.2s ease-out; }
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(100%); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.animate-slide-in { animation: slideIn 0.25s ease-out; }
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.animate-pulse-soft { animation: pulse-soft 2s ease-in-out infinite; }
+
+/* Larger, more visible range slider knob for the rating slider. */
+.rating-slider {
+  height: 1.5rem;
+}
+.rating-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 9999px;
+  background: var(--color-slider-thumb);
+  border: 2px solid var(--color-slider-thumb-border);
+  cursor: pointer;
+  margin-top: -0.5rem;
+}
+.rating-slider::-webkit-slider-runnable-track {
+  height: 0.5rem;
+  border-radius: 9999px;
+  background: var(--color-slider-track);
+}
+.rating-slider::-moz-range-thumb {
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 9999px;
+  background: var(--color-slider-thumb);
+  border: 2px solid var(--color-slider-thumb-border);
+  cursor: pointer;
+}
+.rating-slider::-moz-range-track {
+  height: 0.5rem;
+  border-radius: 9999px;
+  background: var(--color-slider-track);
+}

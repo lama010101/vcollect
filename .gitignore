@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Environment / secrets (PRD §33)
+.env
+.env.local
+.env.*.local
+
+# Generated footage acquisition output (PRD §6 / §41)
+THE_WORLD_IS_OURS/
+output/
+
+# Stray redirect artifact (created by `> nul` in a POSIX shell)
+nul
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Test artifacts
+coverage/
+playwright-report/
+test-results/
