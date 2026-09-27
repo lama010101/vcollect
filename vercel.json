@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "vite",
-  "installCommand": "npm install --include=dev",
+  "installCommand": "NODE_ENV=development npm install",
   "buildCommand": "npm run build -w @twio/web",
   "outputDirectory": "apps/web/dist"
 }
