@@ -109,6 +109,17 @@
   `npm run test:music-edit -w apps/server` with `MUSIC_EDIT_SONG` and
   `MUSIC_EDIT_VIDEOS` (≥4 comma-separated paths).
 
+## Progress tracking (REQUIRED)
+
+- `docs/progress.md` is the development log for the webapp. **Every change to
+  the webapp** — any merged PR, commit, or work session touching `apps/`,
+  `packages/`, the DB schema, config, or tooling — MUST add a dated entry to
+  its Changelog section before the work is considered done.
+- Format: `### YYYY-MM-DD — short title` followed by bullets covering what
+  changed, files touched, and verification result.
+- Also keep the Feature status and Milestones tables in that file current
+  when a change lands a feature or merges a PR.
+
 ## Scope guardrails
 
 - P0 + P1 only. No P2 AI vision. No general-purpose video editor (PRD §40) —
