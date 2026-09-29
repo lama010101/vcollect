@@ -64,6 +64,53 @@ function mmss(seconds: number): string {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
+/** Number input that commits in-range values as typed and clamps the draft on blur / Enter. */
+function NumberInput({
+  value,
+  min,
+  max,
+  step,
+  onCommit,
+}: {
+  value: number;
+  min: number;
+  max?: number;
+  step?: number;
+  onCommit: (v: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+  const commit = () => {
+    const n = Number(draft);
+    if (draft.trim() === "" || !Number.isFinite(n)) {
+      setDraft(String(value));
+      return;
+    }
+    const clamped = Math.min(max ?? Infinity, Math.max(min, n));
+    setDraft(String(clamped));
+    if (clamped !== value) onCommit(clamped);
+  };
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      step={step}
+      className="ui-input w-full"
+      value={draft}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        const n = Number(e.target.value);
+        if (e.target.value !== "" && n >= min && n <= (max ?? Infinity) && n !== value) onCommit(n);
+      }}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+      }}
+    />
+  );
+}
+
 function downloadJson(name: string, data: unknown): void {
   const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
   const a = document.createElement("a");
@@ -262,7 +309,12 @@ export function MusicEdit({
 
       {/* 1. Song */}
       <Card className="p-5 space-y-4">
-        <SectionTitle icon="♫">1. Song</SectionTitle>
+        <SectionTitle
+          icon="♫"
+          action={status?.ok ? <Badge tone="good">Beat analyzer ready · {status.detail}</Badge> : undefined}
+        >
+          1. Song
+        </SectionTitle>
         <div className="flex flex-wrap items-center gap-3">
           <select
             className="ui-input min-w-[16rem]"
@@ -394,7 +446,7 @@ export function MusicEdit({
           {settings.autoBeats ? (
             <label className="space-y-1">
               <span className="text-slate-400">Start offset (beats)</span>
-              <input type="number" min={0} max={7} className="ui-input w-full" value={settings.beatOffset} onChange={(e) => set("beatOffset", Math.max(0, Math.min(7, Number(e.target.value) || 0)))} />
+              <NumberInput min={0} max={7} step={1} value={settings.beatOffset} onCommit={(v) => set("beatOffset", Math.round(v))} />
             </label>
           ) : (
             <>
@@ -404,17 +456,17 @@ export function MusicEdit({
               </label>
               <label className="space-y-1">
                 <span className="text-slate-400">First cut at (s)</span>
-                <input type="number" min={0} step={0.001} className="ui-input w-full" value={settings.manualOffsetSeconds} onChange={(e) => set("manualOffsetSeconds", Math.max(0, Number(e.target.value) || 0))} />
+                <NumberInput min={0} max={600} step={0.001} value={settings.manualOffsetSeconds} onCommit={(v) => set("manualOffsetSeconds", v)} />
               </label>
             </>
           )}
           <label className="space-y-1">
             <span className="text-slate-400">Max speed-up (×)</span>
-            <input type="number" min={1} max={4} step={0.05} className="ui-input w-full" value={settings.maxSpeedUp} onChange={(e) => set("maxSpeedUp", Math.max(1, Number(e.target.value) || 1))} />
+            <NumberInput min={1} max={4} step={0.05} value={settings.maxSpeedUp} onCommit={(v) => set("maxSpeedUp", v)} />
           </label>
           <label className="space-y-1">
             <span className="text-slate-400">Max slow-down (×)</span>
-            <input type="number" min={0.25} max={1} step={0.05} className="ui-input w-full" value={settings.maxSlowDown} onChange={(e) => set("maxSlowDown", Math.min(1, Math.max(0.25, Number(e.target.value) || 1)))} />
+            <NumberInput min={0.25} max={1} step={0.05} value={settings.maxSlowDown} onCommit={(v) => set("maxSlowDown", v)} />
           </label>
           <label className="space-y-1">
             <span className="text-slate-400">Aspect</span>
