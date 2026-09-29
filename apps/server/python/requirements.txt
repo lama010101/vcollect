@@ -1,0 +1,5 @@
+# Beat analysis for the music-video editor (apps/server/src/musicEdit).
+# Install: pip install -r apps/server/python/requirements.txt
+librosa==0.11.0
+soundfile>=0.12.1
+numpy>=1.24

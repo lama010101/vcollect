@@ -7,6 +7,8 @@ import { ffmpegService } from "./ffmpeg.js";
 export interface ProbeStream {
   codec_type?: string;
   codec_name?: string;
+  sample_rate?: string;
+  channels?: number;
   width?: number;
   height?: number;
   r_frame_rate?: string; // e.g. "30000/1001"
@@ -88,6 +90,43 @@ export async function probe(file: string): Promise<ProbeResult> {
     codec: video.codec_name ?? null,
     container: format.format_name ?? null,
     sizeBytes: num(format.size),
+  };
+}
+
+export interface AudioProbeResult {
+  codec: string;
+  sampleRate: number | null;
+  channels: number | null;
+  durationSeconds: number;
+  container: string | null;
+}
+
+/** Probe the first audio stream. Throws if ffprobe fails, there is no audio
+ *  stream, or the duration is unknown. */
+export async function probeAudio(file: string): Promise<AudioProbeResult> {
+  const r = await ffmpegService.ffprobeExec(
+    ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", "-select_streams", "a:0", file],
+    "probe-audio",
+  );
+  if (r.exitCode !== 0) {
+    throw new Error(`ffprobe failed (exit ${r.exitCode}) for ${file}: ${r.stderr.slice(0, 500)}`);
+  }
+  let parsed: { streams?: ProbeStream[]; format?: ProbeFormat };
+  try {
+    parsed = JSON.parse(r.stdout || "{}");
+  } catch {
+    throw new Error(`ffprobe returned non-JSON for ${file}`);
+  }
+  const audio = (parsed.streams ?? []).find((s) => s.codec_type === "audio");
+  if (!audio) throw new Error(`No audio stream found in ${file} (corrupt or unsupported)`);
+  const duration = num(audio.duration) ?? num(parsed.format?.duration);
+  if (duration === null || duration <= 0) throw new Error(`Audio duration unknown for ${file}`);
+  return {
+    codec: audio.codec_name ?? "unknown",
+    sampleRate: num(audio.sample_rate),
+    channels: audio.channels ?? null,
+    durationSeconds: duration,
+    container: parsed.format?.format_name ?? null,
   };
 }
 

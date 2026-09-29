@@ -12,8 +12,8 @@ mapped to a 100-shot creative plan.
 P0 + P1 only (no P2 AI vision analysis). The system is fully usable **without a
 vision API key**. The DB schema keeps P2 fields (`semantic_score`, `logo_risk`,
 `person_risk`, `diversity_score`, `vision_status`, etc.) nullable so P2 is
-additive-only. No video editor (PRD §40); Mixkit + rough-cut export deferred
-(P3).
+additive-only. Mixkit + rough-cut export deferred (P3). The one editing
+feature is the beat-aligned **Music Edit** (see below).
 
 ## Stack
 
@@ -68,6 +68,8 @@ npm run dev
 | `npm run build` | Typecheck + build all workspaces |
 | `npm test` | Run all tests (Vitest shared + tsx server) |
 | `npm run typecheck` | Typecheck all workspaces |
+| `npx tsx apps/server/src/cli.ts music-edit -s song.m4a -v a.mp4 b.mp4 … -b 2 -o out.mp4 --edl edl.json` | Beat-aligned music video from the CLI |
+| `npm run test:music-edit -w apps/server` | Real-song acceptance test (needs `MUSIC_EDIT_SONG`, `MUSIC_EDIT_VIDEOS`) |
 
 ## FFmpeg resolution (locked decision)
 
@@ -81,6 +83,46 @@ executable once, in this priority:
 
 The app never depends exclusively on PATH. All video modules call this one
 service — there is exactly one code path that spawns ffmpeg/ffprobe.
+
+## Music Edit (beat-aligned music video)
+
+The **Music Edit** page (and `music-edit` CLI command) cuts a project's
+downloaded videos to a song, using beats detected in the song's waveform as
+the edit timeline:
+
+```
+song → ffmpeg decode (mono 22.05 kHz) → librosa onset strength + beat_track
+     → explicit beat timestamps → cut boundaries (every 1/2/4/8 beats)
+     → edit decision list (round-robin sources, per-source cursors, trim/retime)
+     → ffmpeg: one H.264 part per clip → joined → original song muxed as-is
+```
+
+- **Timing source of truth:** the detected beat timestamps (floats, cached per
+  song hash under `output/cache/beats/`). Cuts are `beat[i] → beat[i+N]`, the
+  song start/end close the first/last clip. A fixed BPM grid is used only when
+  automatic detection is switched off (manual BPM).
+- **Sources:** used in the listed order V1 → V2 → … → V1; each source keeps a
+  cursor so long clips are consumed progressively. Clips are trimmed and, within
+  `maxSlowDown`–`maxSpeedUp` (default 0.80–1.25), retimed to fill their
+  interval exactly; otherwise the next source is tried (or the source loops when
+  "Loop source videos" is on). Nothing fits → `INSUFFICIENT_VIDEO_MATERIAL`.
+- **Audio is never retimed:** AAC songs are stream-copied, others encoded to
+  AAC; the output is MP4 / H.264 / AAC at 30 fps (configurable) and never
+  upscaled beyond the largest source.
+- **EDL:** `POST /api/music-edit/plan` returns the full plan (source ranges,
+  output ranges, frame ranges, beat indices, speed, loops) before rendering;
+  each render also writes `<name>.edl.json` next to the MP4 in
+  `<project output>/music_edit/renders/`.
+- **API:** `GET /api/music-edit/status|songs|renders`, `POST /api/music-edit/songs`
+  (raw body, `?name=`), `POST /api/music-edit/analyze|plan|render`,
+  `GET /api/music-edit/render/:id`, `POST /api/music-edit/render/:id/cancel`.
+
+Requires Python 3.9+ with the analyzer dependencies:
+
+```bash
+pip install -r apps/server/python/requirements.txt   # librosa, soundfile, numpy
+# optional: PYTHON_BIN_PATH=/path/to/venv/bin/python in .env.local
+```
 
 ## No mock / dry-run mode
 

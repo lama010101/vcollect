@@ -1,6 +1,7 @@
 // Thin fetch wrapper for the backend API.
 // Same-origin "/api" in dev (Vite proxy) and when the backend serves the SPA.
 // Set VITE_API_URL to point the deployed frontend at a hosted backend.
+import type { BeatAnalysis, EditPlan, MusicEditSettings } from "@twio/shared";
 const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
 /** Extract a human-readable error message from a failed fetch response. */
@@ -479,6 +480,62 @@ export interface ProjectSettingsUpdate {
   candidatesPerProvider?: number | null;
 }
 
+// --- Music edit (beat-aligned music-video editor) ---------------------------
+export interface MusicEditStatus {
+  ok: boolean;
+  python: string;
+  detail: string;
+}
+export interface MusicSong {
+  name: string;
+  sizeBytes: number;
+  url: string;
+  modifiedAt: string;
+}
+export type MusicAnalysis = BeatAnalysis & { audioDuration: number; audioCodec: string; cached: boolean };
+export interface MusicEditSource {
+  id: string;
+  label: string;
+  duration: number;
+  width: number;
+  height: number;
+}
+export interface MusicRenderJob {
+  id: string;
+  projectId: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  progress: { phase: "segments" | "mux" | "verify"; done: number; total: number };
+  error: { code: string; message: string } | null;
+  outputUrl: string | null;
+  edlUrl: string;
+  startedAt: string;
+  finishedAt: string | null;
+  durationSeconds: number | null;
+  segmentCount: number;
+}
+export interface MusicRenderedFile {
+  name: string;
+  url: string;
+  edlUrl: string | null;
+  sizeBytes: number;
+  createdAt: string;
+}
+export interface MusicEditRequest {
+  song: string;
+  assetIds: string[];
+  settings: Partial<MusicEditSettings>;
+}
+
+async function postBinary<T>(url: string, body: Blob): Promise<T> {
+  const r = await fetch(base + url, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body,
+  });
+  if (!r.ok) throw new Error(await errorMessage(r, url));
+  return r.json() as Promise<T>;
+}
+
 /** Append `?project=<id>` to a URL if projectId is provided and not the default. */
 function withProject(url: string, projectId?: string): string {
   if (!projectId) return url;
@@ -664,4 +721,18 @@ export const api = {
   getTaskConfig: () => getJson<{ config: TaskConfig }>("/api/tasks/config"),
   setTaskConfig: (maxConcurrent: number) =>
     putJson<{ ok: boolean; config: TaskConfig; tasks: Task[] }>("/api/tasks/config", { maxConcurrent }),
+  // --- Music edit ---
+  musicEditStatus: () => getJson<MusicEditStatus>("/api/music-edit/status"),
+  musicSongs: (projectId: string) => getJson<{ songs: MusicSong[] }>(withProject("/api/music-edit/songs", projectId)),
+  uploadMusicSong: (projectId: string, file: File) =>
+    postBinary<{ song: MusicSong }>(withProject(`/api/music-edit/songs?name=${encodeURIComponent(file.name)}`, projectId), file),
+  analyzeMusicSong: (projectId: string, song: string) =>
+    postJson<{ analysis: MusicAnalysis }>(withProject("/api/music-edit/analyze", projectId), { song }),
+  planMusicEdit: (projectId: string, req: MusicEditRequest) =>
+    postJson<{ analysis: MusicAnalysis; sources: MusicEditSource[]; plan: EditPlan }>(withProject("/api/music-edit/plan", projectId), req),
+  renderMusicEdit: (projectId: string, req: MusicEditRequest) =>
+    postJson<{ job: MusicRenderJob }>(withProject("/api/music-edit/render", projectId), req),
+  musicRenderJob: (id: string) => getJson<{ job: MusicRenderJob }>(`/api/music-edit/render/${encodeURIComponent(id)}`),
+  cancelMusicRender: (id: string) => postJson<{ job: MusicRenderJob }>(`/api/music-edit/render/${encodeURIComponent(id)}/cancel`),
+  musicRenders: (projectId: string) => getJson<{ renders: MusicRenderedFile[] }>(withProject("/api/music-edit/renders", projectId)),
 };
