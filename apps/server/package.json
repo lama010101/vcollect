@@ -9,7 +9,8 @@
     "dev": "tsx watch src/index.ts",
     "migrate": "tsx src/cli.ts migrate",
     "seed": "tsx src/cli.ts seed",
-    "start": "node --enable-source-maps dist/index.js"
+    "start": "node --enable-source-maps dist/index.js",
+    "test:music-edit": "tsx test/music-edit.acceptance.ts"
   },
   "dependencies": {
     "@twio/shared": "*",

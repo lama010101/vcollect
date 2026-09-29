@@ -142,3 +142,73 @@ export interface Project {
   enforceMinAcquireRating?: boolean;
   candidatesPerProvider?: number | null; // perPage per provider per query
 }
+
+// =============================================================================
+// Music edit — beat analysis + edit decision list (EDL)
+// =============================================================================
+export interface BeatPoint {
+  time: number; // seconds from the start of the song, as detected
+  strength: number | null; // normalised onset strength at the beat (0..1)
+}
+
+export interface BeatAnalysis {
+  bpm: number; // tempo estimate from the analyzer
+  duration: number; // decoded song duration (seconds)
+  beats: BeatPoint[];
+  downbeats: number[] | null; // null = analyzer does not detect bars
+  analyzer: { name: string; version: string; sampleRate: number; hopLength: number };
+  /** Inter-beat-interval stats — shows how far the song deviates from a grid. */
+  interval: { min: number; max: number; mean: number; stdDev: number };
+}
+
+export type EdlBoundaryKind = "audio_start" | "beat" | "manual_grid" | "audio_end";
+
+export interface EdlEntry {
+  index: number;
+  sourceId: string;
+  source: string; // display label / file name
+  sourceStart: number; // seconds in the source
+  sourceEnd: number; // seconds in the source (< sourceStart when looped)
+  sourceConsumed: number; // seconds of source footage used
+  sourceLoops: number; // times the source wrapped to 0 inside this clip
+  /** Contiguous source ranges read for this clip, in order (>1 only when looped). */
+  pieces: Array<{ start: number; end: number }>;
+  speed: number; // sourceConsumed / outputDuration (>1 = faster)
+  outputStart: number; // seconds in the song — a detected beat (or 0)
+  outputEnd: number;
+  outputDuration: number;
+  frameStart: number;
+  frameEnd: number;
+  startBeat: number | null; // index into analysis.beats
+  endBeat: number | null;
+  startKind: EdlBoundaryKind;
+  endKind: EdlBoundaryKind;
+  restartedSource: boolean; // cursor wrapped back to 0 before this clip
+}
+
+export interface EditPlanStats {
+  segmentCount: number;
+  averageClipDuration: number;
+  minClipDuration: number;
+  maxClipDuration: number;
+  retimedCount: number;
+  loopedCount: number;
+  minSpeed: number;
+  maxSpeed: number;
+  sourceUsage: Record<string, number>;
+}
+
+export interface EditPlan {
+  version: 1;
+  timing: "detected_beats" | "manual_grid";
+  beatsPerCut: number;
+  bpm: number;
+  beatCount: number;
+  audioDuration: number;
+  fps: number;
+  width: number;
+  height: number;
+  totalFrames: number;
+  entries: EdlEntry[];
+  stats: EditPlanStats;
+}

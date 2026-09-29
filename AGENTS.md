@@ -95,10 +95,25 @@
   When LLM is not configured, the toggle is disabled and only the
   conventional parser is available.
 
+- **Music edit (beat-aligned music video):** `apps/server/src/musicEdit/`.
+  `beatAnalysis.ts` decodes the song via `ffmpegService` and runs
+  `apps/server/python/beat_analysis.py` (librosa; interpreter from
+  `PYTHON_BIN_PATH` or `python3`), caching results by content hash in
+  `OUTPUT_ROOT/cache/beats/`. `edl.ts` is the pure, deterministic planner —
+  cuts are the detected beat timestamps (`beat[i] → beat[i+N]`), never a BPM
+  grid unless `autoBeats` is off. `render.ts` renders one raw H.264 part per
+  EDL entry via `ffmpegService`, byte-joins them and muxes the untouched song.
+  Routes: `routes/musicEdit.ts` (`/api/music-edit/*`); UI: `pages/MusicEdit.tsx`.
+  Errors are `MusicEditError` (status + code). Unit tests:
+  `apps/server/test/music-edit.node.test.ts`; real-media acceptance:
+  `npm run test:music-edit -w apps/server` with `MUSIC_EDIT_SONG` and
+  `MUSIC_EDIT_VIDEOS` (≥4 comma-separated paths).
+
 ## Scope guardrails
 
-- P0 + P1 only. No P2 AI vision. No video editor (PRD §40). No Mixkit scraper
-  (PRD §3.3 — manual import only, P3). No rough-cut/EDL export (P3).
+- P0 + P1 only. No P2 AI vision. No general-purpose video editor (PRD §40) —
+  the beat-aligned Music Edit is the only editing feature. No Mixkit scraper
+  (PRD §3.3 — manual import only, P3). No rough-cut export (P3).
 - P2 DB columns are kept nullable so P2 is additive-only.
 
 ## Environment

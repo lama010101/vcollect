@@ -54,6 +54,8 @@ export const appConfigSchema = z.object({
   host: z.string().default("127.0.0.1"),
   ffmpegBinPath: z.string().default(""),
   ffprobeBinPath: z.string().default(""),
+  // Python interpreter for the beat analyzer (empty = python3 / python on PATH).
+  pythonBinPath: z.string().default(""),
   outputDir: z.string().default("THE_WORLD_IS_OURS"),
   maxDownloadMb: z.number().int().positive().default(600),
   candidatesPerProvider: z.number().int().positive().max(80).default(30),
@@ -127,3 +129,39 @@ export const importScriptSchema = z.object({
   useLlm: z.boolean().default(false),
 });
 export type ImportScriptInput = z.infer<typeof importScriptSchema>;
+
+// --- Music edit (beat-aligned music-video editor) ----------------------------
+export const beatsPerCutSchema = z.union([z.literal(1), z.literal(2), z.literal(4), z.literal(8)]);
+
+export const musicEditSettingsSchema = z.object({
+  // true = cut on beats detected in the waveform; false = manual BPM grid.
+  autoBeats: z.boolean().default(true),
+  beatsPerCut: beatsPerCutSchema.default(2),
+  // Skip this many detected beats before the first beat-grouped cut
+  // (shifts the phase of 2/4/8-beat groups).
+  beatOffset: z.number().int().min(0).max(7).default(0),
+  // Manual grid — only used when autoBeats is false.
+  manualBpm: z.number().min(20).max(300).optional(),
+  manualOffsetSeconds: z.number().min(0).max(600).default(0),
+  maxSpeedUp: z.number().min(1).max(4).default(1.25),
+  maxSlowDown: z.number().min(0.25).max(1).default(0.8),
+  // Permit retiming beyond the limits when no source fits (off by default).
+  allowExtremeRetime: z.boolean().default(false),
+  loopSource: z.boolean().default(false),
+  fps: z.number().int().min(12).max(60).default(30),
+  // Output height cap; never exceeds the tallest source (no upscaling).
+  maxOutputHeight: z.number().int().min(240).max(2160).default(1080),
+  aspect: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
+});
+export type MusicEditSettings = z.infer<typeof musicEditSettingsSchema>;
+
+export const musicEditAnalyzeSchema = z.object({
+  song: z.string().min(1).max(255),
+});
+
+export const musicEditPlanSchema = z.object({
+  song: z.string().min(1).max(255),
+  assetIds: z.array(z.string().min(1)).min(1).max(500),
+  settings: musicEditSettingsSchema.default({}),
+});
+export type MusicEditPlanInput = z.infer<typeof musicEditPlanSchema>;

@@ -43,6 +43,7 @@ const raw: AppConfig = appConfigSchema.parse({
   host: process.env.HOST ?? "127.0.0.1",
   ffmpegBinPath: process.env.FFMPEG_BIN_PATH ?? "",
   ffprobeBinPath: process.env.FFPROBE_BIN_PATH ?? "",
+  pythonBinPath: process.env.PYTHON_BIN_PATH ?? "",
   outputDir: process.env.OUTPUT_DIR ?? "output",
   maxDownloadMb: num(process.env.MAX_DOWNLOAD_MB, 600),
   candidatesPerProvider: num(process.env.CANDIDATES_PER_PROVIDER, 30),

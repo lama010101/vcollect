@@ -86,6 +86,7 @@ import {
 } from "./acquisition/tasks.js";
 import { getDashboard } from "./routes/dashboard.js";
 import { applyReview } from "./routes/review.js";
+import { registerMusicEditRoutes } from "./routes/musicEdit.js";
 import { assetAbsolutePath, getFolders, revealInExplorer, getProjectRow } from "./routes/folders.js";
 import { generateFootageManifest, generateLicenseManifest } from "./manifests/csv.js";
 import { generateJsonManifest } from "./manifests/json.js";
@@ -152,6 +153,9 @@ export async function buildServer() {
     prefix: "/files/",
     decorateReply: false,
   });
+
+  // --- Music edit (beat-aligned music-video editor) ---------------------------
+  await registerMusicEditRoutes(app);
 
   // --- Projects (multi-project management) ------------------------------------
   app.get("/api/projects", async () => {

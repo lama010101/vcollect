@@ -8,6 +8,7 @@ import { Folders } from "./pages/Folders.js";
 import { SearchPage } from "./pages/Search.js";
 import { Projects } from "./pages/Projects.js";
 import { ImportScript } from "./pages/ImportScript.js";
+import { MusicEdit } from "./pages/MusicEdit.js";
 import { TasksPanel } from "./components/TasksPanel.js";
 import { useToast } from "./components/useToast.js";
 
@@ -21,6 +22,7 @@ type View =
   | { name: "search" }
   | { name: "projects" }
   | { name: "import" }
+  | { name: "music" }
   | { name: "help" };
 
 const PROJECT_STORAGE_KEY = "twio.activeProjectId";
@@ -31,6 +33,7 @@ const NAV_ITEMS: Array<{ key: View["name"]; label: string; icon: string; desc: s
   { key: "dashboard", label: "Dashboard", icon: "▣", desc: "Overview & actions" },
   { key: "import", label: "Import Script", icon: "♪", desc: "Paste script to create shots + timeline" },
   { key: "timeline", label: "Timeline", icon: "▬", desc: "Shot schedule" },
+  { key: "music", label: "Music Edit", icon: "♫", desc: "Beat-synced music video from a song" },
   { key: "search", label: "Search", icon: "⌕", desc: "Find assets" },
   { key: "folders", label: "Folders", icon: "▤", desc: "Browse files" },
   { key: "projects", label: "Projects", icon: "◇", desc: "Manage projects" },
@@ -313,6 +316,13 @@ export default function App() {
               <div className="text-center py-20 text-slate-500">
                 <div className="text-4xl mb-3 opacity-40">◇</div>
                 <p>Select a specific project to import a script.</p>
+              </div>
+            )}
+            {view.name === "music" && !isAllProjects && <MusicEdit projectId={activeProjectId} onToast={push} />}
+            {view.name === "music" && isAllProjects && (
+              <div className="text-center py-20 text-slate-500">
+                <div className="text-4xl mb-3 opacity-40">◇</div>
+                <p>Select a specific project to edit a music video.</p>
               </div>
             )}
             {view.name === "help" && <Help />}

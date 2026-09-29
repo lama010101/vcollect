@@ -123,10 +123,14 @@ export interface ExecResult {
   stderr: string;
 }
 
-async function run(bin: string, args: string[], opts: { logTag?: string } = {}): Promise<ExecResult> {
+async function run(
+  bin: string,
+  args: string[],
+  opts: { logTag?: string; signal?: AbortSignal } = {},
+): Promise<ExecResult> {
   if (opts.logTag) console.debug(`[ffmpeg] ${opts.logTag}: ${bin} ${args.join(" ")}`);
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { windowsHide: true });
+    const child = spawn(bin, args, { windowsHide: true, signal: opts.signal });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -174,9 +178,9 @@ export class FfmpegService {
     return this.ffprobe.path;
   }
 
-  async ffmpegExec(args: string[], tag?: string): Promise<ExecResult> {
+  async ffmpegExec(args: string[], tag?: string, opts: { signal?: AbortSignal } = {}): Promise<ExecResult> {
     await this.ensure();
-    return run(this.ffmpegPath(), args, { logTag: tag });
+    return run(this.ffmpegPath(), args, { logTag: tag, signal: opts.signal });
   }
 
   async ffprobeExec(args: string[], tag?: string): Promise<ExecResult> {
