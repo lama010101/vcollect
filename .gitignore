@@ -42,3 +42,5 @@ test-results/
 
 # Python
 __pycache__/
+.venv/
+*.pyc

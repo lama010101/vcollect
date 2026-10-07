@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EditPlan, MusicEditSettings } from "@twio/shared";
 import {
   api,
+  ASSETS_CHANGED_EVENT,
   type Asset,
   type MusicAnalysis,
   type MusicEditRequest,
@@ -14,7 +15,7 @@ import { Badge, Button, Card, EmptyState, ProgressBar, SectionTitle, Spinner, St
 
 /**
  * Music Edit — beat-aligned music-video editor.
- * Song → waveform beat detection (server, librosa) → edit decision list cut
+ * Song → waveform beat detection (server, built-in tracker) → edit decision list cut
  * on the detected beats → FFmpeg render with the original song untouched.
  * Source videos are the project's downloaded assets, used round-robin in the
  * order listed here.
@@ -58,6 +59,46 @@ const CUT_MODES: Array<{ value: Settings["beatsPerCut"]; label: string }> = [
 ];
 
 const EDL_PREVIEW_ROWS = 300;
+
+// --- Per-project session persistence ------------------------------------------
+// All Music Edit work (song choice, clip order, settings, analysis, built EDL,
+// active render job) is stored in localStorage so a refresh loses nothing.
+
+const storageKey = (projectId: string) => `twio.musicEdit.${projectId}`;
+
+interface PersistedMusicEdit {
+  song: string;
+  orderAssets: Asset[];
+  settings: Settings;
+  libraryQuery: string;
+  analysis: MusicAnalysis | null;
+  plan: EditPlan | null;
+  /** JSON.stringify(request) that produced `plan` — plan stays valid only
+   *  while the current inputs still match this key. */
+  planKey: string | null;
+  /** id of the last render job — re-fetched on load to resume polling. */
+  jobId: string | null;
+}
+
+function loadPersisted(projectId: string): PersistedMusicEdit | null {
+  try {
+    const raw = localStorage.getItem(storageKey(projectId));
+    if (!raw) return null;
+    const p = JSON.parse(raw) as Partial<PersistedMusicEdit>;
+    return {
+      song: typeof p.song === "string" ? p.song : "",
+      orderAssets: Array.isArray(p.orderAssets) ? (p.orderAssets as Asset[]) : [],
+      settings: { ...DEFAULT_SETTINGS, ...(typeof p.settings === "object" && p.settings ? p.settings : {}) },
+      libraryQuery: typeof p.libraryQuery === "string" ? p.libraryQuery : "",
+      analysis: p.analysis ?? null,
+      plan: p.plan ?? null,
+      planKey: typeof p.planKey === "string" ? p.planKey : null,
+      jobId: typeof p.jobId === "string" ? p.jobId : null,
+    };
+  } catch {
+    return null;
+  }
+}
 
 function mmss(seconds: number): string {
   const s = Math.max(0, Math.round(seconds));
@@ -127,23 +168,33 @@ export function MusicEdit({
   projectId: string;
   onToast: (text: string, tone?: "info" | "success" | "error") => void;
 }) {
+  // Hydrate the persisted session synchronously on first render — doing it in
+  // a useEffect would lose data under StrictMode (effects double-run and a
+  // persist pass with defaults could overwrite the blob before restore).
+  const initialRef = useRef<PersistedMusicEdit | null | undefined>(undefined);
+  if (initialRef.current === undefined) initialRef.current = loadPersisted(projectId);
+  const initial = initialRef.current;
+
   const [status, setStatus] = useState<MusicEditStatus | null>(null);
   const [songs, setSongs] = useState<MusicSong[]>([]);
-  const [song, setSong] = useState<string>("");
+  const [song, setSong] = useState<string>(initial?.song ?? "");
   const [uploading, setUploading] = useState(false);
-  const [analysis, setAnalysis] = useState<MusicAnalysis | null>(null);
+  const [analysis, setAnalysis] = useState<MusicAnalysis | null>(initial?.analysis ?? null);
   const [analyzing, setAnalyzing] = useState(false);
   const [library, setLibrary] = useState<Asset[]>([]);
-  const [libraryQuery, setLibraryQuery] = useState("");
+  const [libraryQuery, setLibraryQuery] = useState(initial?.libraryQuery ?? "");
   const [libraryLoading, setLibraryLoading] = useState(false);
-  const [order, setOrder] = useState<Asset[]>([]);
-  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
-  const [plan, setPlan] = useState<EditPlan | null>(null);
+  const [order, setOrder] = useState<Asset[]>(initial?.orderAssets ?? []);
+  const [settings, setSettings] = useState<Settings>(initial?.settings ?? DEFAULT_SETTINGS);
+  const [plan, setPlan] = useState<EditPlan | null>(initial?.plan ?? null);
   const [planning, setPlanning] = useState(false);
   const [job, setJob] = useState<MusicRenderJob | null>(null);
   const [renders, setRenders] = useState<MusicRenderedFile[]>([]);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  /** JSON key of the request that produced `plan` — the plan stays valid only
+   *  while current inputs still serialize to the same key. */
+  const planKeyRef = useRef<string | null>(initial?.planKey ?? null);
 
   const loadSongs = useCallback(async () => {
     const r = await api.musicSongs(projectId);
@@ -160,27 +211,94 @@ export function MusicEdit({
     api.musicEditStatus().then(setStatus).catch(() => setStatus(null));
   }, []);
 
+  // Restore the persisted session for this project (or start clean). Runs on
+  // mount and whenever the active project changes.
   useEffect(() => {
-    setSong("");
-    setAnalysis(null);
-    setOrder([]);
-    setPlan(null);
-    loadSongs().catch((e) => setError((e as Error).message));
+    const saved = loadPersisted(projectId);
+    setSong(saved?.song ?? "");
+    setAnalysis(saved?.analysis ?? null);
+    setOrder(saved?.orderAssets ?? []);
+    setSettings(saved?.settings ?? DEFAULT_SETTINGS);
+    setLibraryQuery(saved?.libraryQuery ?? "");
+    setPlan(saved?.plan ?? null);
+    planKeyRef.current = saved?.planKey ?? null;
+    setJob(null);
+    // A render started before the refresh keeps running server-side —
+    // re-fetch it so progress polling resumes.
+    if (saved?.jobId) {
+      api
+        .musicRenderJob(saved.jobId)
+        .then((r) => setJob(r.job))
+        .catch(() => {}); // job gone (server restart) → start fresh
+    }
+    loadSongs()
+      .then((list) => {
+        // The saved song may have been deleted server-side — drop the stale ref.
+        if (saved?.song && !list.some((s) => s.name === saved.song)) setSong("");
+      })
+      .catch((e) => setError((e as Error).message));
     loadRenders().catch(() => {});
   }, [projectId, loadSongs, loadRenders]);
 
-  // Downloaded project assets (debounced search).
+  // Persist the session on every meaningful change.
+  useEffect(() => {
+    const payload: PersistedMusicEdit = {
+      song,
+      orderAssets: order,
+      settings,
+      libraryQuery,
+      analysis,
+      plan,
+      planKey: planKeyRef.current,
+      jobId: job?.id ?? null,
+    };
+    try {
+      localStorage.setItem(storageKey(projectId), JSON.stringify(payload));
+    } catch { /* quota/serialization — persistence is best-effort */ }
+  }, [projectId, song, order, settings, libraryQuery, analysis, plan, job?.id]);
+
+  // Downloaded project assets (debounced search). `libraryRefresh` bumps when
+  // files are dropped onto the app so new uploads appear without a reload.
+  const [libraryRefresh, setLibraryRefresh] = useState(0);
+  const [syncing, setSyncing] = useState(false);
+  // Manual "refresh from folder" — scans the project's assets folder for
+  // videos placed there outside the app and reloads the library.
+  const refreshLibrary = async () => {
+    setSyncing(true);
+    setError(null);
+    try {
+      const r = await api.syncProjectAssets(projectId);
+      if (r.added > 0) {
+        onToast(`Registered ${r.added} video${r.added === 1 ? "" : "s"} from the project folder`, "success");
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSyncing(false);
+      setLibraryRefresh((n) => n + 1); // reload the library list
+    }
+  };
+  useEffect(() => {
+    const onChanged = () => setLibraryRefresh((n) => n + 1);
+    window.addEventListener(ASSETS_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(ASSETS_CHANGED_EVENT, onChanged);
+  }, []);
   useEffect(() => {
     setLibraryLoading(true);
     const t = setTimeout(() => {
+      // Sync the project's assets folder first — the source library is every
+      // video on disk, no matter how it got there (downloads, drag & drop, or
+      // files copied in manually outside the app).
       api
-        .searchAssetsAdvanced({ q: libraryQuery.trim() || undefined, downloadedOnly: true, sort: "newest_downloaded", limit: 200 }, projectId)
+        .syncProjectAssets(projectId)
+        .catch(() => {}) // sync failure must not hide existing assets
+        .then(() => api.searchAssetsAdvanced({ q: libraryQuery.trim() || undefined, downloadedOnly: true, sort: "newest_downloaded", limit: 200 }, projectId))
         .then((r) => setLibrary(r.assets.filter((a) => a.local_path)))
         .catch((e) => setError((e as Error).message))
         .finally(() => setLibraryLoading(false));
     }, 250);
     return () => clearTimeout(t);
-  }, [libraryQuery, projectId]);
+  }, [libraryQuery, projectId, libraryRefresh]);
 
   // Poll the active render.
   useEffect(() => {
@@ -202,9 +320,6 @@ export function MusicEdit({
     return () => clearInterval(t);
   }, [job, onToast, loadRenders]);
 
-  // Any change to inputs invalidates the previewed plan.
-  useEffect(() => setPlan(null), [song, order, settings]);
-
   const request = useMemo<MusicEditRequest>(
     () => ({
       song,
@@ -213,6 +328,14 @@ export function MusicEdit({
     }),
     [song, order, settings],
   );
+  const requestKey = useMemo(() => JSON.stringify(request), [request]);
+
+  // The previewed plan stays valid only while inputs still match the request
+  // it was built from — any change to song/order/settings invalidates it, but
+  // restoring the exact same inputs (e.g. after a page refresh) keeps it.
+  useEffect(() => {
+    if (plan && planKeyRef.current !== requestKey) setPlan(null);
+  }, [plan, requestKey]);
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) => setSettings((s) => ({ ...s, [key]: value }));
 
@@ -253,6 +376,7 @@ export function MusicEdit({
     try {
       const r = await api.planMusicEdit(projectId, request);
       setAnalysis(r.analysis);
+      planKeyRef.current = requestKey;
       setPlan(r.plan);
     } catch (e) {
       setError((e as Error).message);
@@ -291,8 +415,7 @@ export function MusicEdit({
       {status && !status.ok && (
         <Card className="p-4 border border-amber-700/40">
           <p className="text-sm text-amber-300">
-            Beat analyzer unavailable ({status.python}): {status.detail}. Install with{" "}
-            <code className="text-xs">pip install -r apps/server/python/requirements.txt</code> or set PYTHON_BIN_PATH.
+            Beat analyzer unavailable: {status.detail}
           </p>
         </Card>
       )}
@@ -367,7 +490,16 @@ export function MusicEdit({
 
       {/* 2. Videos */}
       <Card className="p-5 space-y-4">
-        <SectionTitle icon="▤">2. Source videos (used in this order: V1 → V2 → … → V1)</SectionTitle>
+        <SectionTitle
+          icon="▤"
+          action={
+            <Button size="sm" variant="ghost" onClick={refreshLibrary} disabled={syncing || libraryLoading}>
+              {syncing ? "Scanning folder…" : "↻ Refresh from folder"}
+            </Button>
+          }
+        >
+          2. Source videos (used in this order: V1 → V2 → … → V1)
+        </SectionTitle>
         <div className="grid md:grid-cols-2 gap-4">
           <div className="space-y-2">
             <input

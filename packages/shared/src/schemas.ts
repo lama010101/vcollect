@@ -54,8 +54,12 @@ export const appConfigSchema = z.object({
   host: z.string().default("127.0.0.1"),
   ffmpegBinPath: z.string().default(""),
   ffprobeBinPath: z.string().default(""),
-  // Python interpreter for the beat analyzer (empty = python3 / python on PATH).
+  // Python engine (apps/server/python/twio_engine): leave empty to use the
+  // managed .venv, which is auto-created + pip-installed on first use. Set to
+  // bypass the venv (interpreter must already have requirements installed).
   pythonBinPath: z.string().default(""),
+  // TWIO_ENGINE_DISABLED=1 → every engine feature reports ENGINE_DISABLED.
+  engineDisabled: z.boolean().default(false),
   outputDir: z.string().default("THE_WORLD_IS_OURS"),
   maxDownloadMb: z.number().int().positive().default(600),
   candidatesPerProvider: z.number().int().positive().max(80).default(30),

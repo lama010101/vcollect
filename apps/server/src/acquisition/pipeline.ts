@@ -470,7 +470,7 @@ export async function acquireShot(
           totalBytes: total,
           pct: total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0,
         }),
-        shot.search_query,
+        { projectSlug: project?.slug ?? projectId, searchQuery: shot.search_query },
         controller,
       );
       onAssetProgress?.(null);
@@ -962,7 +962,7 @@ export async function acquireAssetById(
         totalBytes: total,
         pct: total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0,
       }),
-      shot?.search_query ?? "unknown",
+      { projectSlug: getProjectRow(projectId)?.slug ?? projectId, searchQuery: shot?.search_query },
       controller,
     );
     onAssetProgress?.(null);

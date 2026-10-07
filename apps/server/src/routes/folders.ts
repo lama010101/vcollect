@@ -2,17 +2,16 @@
 // Folder tree (PRD §6 output layout) — groups downloaded assets by their
 // section so the UI can show the on-disk structure with asset details.
 //
-// Multi-project: real asset files are stored directly under OUTPUT_ROOT in
-// subfolders named after the search query that discovered them. The grouping
-// here is by section (derived from the shot_assets → shots.section join),
-// NOT from the physical path.
+// Multi-project: real asset files live in each project's dedicated folder
+// (OUTPUT_ROOT/<slug>/assets/). The grouping here is by section (derived from
+// the shot_assets → shots.section join), NOT from the physical path.
 //
 // `getFolders(projectId)` filters assets by project; for the virtual "__ALL__"
 // project it aggregates every project's assets and tags each with its project.
 // =============================================================================
 
 import { exec } from "node:child_process";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { OUTPUT_ROOT, projectPaths, type ProjectPaths } from "../config.js";
 import { db } from "../db/client.js";
@@ -41,8 +40,8 @@ export interface FolderAsset {
 export interface FolderNode {
   folder: string; // e.g. "001_intro"
   section: string | null; // e.g. "INTRO"
-  relativePath: string; // e.g. <slug>/Collector/001_intro
-  absolutePath: string; // e.g. D:\...\OUTPUT_ROOT\<slug>\Collector\001_intro
+  relativePath: string; // e.g. <slug>/assets
+  absolutePath: string; // e.g. D:\...\OUTPUT_ROOT\<slug>\assets
   assetCount: number;
   assets: FolderAsset[];
   projectId: string;
@@ -148,8 +147,18 @@ export function getFolders(projectId = PROJECT_ID_ALL): FoldersResponse {
     const filename = basename(rel);
     // Derive the section folder from the DB. Assets not linked to any shot
     // (e.g. search-page acquires with no shot) go to a "SEARCH" fallback.
-    const section = assetToSection.get(a.id) ?? "SEARCH";
-    const folderName = sectionFolder(section);
+    // Local files (provider "local" — drag & drop or synced from disk) group
+    // by their real physical subfolder under <slug>/assets/ so the view
+    // mirrors the folder contents exactly ("uploads", a query name, …).
+    let folderName: string;
+    if (a.provider_id === "local") {
+      const parts = rel.split("/");
+      // rel = "<slug>/assets/<sub>/file.ext" (or "<slug>/assets/file.ext")
+      folderName = parts.length >= 4 ? (parts[2] ?? "uploads") : "uploads";
+    } else {
+      const section = assetToSection.get(a.id) ?? "SEARCH";
+      folderName = sectionFolder(section);
+    }
     const key = `${a.project_id}\u0000${folderName}`;
     const fa: FolderAsset = {
       assetId: a.id,
@@ -187,8 +196,8 @@ export function getFolders(projectId = PROJECT_ID_ALL): FoldersResponse {
       folders.push({
         folder: sf.folder,
         section: sf.section,
-        relativePath: `${proj.paths.slug}/${sf.folder}`,
-        absolutePath: join(proj.paths.output, sf.folder),
+        relativePath: `${proj.paths.slug}/assets`,
+        absolutePath: proj.paths.assets,
         assetCount: assetsInFolder.length,
         assets: assetsInFolder.sort((x, y) => x.filename.localeCompare(y.filename)),
         projectId: projId,
@@ -205,8 +214,8 @@ export function getFolders(projectId = PROJECT_ID_ALL): FoldersResponse {
       folders.push({
         folder: folderName,
         section: null,
-        relativePath: `${proj.paths.slug}/${folderName}`,
-        absolutePath: join(proj.paths.output, folderName),
+        relativePath: `${proj.paths.slug}/assets`,
+        absolutePath: proj.paths.assets,
         assetCount: fa.length,
         assets: fa.sort((x, y) => x.filename.localeCompare(y.filename)),
         projectId: projId,
@@ -215,8 +224,12 @@ export function getFolders(projectId = PROJECT_ID_ALL): FoldersResponse {
     }
   }
 
-  // footageRoot: OUTPUT_ROOT where all query subfolders live.
-  const footageRoot = OUTPUT_ROOT;
+  // footageRoot: for a concrete project this is its dedicated assets folder
+  // (OUTPUT_ROOT/<slug>/assets); for __ALL__ it's OUTPUT_ROOT.
+  const footageRoot =
+    projectId === PROJECT_ID_ALL
+      ? OUTPUT_ROOT
+      : (projectMap.get(projectId)?.paths.assets ?? OUTPUT_ROOT);
 
   return {
     outputRoot: OUTPUT_ROOT,

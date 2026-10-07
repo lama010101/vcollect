@@ -79,7 +79,7 @@ console.log(`Song: BPM ${analysis.bpm} · ${beatTimes.length} beats · ${audio.d
 const songResults: Record<string, string> = {};
 check("BPM is detected from the audio", () => assert.ok(analysis.bpm > 30 && analysis.bpm < 300), songResults);
 check("beat timestamps come from the waveform analyzer", () => {
-  assert.ok(analysis.analyzer.name.startsWith("librosa"), analysis.analyzer.name);
+  assert.ok(analysis.analyzer.name.startsWith("twio."), analysis.analyzer.name);
   assert.ok(beatTimes.length >= 8);
 }, songResults);
 check("beat timestamps are not a fixed BPM grid", () => {

@@ -1,5 +1,5 @@
-import { useEffect, useState, useCallback } from "react";
-import { api, type Project, type Task } from "./api.js";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { api, ASSETS_CHANGED_EVENT, type Project, type Task } from "./api.js";
 import { Dashboard } from "./pages/Dashboard.js";
 import { TimelinePage } from "./pages/Timeline.js";
 import { ShotReview } from "./pages/ShotReview.js";
@@ -9,6 +9,7 @@ import { SearchPage } from "./pages/Search.js";
 import { Projects } from "./pages/Projects.js";
 import { ImportScript } from "./pages/ImportScript.js";
 import { MusicEdit } from "./pages/MusicEdit.js";
+import { Visualizer } from "./pages/Visualizer.js";
 import { TasksPanel } from "./components/TasksPanel.js";
 import { useToast } from "./components/useToast.js";
 
@@ -23,17 +24,22 @@ type View =
   | { name: "projects" }
   | { name: "import" }
   | { name: "music" }
+  | { name: "visualizer" }
   | { name: "help" };
 
 const PROJECT_STORAGE_KEY = "twio.activeProjectId";
 const SIDEBAR_STORAGE_KEY = "twio.ui.sidebarCollapsed";
 const THEME_STORAGE_KEY = "twio.theme";
 
+const VIDEO_FILE_RE = /\.(mp4|mov|webm|mkv|avi|m4v|mpg|mpeg)$/i;
+const isVideoFile = (f: File) => f.type.startsWith("video/") || VIDEO_FILE_RE.test(f.name);
+
 const NAV_ITEMS: Array<{ key: View["name"]; label: string; icon: string; desc: string }> = [
   { key: "dashboard", label: "Dashboard", icon: "▣", desc: "Overview & actions" },
   { key: "import", label: "Import Script", icon: "♪", desc: "Paste script to create shots + timeline" },
   { key: "timeline", label: "Timeline", icon: "▬", desc: "Shot schedule" },
   { key: "music", label: "Music Edit", icon: "♫", desc: "Beat-synced music video from a song" },
+  { key: "visualizer", label: "Visualizer", icon: "∿", desc: "Multi-stem waveform video renderer" },
   { key: "search", label: "Search", icon: "⌕", desc: "Find assets" },
   { key: "folders", label: "Folders", icon: "▤", desc: "Browse files" },
   { key: "projects", label: "Projects", icon: "◇", desc: "Manage projects" },
@@ -76,6 +82,11 @@ export default function App() {
     localStorage.getItem(THEME_STORAGE_KEY) === "light" ? "light" : "dark",
   );
   const { push, Toasts } = useToast();
+  // Global drag & drop: files dropped anywhere on the window upload into the
+  // active project's assets folder.
+  const [dragActive, setDragActive] = useState(false);
+  const dragDepth = useRef(0);
+  const [uploading, setUploading] = useState<{ done: number; total: number; failed: number } | null>(null);
 
   const loadProjects = useCallback(async () => {
     try {
@@ -134,6 +145,78 @@ export default function App() {
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? projects[0] ?? null;
   const isAllProjects = activeProjectId === PROJECT_ID_ALL;
+
+  async function handleDroppedFiles(files: FileList | File[] | null | undefined) {
+    if (!files || files.length === 0) return;
+    const videos = [...files].filter(isVideoFile);
+    if (videos.length === 0) {
+      push("No video files in that drop (mp4, mov, webm, mkv, avi, m4v).", "error");
+      return;
+    }
+    if (isAllProjects) {
+      push("Select a specific project before dropping videos — each project has its own assets folder.", "error");
+      return;
+    }
+    setUploading({ done: 0, total: videos.length, failed: 0 });
+    let ok = 0;
+    let failed = 0;
+    for (const f of videos) {
+      try {
+        await api.uploadProjectAsset(activeProjectId, f);
+        ok++;
+      } catch (e) {
+        failed++;
+        console.error(`[upload] ${f.name}: ${(e as Error).message}`);
+      }
+      setUploading({ done: ok + failed, total: videos.length, failed });
+    }
+    setUploading(null);
+    window.dispatchEvent(new Event(ASSETS_CHANGED_EVENT));
+    if (failed === 0) {
+      push(`${ok} video${ok === 1 ? "" : "s"} added to ${activeProject?.name ?? "the project"}.`, "success");
+    } else {
+      push(`${ok} uploaded, ${failed} failed — check the files and try again.`, failed === videos.length ? "error" : "info");
+    }
+  }
+
+  // Window-level drag & drop handlers. dragenter/dragleave are depth-counted
+  // so the overlay doesn't flicker when crossing child elements.
+  useEffect(() => {
+    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes("Files");
+    const onDragEnter = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth.current++;
+      setDragActive(true);
+    };
+    const onDragOver = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault(); // required for drop to fire
+    };
+    const onDragLeave = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      dragDepth.current = Math.max(0, dragDepth.current - 1);
+      if (dragDepth.current === 0) setDragActive(false);
+    };
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth.current = 0;
+      setDragActive(false);
+      void handleDroppedFiles(e.dataTransfer?.files);
+    };
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProjectId, isAllProjects, activeProject?.name]);
 
   function switchProject(id: string) {
     setActiveProjectId(id);
@@ -325,10 +408,42 @@ export default function App() {
                 <p>Select a specific project to edit a music video.</p>
               </div>
             )}
+            {view.name === "visualizer" && !isAllProjects && <Visualizer projectId={activeProjectId} onToast={push} />}
+            {view.name === "visualizer" && isAllProjects && (
+              <div className="text-center py-20 text-slate-500">
+                <div className="text-4xl mb-3 opacity-40">◇</div>
+                <p>Select a specific project to use the visualizer.</p>
+              </div>
+            )}
             {view.name === "help" && <Help />}
           </div>
         </main>
       </div>
+
+      {/* Drag & drop overlay — pointer-events-none so drop still reaches window */}
+      {dragActive && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur-sm pointer-events-none">
+          <div className="rounded-2xl border-2 border-dashed border-sky-500 bg-slate-900/70 px-12 py-10 text-center">
+            <div className="text-4xl mb-2 text-sky-400">↓</div>
+            <div className="text-lg font-semibold text-sky-300">
+              {isAllProjects
+                ? "Select a project first"
+                : `Drop videos to add to ${activeProject?.name ?? "the project"}`}
+            </div>
+            <div className="text-xs text-slate-400 mt-1">
+              Files land in the project's assets/uploads folder
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Upload progress indicator */}
+      {uploading && (
+        <div className="fixed bottom-4 right-4 z-[80] ui-card px-4 py-3 text-sm text-slate-200 shadow-lg">
+          Uploading {uploading.done}/{uploading.total} video{uploading.total === 1 ? "" : "s"}
+          {uploading.failed > 0 && <span className="text-rose-400"> · {uploading.failed} failed</span>}
+        </div>
+      )}
 
       {/* Floating overlays */}
       <TasksPanel />

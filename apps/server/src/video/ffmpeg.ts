@@ -11,7 +11,7 @@
 // this service — there is exactly one code path that spawns ffmpeg/ffprobe.
 // =============================================================================
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, constants } from "node:fs/promises";
 import { homedir, platform } from "node:os";
@@ -186,6 +186,14 @@ export class FfmpegService {
   async ffprobeExec(args: string[], tag?: string): Promise<ExecResult> {
     await this.ensure();
     return run(this.ffprobePath(), args, { logTag: tag });
+  }
+
+  /** Spawn ffmpeg as a streaming child (for stdin-piped rawvideo input and
+   *  other long-running invocations). Same single binary-resolution path —
+   *  the caller owns stdin/stdout/stderr and lifecycle. */
+  async ffmpegSpawn(args: string[], opts: { signal?: AbortSignal } = {}): Promise<ChildProcess> {
+    await this.ensure();
+    return spawn(this.ffmpegPath(), args, { windowsHide: true, signal: opts.signal });
   }
 
   /** ffmpeg version string (for diagnostics). */

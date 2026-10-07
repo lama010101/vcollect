@@ -150,6 +150,58 @@ export function persistStandaloneCandidate(
   return { assetId, license };
 }
 
+/** Insert a user-uploaded (drag & drop) video as a fully-local asset.
+ *  Provider is 'local'; license is the user's own ('LOCAL_UPLOAD') so the
+ *  file counts as license-confirmed and lands in the project's Uploads
+ *  folder. Idempotent on the content-addressed asset id. */
+const insertLocalAssetStmt = lazy(
+  `INSERT INTO assets (
+     id, project_id, provider_id, provider_asset_id, provider_url, download_url,
+     title, creator_name, creator_url, width, height, duration_seconds, fps,
+     orientation, thumbnail_url, local_path, sha256, discovered_at, downloaded_at,
+     source_license, license_url, commercial_status, rights_review_status,
+     vision_status, tags, ready, final_score
+   ) VALUES (?, ?, 'local', ?, ?, NULL, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?,
+     'LOCAL_UPLOAD', NULL, 'LICENSE_SOURCE_CONFIRMED', 'OK', 'NOT_RUN', NULL, 1, ?)
+   ON CONFLICT(id) DO NOTHING`,
+);
+
+export interface LocalAssetInput {
+  id: string;
+  projectId: string;
+  providerAssetId: string;
+  title: string;
+  providerUrl: string;
+  width: number | null;
+  height: number | null;
+  durationSeconds: number | null;
+  fps: number | null;
+  orientation: string | null;
+  localPath: string;
+  sha256: string;
+  downloadedAt: string;
+}
+
+export function insertLocalAsset(inp: LocalAssetInput): void {
+  insertLocalAssetStmt().run(
+    inp.id,
+    inp.projectId,
+    inp.providerAssetId,
+    inp.providerUrl,
+    inp.title,
+    inp.width,
+    inp.height,
+    inp.durationSeconds,
+    inp.fps,
+    inp.orientation,
+    inp.localPath,
+    inp.sha256,
+    inp.downloadedAt,
+    inp.downloadedAt,
+    inp.width != null && inp.height != null && inp.durationSeconds != null ? 1 : null,
+  );
+}
+
 const updateAssetStmt2 = lazy(
   `UPDATE assets SET
      local_path=?, sha256=?, perceptual_hash=?, duplicate_flag=?, aspect_flag=?,

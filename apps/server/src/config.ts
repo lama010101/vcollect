@@ -44,6 +44,7 @@ const raw: AppConfig = appConfigSchema.parse({
   ffmpegBinPath: process.env.FFMPEG_BIN_PATH ?? "",
   ffprobeBinPath: process.env.FFPROBE_BIN_PATH ?? "",
   pythonBinPath: process.env.PYTHON_BIN_PATH ?? "",
+  engineDisabled: ["1", "true", "yes"].includes((process.env.TWIO_ENGINE_DISABLED ?? "").toLowerCase()),
   outputDir: process.env.OUTPUT_DIR ?? "output",
   maxDownloadMb: num(process.env.MAX_DOWNLOAD_MB, 600),
   candidatesPerProvider: num(process.env.CANDIDATES_PER_PROVIDER, 30),
@@ -54,26 +55,33 @@ const raw: AppConfig = appConfigSchema.parse({
 
 export const config: AppConfig = raw;
 
+/** Video file extensions accepted for uploads and folder sync. */
+export const VIDEO_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg",
+]);
+
 // Absolute path to the generated output root (PRD §6).
 // Resolve relative to the monorepo root (not process.cwd()) so the CLI,
 // the dev server, and tests all share one DB + output directory.
 //
-// Real asset files are stored directly under OUTPUT_ROOT in subfolders named
-// after the search query that discovered them (e.g. OUTPUT_ROOT/<query>/).
-// Thumbnails are global under OUTPUT_ROOT/thumbnails/. The shared SQLite DB
-// stays at OUTPUT_ROOT/database/footage.db.
+// Real asset files live inside each project's dedicated folder:
+// OUTPUT_ROOT/<slug>/assets/<query>/ for provider downloads and
+// OUTPUT_ROOT/<slug>/assets/uploads/ for drag-and-drop uploads. Thumbnails
+// are global under OUTPUT_ROOT/thumbnails/. The shared SQLite DB stays at
+// OUTPUT_ROOT/database/footage.db.
 export const OUTPUT_ROOT = resolve(PROJECT_ROOT, config.outputDir);
 
 // Global thumbnails directory (shared across all projects).
 export const THUMBNAILS_DIR = resolve(OUTPUT_ROOT, "thumbnails");
 
 /** Per-project output paths. Each project gets its own subfolder under
- *  OUTPUT_ROOT keyed by its slug for manifests, contact sheets, and source
- *  pages. Real asset files are stored directly under OUTPUT_ROOT in
- *  subfolders named after the search query. */
+ *  OUTPUT_ROOT keyed by its slug. `assets` is the project's dedicated asset
+ *  folder — downloaded clips and manual uploads live there, never in another
+ *  project's folder. */
 export interface ProjectPaths {
   slug: string;
   output: string; // OUTPUT_ROOT/<slug>
+  assets: string; // .../assets — all real asset files for this project
   contactSheets: string; // .../contact_sheets
   manifests: string; // .../manifests
   sourcePages: string; // .../source_pages
@@ -90,27 +98,43 @@ export function projectPaths(slug: string): ProjectPaths {
   const paths: ProjectPaths = {
     slug,
     output,
+    assets: resolve(output, "assets"),
     contactSheets: resolve(output, "contact_sheets"),
     manifests: resolve(output, "manifests"),
     sourcePages: resolve(output, "source_pages"),
   };
   // Create global dirs + per-project dirs.
-  for (const p of [THUMBNAILS_DIR, output, paths.contactSheets, paths.manifests, paths.sourcePages]) {
+  for (const p of [THUMBNAILS_DIR, output, paths.assets, paths.contactSheets, paths.manifests, paths.sourcePages]) {
     mkdirSync(p, { recursive: true });
   }
   _projectPathsCache.set(slug, paths);
   return paths;
 }
 
-/** Resolve the on-disk directory for a search query. Files are stored under
- *  OUTPUT_ROOT/<sanitized_query>/. The query is sanitized to be filesystem-safe. */
-export function queryDir(searchQuery: string): string {
-  const sanitized = searchQuery
+/** Sanitize a folder name to be filesystem-safe (same rules as queryDir). */
+function sanitizeDirName(name: string): string {
+  const s = name
     .trim()
     .replace(/[<>:"/\\|?*]/g, "")
     .replace(/\s+/g, " ")
     .slice(0, 100);
-  const dir = resolve(OUTPUT_ROOT, sanitized);
+  return s || "misc";
+}
+
+/** Resolve (and create) a subdirectory inside a project's dedicated assets
+ *  folder: OUTPUT_ROOT/<slug>/assets/<subdir>. Used for query-grouped
+ *  downloads and the "uploads" drop folder. */
+export function projectAssetDir(slug: string, subdir: string): string {
+  const dir = resolve(projectPaths(slug).assets, sanitizeDirName(subdir));
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Resolve the on-disk directory for a search query. Legacy global layout:
+ *  OUTPUT_ROOT/<sanitized_query>/ — still used by the file migrations that
+ *  relocate older files into the per-project assets folders. */
+export function queryDir(searchQuery: string): string {
+  const dir = resolve(OUTPUT_ROOT, sanitizeDirName(searchQuery));
   mkdirSync(dir, { recursive: true });
   return dir;
 }

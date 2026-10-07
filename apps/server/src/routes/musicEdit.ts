@@ -1,6 +1,6 @@
 // =============================================================================
 // Music edit routes — /api/music-edit/*
-//   GET  status                 analyzer availability (python + librosa)
+//   GET  status                 analyzer availability (built-in tracker + ffmpeg)
 //   GET  songs?project=         list project songs
 //   POST songs?project=&name=   upload a song (raw body)
 //   POST analyze?project=       { song } → detected BPM + beat timestamps

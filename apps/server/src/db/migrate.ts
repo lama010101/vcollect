@@ -8,7 +8,7 @@ import { db } from "./client.js";
 import { DEFAULT_PROJECT_DESCRIPTION, DEFAULT_PROJECT_ID, DEFAULT_PROJECT_NAME } from "@twio/shared";
 import { OUTPUT_ROOT, THUMBNAILS_DIR, PROJECT_ROOT, projectPaths, queryDir } from "../config.js";
 import { readdirSync, existsSync, renameSync, rmSync, copyFileSync, mkdirSync, unlinkSync } from "node:fs";
-import { join, basename, resolve } from "node:path";
+import { join, basename, dirname, resolve } from "node:path";
 
 // NOTE: column definitions mirror drizzle schema in db/schema.ts exactly.
 const DDL = [
@@ -241,6 +241,13 @@ export function migrate(): void {
     // project_id values to it (the ALTER above sets a DEFAULT but existing
     // rows may still carry NULL on some SQLite versions — guard both).
     bootstrapDefaultProject();
+    // "local" provider row — FK target for user-uploaded (drag & drop) assets.
+    // Kept out of PROVIDER_SEEDS so it never becomes an API search provider.
+    db.prepare(
+      `INSERT INTO providers (id, name, api_enabled, commercial_license_policy, license_url, attribution_url, active)
+       VALUES ('local', 'Local uploads', 0, 'LICENSE_SOURCE_CONFIRMED', NULL, NULL, 1)
+       ON CONFLICT(id) DO NOTHING`,
+    ).run();
     // Bootstrap a default "Main" timeline (scoped to the default project) and
     // assign all existing shots in the default project to it so the seeded
     // 100-shot dataset is reachable from the Timeline UI. Runs once; on
@@ -260,7 +267,97 @@ export function migrate(): void {
   // subfolders under OUTPUT_ROOT. Also moves per-project thumbnails/ to the
   // global thumbnails/ dir. Idempotent.
   migrateToQuerySubfolders();
+  // Move downloaded asset files into each project's dedicated folder
+  // (OUTPUT_ROOT/<slug>/assets/). Runs last so it also picks up files the
+  // earlier migrations just relocated. Idempotent.
+  migrateAssetsToProjectFolders();
   console.log(`[migrate] schema ready at ${new Date().toISOString()}`);
+}
+
+/**
+ * Move every downloaded asset file into its project's dedicated assets folder.
+ * Old local_path values are relative to OUTPUT_ROOT (e.g. "<query>/x.mp4");
+ * new values are "<slug>/assets/<query>/x.mp4". Files referenced by assets in
+ * multiple projects (shared local_path from a cross-project copy) are copied
+ * so every project physically owns its files. Idempotent: rows whose
+ * local_path already starts with "<slug>/assets/" are skipped.
+ */
+function migrateAssetsToProjectFolders(): void {
+  const slugs = new Map(
+    (db.all(`SELECT id, slug FROM projects`) as Array<{ id: string; slug: string }>).map((p) => [p.id, p.slug]),
+  );
+  const rows = db.all(
+    `SELECT id, project_id, local_path FROM assets WHERE local_path IS NOT NULL`,
+  ) as Array<{ id: string; project_id: string; local_path: string }>;
+
+  // oldRel → newAbs, so a file shared by several projects is copied into each
+  // project folder after the first move removes the shared source.
+  const moved = new Map<string, string>();
+  const updateStmt = db.prepare(`UPDATE assets SET local_path = ? WHERE id = ?`);
+  let n = 0;
+
+  for (const r of rows) {
+    const slug = slugs.get(r.project_id);
+    if (!slug) continue;
+    const rel = r.local_path.replace(/\\/g, "/").replace(/^\/+/, "");
+    if (rel.startsWith(`${slug}/assets/`)) continue;
+    const remainder = rel.startsWith(`${slug}/`) ? rel.slice(slug.length + 1) : rel;
+    const destRel = `${slug}/assets/${remainder}`;
+    const srcAbs = resolve(OUTPUT_ROOT, rel);
+    const destAbs = resolve(OUTPUT_ROOT, destRel);
+    try {
+      if (existsSync(srcAbs)) {
+        mkdirSync(dirname(destAbs), { recursive: true });
+        if (!existsSync(destAbs)) {
+          try {
+            renameSync(srcAbs, destAbs);
+          } catch {
+            copyFileSync(srcAbs, destAbs);
+            rmSync(srcAbs, { force: true });
+          }
+        } else {
+          // Destination already has this file — drop the old duplicate.
+          try { rmSync(srcAbs, { force: true }); } catch { /* ignore */ }
+        }
+      } else {
+        const movedTo = moved.get(rel);
+        if (movedTo && existsSync(movedTo) && !existsSync(destAbs)) {
+          mkdirSync(dirname(destAbs), { recursive: true });
+          copyFileSync(movedTo, destAbs);
+        }
+        // If the file is missing everywhere we still update the path so it
+        // points at the canonical project location.
+      }
+      moved.set(rel, destAbs);
+      updateStmt.run(destRel, r.id);
+      n++;
+    } catch (e) {
+      console.warn(`[migrate] could not move asset file ${rel} → ${destRel}: ${(e as Error).message}`);
+    }
+  }
+
+  // Remove now-empty top-level query dirs left behind by the move. Only
+  // directories that end up completely empty are removed — never touch
+  // project dirs or global dirs (thumbnails/database/cache).
+  if (n > 0) {
+    const keep = new Set([...slugs.values(), "thumbnails", "database", "cache"]);
+    for (const entry of readdirSync(OUTPUT_ROOT, { withFileTypes: true })) {
+      if (!entry.isDirectory() || keep.has(entry.name)) continue;
+      try { rmEmptyDirs(join(OUTPUT_ROOT, entry.name)); } catch { /* ignore */ }
+    }
+    console.log(`[migrate] moved ${n} asset file(s) into per-project assets folders`);
+  }
+}
+
+/** Recursively remove directories that contain no files (post-order). */
+function rmEmptyDirs(dir: string): void {
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) rmEmptyDirs(join(dir, entry.name));
+  }
+  try {
+    if (readdirSync(dir).length === 0) rmSync(dir);
+  } catch { /* ignore */ }
 }
 
 /**

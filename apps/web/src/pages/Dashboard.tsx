@@ -127,7 +127,7 @@ export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
       {/* ===== Hero stats row ===== */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
         <StatCard label="Total assets" value={d.total} icon="◆" tone="info" />
-        <StatCard label="Downloaded" value={d.downloaded} icon="↓" tone="good" progress={downloadPct} sublabel={`${downloadPct}% of pool`} />
+        <StatCard label="Downloaded" value={d.downloaded} icon="↓" tone="good" progress={downloadPct} sublabel={`${downloadPct}% of pool — view all`} onClick={() => onNavigate({ name: "folders" })} />
         <StatCard label="License confirmed" value={d.confirmed} icon="✓" tone="good" progress={confirmedPct} />
         <StatCard label="Needs review" value={d.review} icon="!" tone="warn" />
         <StatCard label="Rejected" value={d.rejected} icon="✕" tone="bad" />
@@ -175,6 +175,13 @@ export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
             className="mb-3"
             action={
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => onNavigate({ name: "folders" })}
+                  className="text-xs text-sky-400 hover:underline"
+                  title="Show all downloaded assets"
+                >
+                  All downloaded →
+                </button>
                 {taskCfg && (
                   <span className="text-[10px] text-slate-500">
                     {taskCfg.running}/{taskCfg.maxConcurrent} active

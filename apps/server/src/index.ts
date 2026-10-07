@@ -87,6 +87,9 @@ import {
 import { getDashboard } from "./routes/dashboard.js";
 import { applyReview } from "./routes/review.js";
 import { registerMusicEditRoutes } from "./routes/musicEdit.js";
+import { registerUploadRoutes } from "./routes/uploads.js";
+import { registerVisualizerRoutes } from "./routes/visualizer.js";
+import { registerEngineRoutes } from "./routes/engine.js";
 import { assetAbsolutePath, getFolders, revealInExplorer, getProjectRow } from "./routes/folders.js";
 import { generateFootageManifest, generateLicenseManifest } from "./manifests/csv.js";
 import { generateJsonManifest } from "./manifests/json.js";
@@ -156,6 +159,15 @@ export async function buildServer() {
 
   // --- Music edit (beat-aligned music-video editor) ---------------------------
   await registerMusicEditRoutes(app);
+
+  // --- Local video uploads (drag & drop onto the webapp) ----------------------
+  await registerUploadRoutes(app);
+
+  // --- Visualizer (multi-stem waveform renderer) ------------------------------
+  await registerVisualizerRoutes(app);
+
+  // --- Python engine (analysis worker: librosa/numpy/scipy/opencv) ------------
+  await registerEngineRoutes(app);
 
   // --- Projects (multi-project management) ------------------------------------
   app.get("/api/projects", async () => {

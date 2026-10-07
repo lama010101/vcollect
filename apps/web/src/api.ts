@@ -1,8 +1,12 @@
 // Thin fetch wrapper for the backend API.
 // Same-origin "/api" in dev (Vite proxy) and when the backend serves the SPA.
 // Set VITE_API_URL to point the deployed frontend at a hosted backend.
-import type { BeatAnalysis, EditPlan, MusicEditSettings } from "@twio/shared";
+import type { BeatAnalysis, EditPlan, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest } from "@twio/shared";
 const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
+
+/** Fired on `window` after local uploads complete so asset lists (Folders,
+ *  Music Edit library) refresh without a page reload. */
+export const ASSETS_CHANGED_EVENT = "twio:assets-changed";
 
 /** Extract a human-readable error message from a failed fetch response. */
 async function errorMessage(r: Response, url: string): Promise<string> {
@@ -11,18 +15,31 @@ async function errorMessage(r: Response, url: string): Promise<string> {
     const detail = body.message ?? body.error ?? r.statusText;
     return `${r.status} ${url}: ${detail}`;
   } catch {
-    return `${r.status} ${url}`;
+    // Non-JSON error body — typically the Vite dev proxy reporting that the
+    // backend is unreachable (down or mid-restart) with an HTML error page.
+    return r.status >= 500
+      ? `${r.status} ${url} — backend error with no details; the API may be down or restarting (check the npm run dev console)`
+      : `${r.status} ${url}`;
+  }
+}
+
+/** fetch() that translates network failures into an actionable message. */
+async function req(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(base + url, init);
+  } catch (e) {
+    throw new Error(`Cannot reach the backend (${url}) — is the API running via npm run dev? [${(e as Error).message}]`);
   }
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const r = await fetch(base + url);
+  const r = await req(url);
   if (!r.ok) throw new Error(await errorMessage(r, url));
   return r.json() as Promise<T>;
 }
 
 async function postJson<T>(url: string, body?: unknown): Promise<T> {
-  const r = await fetch(base + url, {
+  const r = await req(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
@@ -32,7 +49,7 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
 }
 
 async function patchJson<T>(url: string, body?: unknown): Promise<T> {
-  const r = await fetch(base + url, {
+  const r = await req(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
@@ -42,7 +59,7 @@ async function patchJson<T>(url: string, body?: unknown): Promise<T> {
 }
 
 async function putJson<T>(url: string, body?: unknown): Promise<T> {
-  const r = await fetch(base + url, {
+  const r = await req(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
@@ -52,7 +69,7 @@ async function putJson<T>(url: string, body?: unknown): Promise<T> {
 }
 
 async function deleteJson<T>(url: string): Promise<T> {
-  const r = await fetch(base + url, { method: "DELETE" });
+  const r = await req(url, { method: "DELETE" });
   if (!r.ok) throw new Error(await errorMessage(r, url));
   return r.json() as Promise<T>;
 }
@@ -483,7 +500,7 @@ export interface ProjectSettingsUpdate {
 // --- Music edit (beat-aligned music-video editor) ---------------------------
 export interface MusicEditStatus {
   ok: boolean;
-  python: string;
+  engine: string;
   detail: string;
 }
 export interface MusicSong {
@@ -526,8 +543,52 @@ export interface MusicEditRequest {
   settings: Partial<MusicEditSettings>;
 }
 
+// --- Visualizer (multi-stem waveform renderer) --------------------------------
+export interface VizStem {
+  name: string;
+  sizeBytes: number;
+  url: string;
+  modifiedAt: string;
+  durationSec: number | null;
+}
+export interface VizRenderJob {
+  id: string;
+  projectId: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  progress: { phase: "decode" | "frames" | "mux" | "verify"; done: number; total: number };
+  error: { code: string; message: string } | null;
+  outputUrl: string | null;
+  /** Absolute filesystem path of the MP4 — shown as an "open folder" link. */
+  outputPath: string | null;
+  configUrl: string;
+  startedAt: string;
+  finishedAt: string | null;
+  durationSeconds: number | null;
+  frameCount: number;
+}
+export interface VizRenderedFile {
+  name: string;
+  url: string;
+  configUrl: string | null;
+  /** Absolute filesystem path. */
+  path: string;
+  sizeBytes: number;
+  createdAt: string;
+}
+
+// --- Python engine (analysis worker status) -----------------------------------
+export interface EngineStatus {
+  ok: boolean;
+  disabled: boolean;
+  phase: "idle" | "venv" | "deps" | "ready" | "error" | "disabled";
+  python: { path: string; source: string; version: string } | null;
+  venvPath: string;
+  depsInstalled: boolean;
+  detail: string;
+}
+
 async function postBinary<T>(url: string, body: Blob): Promise<T> {
-  const r = await fetch(base + url, {
+  const r = await req(url, {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream" },
     body,
@@ -677,6 +738,19 @@ export const api = {
   assetThumbUrl: (id: string) => `${base}/api/assets/${id}/thumb`,
   folders: (projectId?: string) => getJson<FoldersResponse>(withProject("/api/folders", projectId)),
   revealAsset: (id: string) => postJson<{ ok: boolean; error?: string }>(`/api/assets/${id}/reveal`),
+  // --- Local video upload (drag & drop) — the file lands in the project's
+  // own assets folder (OUTPUT_ROOT/<slug>/assets/uploads/). ---
+  uploadProjectAsset: (projectId: string, file: File) =>
+    postBinary<{ assetId: string; filename: string; localPath: string; sizeBytes: number; alreadyUploaded: boolean; asset: Asset | null }>(
+      `/api/assets/upload?project=${encodeURIComponent(projectId)}&name=${encodeURIComponent(file.name)}`,
+      file,
+    ),
+  // Register video files found on disk inside the project's assets folder —
+  // everything in <slug>/assets/ must be visible no matter how it got there.
+  syncProjectAssets: (projectId: string) =>
+    postJson<{ scanned: number; added: number; known: number; skipped: number }>(
+      `/api/assets/sync?project=${encodeURIComponent(projectId)}`,
+    ),
   setAssetReady: (id: string, ready: boolean) =>
     postJson<{ ok: boolean; id: string; ready: boolean }>(`/api/assets/${id}/ready`, { ready }),
   setAssetRating: (id: string, rating: number | null) =>
@@ -735,4 +809,71 @@ export const api = {
   musicRenderJob: (id: string) => getJson<{ job: MusicRenderJob }>(`/api/music-edit/render/${encodeURIComponent(id)}`),
   cancelMusicRender: (id: string) => postJson<{ job: MusicRenderJob }>(`/api/music-edit/render/${encodeURIComponent(id)}/cancel`),
   musicRenders: (projectId: string) => getJson<{ renders: MusicRenderedFile[] }>(withProject("/api/music-edit/renders", projectId)),
+  // --- Visualizer ---
+  vizStems: (projectId: string) => getJson<{ stems: VizStem[] }>(withProject("/api/visualizer/stems", projectId)),
+  vizUploadStem: (projectId: string, file: File) =>
+    postBinary<{ stem: VizStem }>(withProject(`/api/visualizer/stems?name=${encodeURIComponent(file.name)}`, projectId), file),
+  vizDeleteStem: (projectId: string, name: string) =>
+    deleteJson<{ ok: boolean; name: string }>(withProject(`/api/visualizer/stems/${encodeURIComponent(name)}`, projectId)),
+  vizRender: (projectId: string, req: VisualizerRenderRequest) =>
+    postJson<{ job: VizRenderJob }>(withProject("/api/visualizer/render", projectId), req),
+  vizRenderJob: (id: string) => getJson<{ job: VizRenderJob }>(`/api/visualizer/render/${encodeURIComponent(id)}`),
+  vizCancelRender: (id: string) => postJson<{ job: VizRenderJob }>(`/api/visualizer/render/${encodeURIComponent(id)}/cancel`),
+  vizRenders: (projectId: string) => getJson<{ renders: VizRenderedFile[] }>(withProject("/api/visualizer/renders", projectId)),
+  // Open the renders folder (a rendered file selected when `name` is given)
+  // in the OS file explorer.
+  vizRevealRender: (projectId: string, name?: string) =>
+    postJson<{ ok: boolean; error?: string }>(
+      withProject(`/api/visualizer/reveal${name ? `?name=${encodeURIComponent(name)}` : ""}`, projectId),
+    ),
+  // Binary signal payload → StemSignal (peaks/env + engine features when present).
+  vizStemSignal: async (projectId: string, name: string): Promise<StemSignal> => {
+    const r = await req(withProject(`/api/visualizer/stems/${encodeURIComponent(name)}/signal`, projectId));
+    if (!r.ok) throw new Error(await errorMessage(r, r.url));
+    const buf = await r.arrayBuffer();
+    const view = new DataView(buf);
+    const metaLen = view.getUint32(0, true);
+    const meta = JSON.parse(new TextDecoder().decode(buf.slice(4, 4 + metaLen))) as StemSignalMeta;
+    let off = 4 + metaLen;
+    const take = (count: number): Float32Array => {
+      const arr = new Float32Array(buf.slice(off, off + count * 4));
+      off += count * 4;
+      return arr;
+    };
+    const peaks = take(meta.counts.peaks);
+    const env = take(meta.counts.env);
+    const signal: StemSignal = { peaks, env, durationSec: meta.durationSec };
+    const peaksL = take(meta.counts.peaksL ?? 0);
+    const peaksR = take(meta.counts.peaksR ?? 0);
+    if (peaksL.length > 0 && peaksR.length > 0) {
+      signal.peaksL = peaksL;
+      signal.peaksR = peaksR;
+    }
+    if (meta.features) {
+      const bands = take(meta.counts.bands);
+      const featEnv = take(meta.counts.featEnv);
+      const onsetEnv = take(meta.counts.onsetEnv);
+      const f = meta.features;
+      signal.features = {
+        version: f.version,
+        durationSec: f.durationSec,
+        tempo: f.tempo,
+        featureRate: f.featureRate,
+        frames: f.frames,
+        bandNames: f.bandNames,
+        bands,
+        env: featEnv,
+        onsetEnv,
+        onsets: f.onsets,
+        beats: f.beats,
+      };
+    }
+    return signal;
+  },
+  // Coarse phase of the in-flight signal analysis (null when idle/cached).
+  vizStemSignalStatus: (projectId: string, name: string) =>
+    getJson<{ phase: string | null }>(withProject(`/api/visualizer/stems/${encodeURIComponent(name)}/signal/status`, projectId)),
+  // --- Python engine ---
+  engineStatus: () => getJson<EngineStatus>("/api/engine/status"),
+  engineSetup: () => postJson<EngineStatus>("/api/engine/setup"),
 };

@@ -1,73 +1,47 @@
 // =============================================================================
-// Beat analysis — decodes the song through the shared FFmpeg service, then
-// runs apps/server/python/beat_analysis.py (librosa) on the PCM. Results are
-// cached by song content hash so each song is analysed once.
+// Beat analysis — decodes the song through the shared FFmpeg service to mono
+// f32le PCM, then runs the built-in beat tracker (beatAnalyzer.ts: spectral-
+// flux onset envelope + dynamic-programming beat sequence). No Python, no
+// external runtime — ffmpeg is the only dependency. Results are cached by
+// song content hash so each song is analysed once.
 // =============================================================================
 
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { BeatAnalysis, BeatPoint } from "@twio/shared";
-import { config, OUTPUT_ROOT, PROJECT_ROOT } from "../config.js";
+import { OUTPUT_ROOT } from "../config.js";
 import { ffmpegService } from "../video/ffmpeg.js";
 import { probeAudio, type AudioProbeResult } from "../video/ffprobe.js";
+import { analyzePcm, ANALYZER_NAME, ANALYZER_VERSION } from "./beatAnalyzer.js";
 import { assertValidBeatTimes } from "./edl.js";
 import { MusicEditError } from "./errors.js";
 
-export const ANALYZER_SCRIPT = resolve(PROJECT_ROOT, "apps", "server", "python", "beat_analysis.py");
 const ANALYSIS_SAMPLE_RATE = 22050;
 const HOP_LENGTH = 256;
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 const CACHE_DIR = resolve(OUTPUT_ROOT, "cache", "beats");
-
-export function pythonBin(): string {
-  return config.pythonBinPath || (process.platform === "win32" ? "python" : "python3");
-}
-
-interface ProcResult {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-}
-
-function runPython(args: string[]): Promise<ProcResult> {
-  const bin = pythonBin();
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(bin, args, { windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", (e) =>
-      reject(
-        new MusicEditError(
-          500,
-          "PYTHON_UNAVAILABLE",
-          `Cannot start Python (${bin}): ${e.message}. Install Python 3 and set PYTHON_BIN_PATH if it is not on PATH.`,
-        ),
-      ),
-    );
-    child.on("close", (code) => resolvePromise({ exitCode: code ?? -1, stdout, stderr }));
-  });
-}
 
 export interface AnalyzerStatus {
   ok: boolean;
-  python: string;
+  engine: string;
   detail: string;
 }
 
-/** Checks the interpreter can import the analyzer's dependencies. */
+/** The analyzer is built in; the only external need is ffmpeg for decoding. */
 export async function analyzerStatus(): Promise<AnalyzerStatus> {
   try {
-    const r = await runPython(["-c", "import librosa, soundfile; print(librosa.__version__)"]);
-    if (r.exitCode === 0) return { ok: true, python: pythonBin(), detail: `librosa ${r.stdout.trim()}` };
-    return { ok: false, python: pythonBin(), detail: r.stderr.trim().split("\n").pop() ?? "import failed" };
+    const version = await ffmpegService.version();
+    const ffmpegVersion = version.match(/ffmpeg\s+version\s+(\S+)/i)?.[1]?.split(/[-\s]/)[0] ?? "unknown";
+    return {
+      ok: true,
+      engine: `${ANALYZER_NAME}@${ANALYZER_VERSION}`,
+      detail: `built-in tracker · ffmpeg ${ffmpegVersion}`,
+    };
   } catch (e) {
-    return { ok: false, python: pythonBin(), detail: (e as Error).message };
+    return { ok: false, engine: `${ANALYZER_NAME}@${ANALYZER_VERSION}`, detail: (e as Error).message };
   }
 }
 
@@ -90,7 +64,7 @@ function intervalStats(times: number[]): BeatAnalysis["interval"] {
   return { min: r(Math.min(...ibi)), max: r(Math.max(...ibi)), mean: r(mean), stdDev: r(Math.sqrt(variance)) };
 }
 
-/** Validate the analyzer's JSON (untrusted process output). */
+/** Validate an analyzer result (untrusted/cached data). */
 export function parseAnalyzerOutput(raw: unknown): BeatAnalysis {
   const o = raw as Partial<Record<string, unknown>> | null;
   if (!o || typeof o !== "object") throw new MusicEditError(500, "BEAT_ANALYSIS_FAILED", "Beat analyzer returned no result.");
@@ -152,30 +126,21 @@ export async function analyzeSong(songPath: string, opts: { useCache?: boolean }
 
   const tmp = await mkdtemp(join(tmpdir(), "twio-beats-"));
   try {
-    const wav = join(tmp, "audio.wav");
+    const pcm = join(tmp, "audio.f32");
     const dec = await ffmpegService.ffmpegExec(
-      ["-v", "error", "-y", "-i", songPath, "-map", "0:a:0", "-ac", "1", "-ar", String(ANALYSIS_SAMPLE_RATE), "-c:a", "pcm_s16le", "-f", "wav", wav],
+      ["-v", "error", "-y", "-i", songPath, "-map", "0:a:0", "-ac", "1", "-ar", String(ANALYSIS_SAMPLE_RATE), "-c:a", "pcm_f32le", "-f", "f32le", pcm],
       "beat-decode",
     );
     if (dec.exitCode !== 0) {
       throw new MusicEditError(422, "CORRUPT_AUDIO", `FFmpeg could not decode the song: ${dec.stderr.trim().slice(-500)}`);
     }
-    const r = await runPython([ANALYZER_SCRIPT, wav, "--hop-length", String(HOP_LENGTH)]);
-    if (r.exitCode === 3) {
-      throw new MusicEditError(500, "BEAT_ANALYZER_DEPENDENCY_MISSING", r.stderr.trim().slice(-500));
-    }
-    if (r.exitCode !== 0) {
-      throw new MusicEditError(422, "BEAT_ANALYSIS_FAILED", `Beat analyzer failed (exit ${r.exitCode}): ${r.stderr.trim().slice(-500)}`);
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(r.stdout);
-    } catch {
-      throw new MusicEditError(500, "BEAT_ANALYSIS_FAILED", "Beat analyzer returned non-JSON output.");
-    }
-    const analysis = parseAnalyzerOutput(parsed);
+    const buf = readFileSync(pcm);
+    const bytes = Math.floor(buf.length / 4) * 4;
+    const samples = new Float32Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + bytes));
+    const raw = analyzePcm(samples, ANALYSIS_SAMPLE_RATE, HOP_LENGTH);
+    const analysis = parseAnalyzerOutput(raw);
     mkdirSync(CACHE_DIR, { recursive: true });
-    writeFileSync(cachePath, JSON.stringify(parsed));
+    writeFileSync(cachePath, JSON.stringify(raw));
     return { analysis, audio, sha256, cached: false };
   } finally {
     rmSync(tmp, { recursive: true, force: true });

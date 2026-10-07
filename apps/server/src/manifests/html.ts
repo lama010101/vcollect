@@ -117,10 +117,10 @@ export function generateContactSheetHtml(ctx: ManifestCtx = {}): string {
   const assets = listAllAssetsWithShots(projectId).filter((a) => a.local_path);
   const cells = assets
     .map((a) => {
-      const thumb = a.id ? `../thumbnails/${a.id}.jpg` : "";
+      const thumb = a.id ? `../../thumbnails/${a.id}.jpg` : "";
       const score = a.final_score != null ? Math.round(a.final_score * 100) : "—";
       return `<div class="cell">
-        <a href="../${esc(a.local_path)}" target="_blank"><img src="${esc(thumb)}" alt="${esc(a.id)}"></a>
+        <a href="../../${esc(a.local_path)}" target="_blank"><img src="${esc(thumb)}" alt="${esc(a.id)}"></a>
         <div class="meta">
           <div class="line"><strong>${esc(a.primary_shot_id ?? "—")}</strong></div>
           <div class="line">${esc(a.id)}</div>

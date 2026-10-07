@@ -12,7 +12,7 @@ import { createWriteStream, mkdirSync, statSync, existsSync, rmSync } from "node
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { join } from "node:path";
-import { config, OUTPUT_ROOT, queryDir } from "../config.js";
+import { config, OUTPUT_ROOT, projectAssetDir, queryDir } from "../config.js";
 import { isPlayableVideo } from "./ffprobe.js";
 
 export interface DownloadResult {
@@ -98,13 +98,22 @@ export function ourFilename(shotNumber: number, provider: string, providerAssetI
   return `${shot}_${prov}_${providerAssetId}.mp4`;
 }
 
+/** Where the downloaded file lands. When `projectSlug` is set the file is
+ *  stored inside that project's dedicated assets folder
+ *  (OUTPUT_ROOT/<slug>/assets/<searchQuery>/); otherwise it falls back to the
+ *  legacy global query folder (OUTPUT_ROOT/<searchQuery>/). */
+export interface DownloadDest {
+  projectSlug?: string;
+  searchQuery?: string;
+}
+
 /**
  * Download a real video asset from the provider URL. Throws on validation failure.
  *
- * The file is stored under OUTPUT_ROOT/<search_query>/<filename> — organized
- * by the search query that discovered the asset.
+ * The file is stored under the project's assets folder — organized by the
+ * search query that discovered the asset.
  *
- * @param searchQuery the search query that discovered this asset (determines folder)
+ * @param dest destination selector (project folder + query subfolder)
  * @param shotNumber used to build our own filename
  * @param _section unused (kept for API compatibility)
  * @param onProgress optional streamed-progress callback (received, total)
@@ -117,25 +126,26 @@ export async function downloadAsset(
   providerAssetId: string,
   expectedContentType = "video/*",
   onProgress?: DownloadProgressCb,
-  searchQuery?: string,
+  dest?: DownloadDest,
   controller?: DownloadController,
 ): Promise<DownloadResult> {
   const filename = ourFilename(shotNumber, provider, providerAssetId);
-  const dir = queryDir(searchQuery ?? "unknown");
-  const dest = join(dir, filename);
+  const query = dest?.searchQuery ?? "unknown";
+  const dir = dest?.projectSlug ? projectAssetDir(dest.projectSlug, query) : queryDir(query);
+  const file = join(dir, filename);
 
-  await downloadHttp(downloadUrl, dest, expectedContentType, onProgress, controller);
+  await downloadHttp(downloadUrl, file, expectedContentType, onProgress, controller);
 
   // Validate the actual video container (PRD §34) — never trust the filename.
-  if (!(await isPlayableVideo(dest))) {
-    throw new Error(`Downloaded file is not a valid video container: ${dest}`);
+  if (!(await isPlayableVideo(file))) {
+    throw new Error(`Downloaded file is not a valid video container: ${file}`);
   }
 
-  const stat = statSync(dest);
-  const sha256 = await sha256File(dest);
+  const stat = statSync(file);
+  const sha256 = await sha256File(file);
   return {
-    localPath: dest,
-    relativePath: relativeToOutput(dest),
+    localPath: file,
+    relativePath: relativeToOutput(file),
     sha256,
     sizeBytes: stat.size,
   };

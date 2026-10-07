@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { musicEditSettingsSchema, type MusicEditSettings } from "@twio/shared";
 import { cutBoundaries, outputSize, planEdit, type PlanSource } from "../src/musicEdit/edl.ts";
 import { parseAnalyzerOutput } from "../src/musicEdit/beatAnalysis.ts";
+import { analyzePcm } from "../src/musicEdit/beatAnalyzer.ts";
 import { segmentArgs } from "../src/musicEdit/render.ts";
 import { MusicEditError } from "../src/musicEdit/errors.ts";
 
@@ -135,6 +136,58 @@ describe("music edit — EDL planner", () => {
     assert.deepEqual(outputSize([src("a", 1, 1280, 720)], settings()), { width: 1280, height: 720 });
     assert.deepEqual(outputSize([src("a", 1, 3840, 2160)], settings()), { width: 1920, height: 1080 });
     assert.deepEqual(outputSize([src("a", 1, 1920, 1080)], settings({ aspect: "9:16" })), { width: 608, height: 1080 });
+  });
+});
+
+describe("music edit — built-in beat tracker (no python)", () => {
+  const SR = 22050;
+  const HOP = 256;
+
+  const mulberry = (seed: number) => () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+
+  /** Quiet sine bed + decaying noise bursts at (jittered) beat positions. */
+  const clickTrack = (bpm: number, seconds: number, jitterMs: number) => {
+    const y = new Float32Array(Math.floor(SR * seconds));
+    const rnd = mulberry(7);
+    for (let i = 0; i < y.length; i++) y[i] = 0.005 * Math.sin((2 * Math.PI * 220 * i) / SR);
+    const hits: number[] = [];
+    for (let t = 0.4; t < seconds - 0.3; t += 60 / bpm) {
+      const hit = t + (rnd() - 0.5) * (jitterMs / 1000);
+      hits.push(hit);
+      const start = Math.round(hit * SR);
+      for (let i = 0; i < 0.025 * SR && start + i < y.length; i++) {
+        y[start + i]! += Math.exp(-i / (0.005 * SR)) * 0.9 * (rnd() * 2 - 1);
+      }
+    }
+    return { y, hits };
+  };
+
+  it("detects tempo and beat times on a jittered 120 BPM click track", () => {
+    const { y, hits } = clickTrack(120, 12, 30);
+    const a = analyzePcm(y, SR, HOP);
+    assert.ok(Math.abs(a.bpm - 120) < 6, `bpm ${a.bpm}`);
+    assert.ok(a.beats.length >= 15, `${a.beats.length} beats`);
+    const times = a.beats.map((b) => b.time);
+    for (let i = 1; i < times.length; i++) assert.ok(times[i]! > times[i - 1]!, "beats strictly increasing");
+    const matched = hits.filter((h) => times.some((t) => Math.abs(t - h) < 0.06)).length;
+    assert.ok(matched / hits.length > 0.8, `matched ${matched}/${hits.length} clicks`);
+  });
+
+  it("detects a tempo off the 120 BPM prior (140 BPM)", () => {
+    const { y } = clickTrack(140, 12, 20);
+    const a = analyzePcm(y, SR, HOP);
+    assert.ok(Math.abs(a.bpm - 140) < 8, `bpm ${a.bpm}`);
+  });
+
+  it("silence yields no beats → NO_BEATS_DETECTED through the parser", () => {
+    const a = analyzePcm(new Float32Array(SR * 2), SR, HOP);
+    assert.equal(a.beats.length, 0);
+    assert.equal(code(() => parseAnalyzerOutput(a)), "NO_BEATS_DETECTED");
   });
 });
 

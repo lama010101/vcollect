@@ -2,14 +2,14 @@
 // Asset copy — link an existing asset into a target project. Used by the
 // "Copy to project..." action in the Folders and ShotReview UI.
 //
-// Since real files live under OUTPUT_ROOT/<query>/, "copying" no longer
-// duplicates the file — it creates a new asset row (with a project-scoped id)
-// that references the same file path. The thumbnail is copied from the global
-// thumbnails dir under the new asset id.
+// Each project owns a dedicated folder (OUTPUT_ROOT/<slug>/assets/), so
+// copying physically duplicates the video file into the target project's
+// folder — deleting the source project can't break the copy. The thumbnail
+// is copied from the global thumbnails dir under the new asset id.
 // =============================================================================
 
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { db } from "./client.js";
 import { OUTPUT_ROOT, THUMBNAILS_DIR } from "../config.js";
 import { getAsset, addAssetToShot } from "./repository.js";
@@ -51,7 +51,7 @@ export interface CopyAssetResult {
   ok: boolean;
   newAssetId: string;
   toProjectId: string;
-  linkedFile: boolean;
+  copiedFile: boolean;
   copiedThumbnail: boolean;
 }
 
@@ -59,8 +59,10 @@ export interface CopyAssetResult {
  *  and have a `local_path` (only downloaded assets are copyable). The target
  *  project must be a concrete project (not __ALL__).
  *
- *  Since real files live under OUTPUT_ROOT/<query>/, this does NOT copy the
- *  video file. It creates a new asset row referencing the same file path. */
+ *  Projects own their asset folders, so the file is physically copied into
+ *  the target project's assets dir (mirroring the source's subpath inside
+ *  its assets folder). Falls back to sharing the old path if the source
+ *  file is missing. */
 export function copyAssetToProject(inp: CopyAssetInput): CopyAssetResult {
   const src = getAsset(inp.assetId);
   if (!src) throw new Error(`asset not found: ${inp.assetId}`);
@@ -72,10 +74,32 @@ export function copyAssetToProject(inp: CopyAssetInput): CopyAssetResult {
   // across projects.
   const newAssetId = `${target.slug}_${src.id}`.slice(0, 200);
 
-  // The real file is under OUTPUT_ROOT/<query>/ — no need to copy it.
-  // Just reference the same local_path in the new asset row.
-  const globalFile = resolve(OUTPUT_ROOT, src.local_path.replace(/\\/g, "/"));
-  const linkedFile = existsSync(globalFile);
+  // Physically copy the file into the target project's assets folder.
+  // The source's subpath inside its own assets dir is preserved (e.g.
+  // "<slug>/assets/<query>/f.mp4" → "<target>/assets/<query>/f.mp4").
+  const rel = src.local_path.replace(/\\/g, "/").replace(/^\/+/, "");
+  const srcSlug = getProject(src.project_id)?.slug;
+  const sub = srcSlug && rel.startsWith(`${srcSlug}/assets/`) ? rel.slice(srcSlug.length + 8) : rel;
+  const srcAbs = resolve(OUTPUT_ROOT, rel);
+  let newLocalPath = src.local_path; // fallback: reference the old path
+  let copiedFile = false;
+  if (existsSync(srcAbs)) {
+    let destRel = `${target.slug}/assets/${sub}`;
+    let destAbs = resolve(OUTPUT_ROOT, destRel);
+    if (existsSync(destAbs)) {
+      const ext = extname(sub);
+      const stem = sub.slice(0, -ext.length);
+      let i = 1;
+      do {
+        destRel = `${target.slug}/assets/${stem}_${i++}${ext}`;
+        destAbs = resolve(OUTPUT_ROOT, destRel);
+      } while (existsSync(destAbs));
+    }
+    mkdirSync(dirname(destAbs), { recursive: true });
+    copyFileSync(srcAbs, destAbs);
+    newLocalPath = destRel;
+    copiedFile = true;
+  }
 
   // Copy the thumbnail from the global thumbnails dir under the new asset id.
   const srcThumb = join(THUMBNAILS_DIR, `${src.id}.jpg`);
@@ -87,8 +111,8 @@ export function copyAssetToProject(inp: CopyAssetInput): CopyAssetResult {
     copiedThumbnail = true;
   }
 
-  // Insert the copied asset row. local_path stays the same (points to the
-  // global Assets/ file).
+  // Insert the copied asset row pointing at the file in the target project's
+  // assets folder.
   insertCopiedAssetStmt().run(
     newAssetId,
     target.id,
@@ -105,7 +129,7 @@ export function copyAssetToProject(inp: CopyAssetInput): CopyAssetResult {
     src.fps,
     src.orientation,
     src.thumbnail_url,
-    src.local_path, // same global path (relative to OUTPUT_ROOT)
+    newLocalPath, // file copied into the target project's assets folder
     src.sha256,
     src.perceptual_hash,
     src.duplicate_flag ?? "NONE",
@@ -136,7 +160,7 @@ export function copyAssetToProject(inp: CopyAssetInput): CopyAssetResult {
     ok: true,
     newAssetId,
     toProjectId: target.id,
-    linkedFile,
+    copiedFile,
     copiedThumbnail,
   };
 }

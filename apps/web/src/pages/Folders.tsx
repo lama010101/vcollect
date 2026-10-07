@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type FoldersResponse, type FolderNode, type FolderAsset, type Project } from "../api.js";
+import { api, ASSETS_CHANGED_EVENT, type FoldersResponse, type FolderNode, type FolderAsset, type Project } from "../api.js";
 import { RatingSlider } from "../components/RatingSlider.js";
 import { PROJECT_ID_ALL } from "@twio/shared";
 
@@ -45,6 +45,9 @@ export function Folders({ projectId, projects }: { projectId: string; projects: 
 
   async function load() {
     try {
+      // Register any video files placed in the project's assets folder outside
+      // the app before listing — the folder contents are the source of truth.
+      await api.syncProjectAssets(projectId).catch(() => {});
       const r = await api.folders(projectId);
       setData(r);
       setRatingOverrides(new Map());
@@ -56,6 +59,15 @@ export function Folders({ projectId, projects }: { projectId: string; projects: 
   }
   useEffect(() => {
     load().catch(console.error);
+  }, [projectId]);
+
+  // Reload when files are dropped onto the app (uploads land in the active
+  // project's assets folder).
+  useEffect(() => {
+    const onChanged = () => { load().catch(console.error); };
+    window.addEventListener(ASSETS_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(ASSETS_CHANGED_EVENT, onChanged);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
   function toggle(folder: string) {
@@ -172,7 +184,9 @@ export function Folders({ projectId, projects }: { projectId: string; projects: 
       </p>
 
       <div className="ui-card p-3 mb-4">
-        <div className="text-xs text-slate-400 mb-1">Collector root</div>
+        <div className="text-xs text-slate-400 mb-1">
+          {projectId === PROJECT_ID_ALL ? "Output root" : "Project assets folder"}
+        </div>
         <code className="text-sm text-sky-400 break-all">{data.footageRoot}</code>
       </div>
 
