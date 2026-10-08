@@ -44,6 +44,30 @@ async function sharpnessScore(png: Buffer): Promise<number> {
 }
 
 /**
+ * Generate the representative thumbnail for an image file — sharp decodes
+ * directly (no ffmpeg spawn), flattens alpha onto black (matches the dark
+ * video-thumb look) and bounds the result to 1920×1080 so giant source
+ * images don't produce giant thumbs. Same output location/naming as
+ * generateThumbnail. @returns absolute path to the JPEG, or null on failure.
+ */
+export async function generateImageThumbnail(file: string, assetId: string): Promise<string | null> {
+  try {
+    const thumbDir = THUMBNAILS_DIR;
+    mkdirSync(thumbDir, { recursive: true });
+    const dest = join(thumbDir, `${assetId}.jpg`);
+    await sharp(file)
+      .flatten({ background: "#000000" })
+      .resize(1920, 1080, { fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 85 })
+      .toFile(dest);
+    return dest;
+  } catch (err) {
+    console.warn(`[thumbnails] image thumb failed for ${assetId}: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+/**
  * Generate the representative thumbnail for a video file.
  * Thumbnails are stored in the global THUMBNAILS_DIR (shared across projects).
  * @returns absolute path to the generated JPEG, or null on failure.

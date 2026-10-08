@@ -60,6 +60,35 @@ export const VIDEO_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
   ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg",
 ]);
 
+/** Image file extensions accepted for uploads and folder sync. Limited to
+ *  formats sharp can decode — upload validation reads real pixel metadata,
+ *  so anything sharp can't parse is rejected at upload/sync time anyway. */
+export const IMAGE_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".tif", ".tiff", ".svg",
+]);
+
+/** Content-Type for a stored asset file, derived from its extension. Falls
+ *  back to octet-stream so unknown types still download instead of 500ing. */
+export function mediaMimeForFile(filename: string): string {
+  const ext = filename.slice(filename.lastIndexOf(".")).toLowerCase();
+  switch (ext) {
+    case ".mp4": case ".m4v": return "video/mp4";
+    case ".mov": return "video/quicktime";
+    case ".webm": return "video/webm";
+    case ".mkv": return "video/x-matroska";
+    case ".avi": return "video/x-msvideo";
+    case ".mpg": case ".mpeg": return "video/mpeg";
+    case ".jpg": case ".jpeg": return "image/jpeg";
+    case ".png": return "image/png";
+    case ".webp": return "image/webp";
+    case ".gif": return "image/gif";
+    case ".avif": return "image/avif";
+    case ".tif": case ".tiff": return "image/tiff";
+    case ".svg": return "image/svg+xml";
+    default: return "application/octet-stream";
+  }
+}
+
 // Absolute path to the generated output root (PRD §6).
 // Resolve relative to the monorepo root (not process.cwd()) so the CLI,
 // the dev server, and tests all share one DB + output directory.

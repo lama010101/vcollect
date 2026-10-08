@@ -3,6 +3,7 @@ import type { EditPlan, MusicEditSettings } from "@twio/shared";
 import {
   api,
   ASSETS_CHANGED_EVENT,
+  isImageFileName,
   type Asset,
   type MusicAnalysis,
   type MusicEditRequest,
@@ -293,7 +294,9 @@ export function MusicEdit({
         .syncProjectAssets(projectId)
         .catch(() => {}) // sync failure must not hide existing assets
         .then(() => api.searchAssetsAdvanced({ q: libraryQuery.trim() || undefined, downloadedOnly: true, sort: "newest_downloaded", limit: 200 }, projectId))
-        .then((r) => setLibrary(r.assets.filter((a) => a.local_path)))
+        // Images are project assets too (uploads/sync register them) but they
+        // can't be edit sources — keep the library videos-only.
+        .then((r) => setLibrary(r.assets.filter((a) => a.local_path && !isImageFileName(a.local_path))))
         .catch((e) => setError((e as Error).message))
         .finally(() => setLibraryLoading(false));
     }, 250);
@@ -511,7 +514,7 @@ export function MusicEdit({
             <div className="max-h-80 overflow-y-auto space-y-1 pr-1">
               {libraryLoading && <Spinner />}
               {!libraryLoading && library.length === 0 && (
-                <EmptyState icon="▤" title="No downloaded videos" description="Download footage from the Timeline or Search pages first." />
+                <EmptyState icon="▤" title="No downloaded videos" description="Download footage from the Timeline or Library pages first." />
               )}
               {library.map((a) => (
                 <div key={a.id} className="flex items-center gap-2 text-sm rounded px-2 py-1 hover:bg-slate-700/30">

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sanitizeFilename, uniqueDest, VIDEO_EXTENSIONS } from "../src/routes/uploads.ts";
+import { sanitizeFilename, uniqueDest, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, mediaKindForExt } from "../src/routes/uploads.ts";
 
 describe("uploads — sanitizeFilename", () => {
   it("keeps a normal filename unchanged", () => {
@@ -51,5 +51,25 @@ describe("uploads — VIDEO_EXTENSIONS", () => {
     }
     assert.ok(!VIDEO_EXTENSIONS.has(".exe"));
     assert.ok(!VIDEO_EXTENSIONS.has(".txt"));
+  });
+});
+
+describe("uploads — IMAGE_EXTENSIONS", () => {
+  it("covers common image formats", () => {
+    for (const ext of [".jpg", ".jpeg", ".png", ".webp", ".gif"]) {
+      assert.ok(IMAGE_EXTENSIONS.has(ext), ext);
+    }
+    assert.ok(!IMAGE_EXTENSIONS.has(".mp4"));
+    assert.ok(!IMAGE_EXTENSIONS.has(".txt"));
+  });
+});
+
+describe("uploads — mediaKindForExt", () => {
+  it("classifies videos and images, case-insensitive", () => {
+    assert.equal(mediaKindForExt(".mp4"), "video");
+    assert.equal(mediaKindForExt(".PNG"), "image");
+    assert.equal(mediaKindForExt(".jpeg"), "image");
+    assert.equal(mediaKindForExt(".exe"), null);
+    assert.equal(mediaKindForExt(""), null);
   });
 });

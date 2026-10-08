@@ -12,7 +12,7 @@
 
 import { exec } from "node:child_process";
 import { basename, dirname, resolve } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { OUTPUT_ROOT, projectPaths, type ProjectPaths } from "../config.js";
 import { db } from "../db/client.js";
 import { listAllAssets } from "../db/repository.js";
@@ -241,13 +241,17 @@ export function getFolders(projectId = PROJECT_ID_ALL): FoldersResponse {
 }
 
 /**
- * Reveal a file in the OS file explorer. On Windows: `explorer /select,"path"`.
- * On macOS: `open -R "path"`. On Linux: falls back to opening the containing dir.
+ * Reveal a file in the OS file explorer, or open it directly when it's a
+ * directory. On Windows: `explorer /select,"file"` selects the file while
+ * `explorer "dir"` opens the folder itself. On macOS: `open -R` reveals a
+ * file, plain `open` opens a dir. Linux: xdg-open on the dir (containing
+ * dir for files).
  */
 export function revealInExplorer(absolutePath: string): { ok: boolean; error?: string } {
   if (!existsSync(absolutePath)) {
     return { ok: false, error: `file does not exist: ${absolutePath}` };
   }
+  const isDir = statSync(absolutePath).isDirectory();
   const platform = process.platform;
   if (platform === "win32") {
     // explorer.exe is not always on PATH when spawned from Node; resolve it
@@ -257,18 +261,18 @@ export function revealInExplorer(absolutePath: string): { ok: boolean; error?: s
     const explorer = `${systemRoot}\\explorer.exe`;
     // explorer.exe returns exit code 1 even on success, so don't treat a
     // non-zero code as failure — only surface spawn errors.
-    exec(`"${explorer}" /select,"${winPath}"`, (err) => {
+    exec(isDir ? `"${explorer}" "${winPath}"` : `"${explorer}" /select,"${winPath}"`, (err) => {
       if (err) console.error(`[reveal] failed: ${err.message}`);
     });
     return { ok: true };
   } else if (platform === "darwin") {
-    exec(`open -R "${absolutePath}"`, (err) => {
+    exec(isDir ? `open "${absolutePath}"` : `open -R "${absolutePath}"`, (err) => {
       if (err) console.error(`[reveal] failed: ${err.message}`);
     });
     return { ok: true };
   } else {
-    // Linux: open the containing directory.
-    exec(`xdg-open "${dirname(absolutePath)}"`, (err) => {
+    // Linux: open the dir itself, or the containing dir for a file.
+    exec(`xdg-open "${isDir ? absolutePath : dirname(absolutePath)}"`, (err) => {
       if (err) console.error(`[reveal] failed: ${err.message}`);
     });
     return { ok: true };

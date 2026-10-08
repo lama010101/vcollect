@@ -84,27 +84,24 @@ function dotsPath(joints: Float32Array, r: number): string {
   return d;
 }
 
-/** The video layer as an embedded raster — render.ts decodes one frame
- *  (already cover-cropped to width×height) and hands it in as a data URI. */
-function videoImage(state: VizFrameState, width: number, height: number, layer: "under" | "over", videoImageHref?: string | null): string | null {
-  const v = state.video;
-  if (!v || v.layer !== layer || !videoImageHref || v.opacity <= 0) return null;
-  return `<image href="${videoImageHref}" xlink:href="${videoImageHref}" x="0" y="0" width="${width}" height="${height}" preserveAspectRatio="none" opacity="${f(v.opacity)}"/>`;
+/** One media layer's <image> — render.ts hands in the decoded frame already
+ *  cover-cropped to width×height; `scale` resizes the destination rect about
+ *  the layer's center (cx·w, cy·h) and cx/cy place that center anywhere in
+ *  the frame (<1 centered inset, >1 zooms — the viewBox clips the overflow).
+ *  Identical placement math to the Canvas preview's drawImage. */
+function layerImageTag(href: string, opacity: number, scale: number, width: number, height: number, cx: number, cy: number): string {
+  const dw = width * scale;
+  const dh = height * scale;
+  const x = cx * width - dw / 2;
+  const y = cy * height - dh / 2;
+  return `<image href="${href}" xlink:href="${href}" x="${f(x)}" y="${f(y)}" width="${f(dw)}" height="${f(dh)}" preserveAspectRatio="none" opacity="${f(opacity)}"/>`;
 }
 
-export function frameSvg(state: VizFrameState, width: number, height: number, background: string, videoImageHref?: string | null): string {
-  const parts: string[] = [
-    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
-    `<defs><radialGradient id="star"><stop offset="0%" stop-color="#ffffff" stop-opacity="1"/>`,
-    `<stop offset="35%" stop-color="#fff7e0" stop-opacity="0.55"/>`,
-    `<stop offset="100%" stop-color="#ffffff" stop-opacity="0"/></radialGradient></defs>`,
-    `<rect width="${width}" height="${height}" fill="${background}"/>`,
-  ];
-
-  // Backdrop video — sits above the background color, below every visual.
-  const under = videoImage(state, width, height, "under", videoImageHref);
-  if (under) parts.push(under);
-
+/** Every mode visual (ribbons/rings/bars/particles/mirrors/blocks/eqbars/
+ *  eqradial/stereos/silk) pushed into `parts` — extracted from frameSvg so the
+ *  visuals can sit at any row of the layer stack (wrapped in the row's
+ *  opacity/scale <g>). */
+function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
   // --- ribbons mode --------------------------------------------------------------
   for (const s of state.stems) {
     if (s.glowWidth > 0 && s.glowAlpha > 0.01) {
@@ -302,9 +299,40 @@ export function frameSvg(state: VizFrameState, width: number, height: number, ba
     }
   }
 
-  // Overlay video — above the mode visuals, below the dancer + star.
-  const over = videoImage(state, width, height, "over", videoImageHref);
-  if (over) parts.push(over);
+}
+
+export function frameSvg(state: VizFrameState, width: number, height: number, background: string, layerImageHrefs?: ReadonlyArray<string | null>): string {
+  const parts: string[] = [
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+    `<defs><radialGradient id="star"><stop offset="0%" stop-color="#ffffff" stop-opacity="1"/>`,
+    `<stop offset="35%" stop-color="#fff7e0" stop-opacity="0.55"/>`,
+    `<stop offset="100%" stop-color="#ffffff" stop-opacity="0"/></radialGradient></defs>`,
+    `<rect width="${width}" height="${height}" fill="${background}"/>`,
+  ];
+
+  // The layer stack — row order is the z-order, composited over the
+  // background. Media rows embed their decoded frame; a visuals row draws the
+  // whole mode-visual set at that position (wrapped in the row's opacity/scale
+  // <g>). With no visuals row the waveforms don't render at all. The dancer +
+  // convergence star always ride on top of the stack.
+  state.videoLayers.forEach((v, i) => {
+    if (v.hidden || v.opacity <= 0) return;
+    if (v.kind === "visuals") {
+      const inner: string[] = [];
+      modeVisualsSvg(state, inner);
+      if (inner.length === 0) return;
+      // Scale about the row's own center — which x/y move off the frame
+      // center (translate-to-center → scale → translate-back).
+      const tr =
+        Math.abs(v.scale - 1) > 1e-6 || v.x !== 0.5 || v.y !== 0.5
+          ? ` transform="translate(${f(v.x * width)} ${f(v.y * height)}) scale(${f(v.scale)}) translate(${f(-width / 2)} ${f(-height / 2)})"`
+          : "";
+      parts.push(`<g opacity="${f(v.opacity)}"${tr}>`, ...inner, "</g>");
+      return;
+    }
+    const href = layerImageHrefs?.[i];
+    if (href) parts.push(layerImageTag(href, v.opacity, v.scale, width, height, v.x, v.y));
+  });
 
   // --- procedural dancer -----------------------------------------------------------------
   const dn = state.dancer;

@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
 import { buildPeakSeries, buildStemSignal, isStemAudible, resolveStem, visualizerRenderSchema, type FrameStem, type VisualizerRenderInput } from "@twio/shared";
-import { projectPaths } from "../config.js";
+import { IMAGE_FILE_EXTENSIONS, projectPaths, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { getProject } from "../db/projectRepository.js";
 import { getAsset } from "../db/repository.js";
 import { AUDIO_EXTENSIONS, MAX_SONG_BYTES, fileUrl } from "../musicEdit/service.js";
@@ -17,7 +17,8 @@ import { probe, probeAudio } from "../video/ffprobe.js";
 import { decodeStem } from "./decode.js";
 import { VisualizerError } from "./errors.js";
 import { stemFeaturesOrNull } from "./features.js";
-import { renderVisualizer, type VizRenderProgress } from "./render.js";
+import { ensureKeyedVideo } from "./keying.js";
+import { renderVisualizer, type VizRenderLayer, type VizRenderProgress } from "./render.js";
 import { stemSignalPayload } from "./signals.js";
 
 export { MAX_SONG_BYTES };
@@ -131,24 +132,39 @@ export function startRenderJob(projectId: string, raw: VisualizerRenderInput): V
   const resolved = cfg.stems.map((s, i) => resolveStem(s, i));
   for (const s of resolved) stemPath(projectId, s.name); // 404 if missing
 
-  // Optional video layer — resolve + validate the project asset now so a bad
-  // pick fails the request (4xx) instead of the job.
-  const vcfg = cfg.globalVisuals.video;
-  let video: { path: string; layer: typeof vcfg.layer; opacity: number; chromaKey: typeof vcfg.chromaKey } | null = null;
-  if (vcfg.assetId) {
-    const a = getAsset(vcfg.assetId);
+  // Layer stack — resolve + validate every media row's project asset now so a
+  // bad pick fails the request (4xx) instead of the job. `kind:"visuals"` rows
+  // are placeholders keeping the array aligned with cfg.globalVisuals.video
+  // .layers (same row order = the render's z-order). Hidden media rows get the
+  // same placeholder: nothing draws at that slot, so a stale asset shouldn't
+  // fail the render and no decoder/probe/keying work is spent on it.
+  const videoLayers: VizRenderLayer[] = [];
+  cfg.globalVisuals.video.layers.forEach((l, i) => {
+    if (l.kind !== "media" || l.hidden) {
+      videoLayers.push({ kind: "visuals" });
+      return;
+    }
+    const a = getAsset(l.assetId);
     if (!a || a.project_id !== projectId) {
-      throw new VisualizerError(404, "VIDEO_ASSET_NOT_FOUND", `Video asset not found in this project: ${vcfg.assetId}`);
+      throw new VisualizerError(404, "LAYER_ASSET_NOT_FOUND", `Layer ${i + 1}: asset not found in this project: ${l.assetId}`);
     }
     if (!a.local_path) {
-      throw new VisualizerError(422, "VIDEO_NOT_DOWNLOADED", `Asset "${a.title ?? a.id}" has no downloaded file — download it first.`);
+      throw new VisualizerError(422, "LAYER_NOT_DOWNLOADED", `Layer ${i + 1}: asset "${a.title ?? a.id}" has no downloaded file — download it first.`);
     }
     const abs = assetAbsolutePath(a.local_path, "");
     if (!existsSync(abs)) {
-      throw new VisualizerError(404, "VIDEO_FILE_MISSING", `The asset's file is missing on disk: ${a.local_path}`);
+      throw new VisualizerError(404, "LAYER_FILE_MISSING", `Layer ${i + 1}: the asset's file is missing on disk: ${a.local_path}`);
     }
-    video = { path: abs, layer: vcfg.layer, opacity: vcfg.opacity, chromaKey: vcfg.chromaKey };
-  }
+    const ext = extname(abs).toLowerCase();
+    const isImage = IMAGE_FILE_EXTENSIONS.has(ext);
+    if (!isImage && !VIDEO_FILE_EXTENSIONS.has(ext)) {
+      throw new VisualizerError(422, "LAYER_UNSUPPORTED_MEDIA", `Layer ${i + 1}: "${a.title ?? a.id}" is neither a video nor an image.`);
+    }
+    if (isImage && l.key.method === "cutout") {
+      throw new VisualizerError(422, "LAYER_CUTOUT_NEEDS_VIDEO", `Layer ${i + 1}: AI cutout applies to videos — image layers already carry their own alpha.`);
+    }
+    videoLayers.push({ kind: "media", path: abs, isImage, key: l.key });
+  });
 
   const dir = visualizerDir(projectId, "renders");
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -193,11 +209,23 @@ export function startRenderJob(projectId: string, raw: VisualizerRenderInput): V
       job.progress = { phase: "decode", done: i + 1, total: resolved.length };
       if (job.controller.signal.aborted) throw new VisualizerError(499, "RENDER_CANCELLED", "Render cancelled.");
     }
-    if (video) {
+    for (const [i, l] of videoLayers.entries()) {
+      if (l.kind !== "media" || l.isImage) continue;
       try {
-        await probe(video.path); // throws when there is no decodable video stream
+        await probe(l.path); // throws when there is no decodable video stream
       } catch (e) {
-        throw new VisualizerError(422, "VIDEO_NOT_PLAYABLE", `The selected video is not playable: ${(e as Error).message}`);
+        throw new VisualizerError(422, "VIDEO_NOT_PLAYABLE", `Layer ${i + 1}: the selected video is not playable: ${(e as Error).message}`);
+      }
+      // AI cutout: the engine bakes the matte into a cached VP9-alpha WebM —
+      // generated here when the UI didn't already produce one (cache hits are
+      // instant, so a prepared preview costs the render nothing).
+      if (l.key.method === "cutout") {
+        job.progress = { phase: "keying", done: 0, total: 0 };
+        const keyed = await ensureKeyedVideo(projectId, l.path, l.key, {
+          signal: job.controller.signal,
+          onProgress: (p) => (job.progress = { phase: "keying", done: p.done, total: p.total }),
+        });
+        l.keyedPath = keyed.path;
       }
     }
     // "spectrum" draws real band envelopes — without engine features there is
@@ -212,7 +240,7 @@ export function startRenderJob(projectId: string, raw: VisualizerRenderInput): V
     return renderVisualizer(cfg, stems, {
       audiblePaths,
       outPath,
-      video,
+      videoLayers,
       signal: job.controller.signal,
       onProgress: (p) => (job.progress = p),
     });
@@ -242,7 +270,16 @@ export function getRenderJob(id: string): VizRenderJob {
 export function cancelRenderJob(id: string): VizRenderJob {
   const j = jobs.get(id);
   if (!j) throw new VisualizerError(404, "RENDER_NOT_FOUND", `Render job not found: ${id}`);
-  if (j.status === "running") j.controller.abort();
+  // abort() synchronously emits 'error' on every child spawned with this
+  // signal — if any lacks an 'error' listener the emit throws back up through
+  // this route, so guard it. Render teardown still runs via the aborted flag.
+  if (j.status === "running") {
+    try {
+      j.controller.abort();
+    } catch {
+      /* swallowed — job is marked cancelled by the render loop */
+    }
+  }
   return publicJob(j);
 }
 

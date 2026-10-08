@@ -6,17 +6,21 @@ import { join } from "node:path";
 import {
   buildStemSignal,
   chromaKeyFrame,
+  chromaKeyYUVFrame,
   computeDancer,
   computeFrame,
   coverCrop,
   detectStemKind,
   frameCenter,
   hash01,
+  hsvKeyFrame,
+  keyVideoFrame,
   peaksForWindow,
   resolveStem,
   ribbonOutline,
   stemAngles,
   visualizerRenderSchema,
+  vizVideoKeySchema,
   windowSlice,
   PEAK_RATE,
   VIZ_POINTS,
@@ -24,6 +28,7 @@ import {
   type StemKind,
   type StemSignal,
   type VizMode,
+  type VizVideoKeyConfig,
 } from "@twio/shared";
 import { decodeStem } from "../src/visualizer/decode.ts";
 import { renderVisualizer, muxArgs, videoDecoderArgs } from "../src/visualizer/render.ts";
@@ -187,6 +192,30 @@ describe("visualizer — signal + frame state", () => {
     assert.ok(svg.startsWith("<svg"));
     assert.ok(svg.includes("<path"));
     assert.ok(svg.includes("<circle"));
+  });
+
+  it("render settings accept portrait aspect ratios up to 4K", () => {
+    for (const [width, height] of [[1920, 1080], [1080, 1920], [2160, 3840], [1080, 1080]] as const) {
+      assert.ok(
+        visualizerRenderSchema.safeParse({
+          renderSettings: { width, height, fps: 30 },
+          globalVisuals: {},
+          stems: [{ name: "a.wav" }],
+        }).success,
+        `${width}×${height} must parse`,
+      );
+    }
+    for (const [width, height] of [[3841, 2160], [2160, 3841], [239, 240]] as const) {
+      assert.equal(
+        visualizerRenderSchema.safeParse({
+          renderSettings: { width, height, fps: 30 },
+          globalVisuals: {},
+          stems: [{ name: "a.wav" }],
+        }).success,
+        false,
+        `${width}×${height} must be rejected`,
+      );
+    }
   });
 });
 
@@ -466,7 +495,7 @@ describe("visualizer — modes + dancer", () => {
   });
 });
 
-describe("visualizer — video layer", () => {
+describe("visualizer — layer stack (media + visuals rows)", () => {
   const sr = 48000;
   const signal = buildStemSignal(sine(1.0, sr), sr);
   const stems: FrameStem[] = [{ cfg: resolveStem({ name: "x.wav", muted: false, solo: false }, 0), signal }];
@@ -476,26 +505,113 @@ describe("visualizer — video layer", () => {
       globalVisuals: { mode: "eqbars", video },
       stems: [{ name: "x.wav" }],
     }).globalVisuals;
+  /** Narrow a stack row to its media shape — the tests' compile-time guard. */
+  const mediaAt = (g: ReturnType<typeof globalsWith>, i: number) => {
+    const l = g.video.layers[i]!;
+    if (l.kind !== "media") throw new Error(`layer ${i} is ${l.kind}, expected media`);
+    return l;
+  };
 
-  it("schema defaults to no video, under-layer when one is picked", () => {
+  it("an absent video block defaults to a lone visuals row — old configs keep their waveforms", () => {
     const g = visualizerRenderSchema.parse({
       renderSettings: { width: 320, height: 240, fps: 30 },
       globalVisuals: {},
       stems: [{ name: "x.wav" }],
     }).globalVisuals;
-    assert.deepEqual(g.video, { assetId: null, layer: "under", opacity: 1, chromaKey: { enabled: false, color: "#00FF00", similarity: 0.12, blend: 0.02 } });
-    // computeFrame passes the placement through only when an asset is set.
-    assert.equal(computeFrame(stems, g, 320, 240, 0.5).video, null);
+    assert.deepEqual(g.video, { layers: [{ kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1 }] });
+    assert.deepEqual(computeFrame(stems, g, 320, 240, 0.5).videoLayers, [{ kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null }]);
+    // An explicit empty list is respected literally — nothing is drawn.
+    const empty = globalsWith({ layers: [] });
+    assert.deepEqual(empty.video.layers, []);
+    assert.deepEqual(computeFrame(stems, empty, 320, 240, 0.5).videoLayers, []);
+  });
+
+  it("legacy flat single-video configs fold to media + visuals at the band boundary", () => {
+    // {assetId} with the default "under" band → media under the visuals row.
     const gv = globalsWith({ assetId: "asset-1" });
-    assert.equal(gv.video.layer, "under"); // default layer
-    assert.deepEqual(computeFrame(stems, gv, 320, 240, 0.5).video, { layer: "under", opacity: 1, chromaKey: null });
-    // Invalid layer rejected.
-    const bad = visualizerRenderSchema.safeParse({
+    assert.equal(gv.video.layers.length, 2);
+    const m0 = mediaAt(gv, 0);
+    assert.equal(m0.assetId, "asset-1");
+    assert.equal(m0.layer, "under"); // deprecated hint kept through the fold
+    assert.equal(m0.opacity, 1);
+    assert.equal(gv.video.layers[1]!.kind, "visuals");
+    assert.deepEqual(computeFrame(stems, gv, 320, 240, 0.5).videoLayers, [
+      { kind: "media", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null },
+      { kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null },
+    ]);
+    // Old "over" band → the visuals row sits under the media row.
+    const gvo = globalsWith({ assetId: "asset-1", layer: "over", opacity: 0.7 });
+    assert.deepEqual(gvo.video.layers.map((l) => l.kind), ["visuals", "media"]);
+    assert.equal(mediaAt(gvo, 1).opacity, 0.7);
+  });
+
+  it("band-model rows restore the visuals row at the under/over boundary; new rows stay verbatim", () => {
+    const g = globalsWith({
+      layers: [
+        { assetId: "a1", layer: "under" },
+        { assetId: "a2", layer: "under" },
+        { assetId: "a3", layer: "over" },
+      ],
+    });
+    assert.deepEqual(g.video.layers.map((l) => l.kind), ["media", "media", "visuals", "media"]);
+    // Rows without the deprecated hint are trusted as-is — a media-only stack
+    // renders no waveforms, and an explicit visuals row keeps its position.
+    const mediaOnly = globalsWith({ layers: [{ assetId: "a1" }, { assetId: "a2" }] });
+    assert.deepEqual(mediaOnly.video.layers.map((l) => l.kind), ["media", "media"]);
+    const fresh = globalsWith({ layers: [{ assetId: "a1" }, { kind: "visuals" }, { assetId: "a2" }] });
+    assert.deepEqual(fresh.video.layers.map((l) => l.kind), ["media", "visuals", "media"]);
+  });
+
+  it("schema bounds: invalid kind/band/scale and the 10-row cap", () => {
+    for (const video of [
+      { layers: [{ kind: "bogus" }] },
+      { layers: [{ kind: "media" }] }, // media rows need an assetId
+      { layers: [{ assetId: "a", layer: "sideways" }] },
+    ]) {
+      assert.equal(
+        visualizerRenderSchema.safeParse({
+          renderSettings: { width: 320, height: 240, fps: 30 },
+          globalVisuals: { video },
+          stems: [{ name: "x.wav" }],
+        }).success,
+        false,
+        JSON.stringify(video),
+      );
+    }
+    for (const scale of [0, 0.05, 2.5]) {
+      assert.equal(
+        visualizerRenderSchema.safeParse({
+          renderSettings: { width: 320, height: 240, fps: 30 },
+          globalVisuals: { video: { layers: [{ assetId: "a", scale }] } },
+          stems: [{ name: "x.wav" }],
+        }).success,
+        false,
+        `scale ${scale} must be rejected`,
+      );
+      // The bound applies to visuals rows too.
+      assert.equal(
+        visualizerRenderSchema.safeParse({
+          renderSettings: { width: 320, height: 240, fps: 30 },
+          globalVisuals: { video: { layers: [{ kind: "visuals", scale }] } },
+          stems: [{ name: "x.wav" }],
+        }).success,
+        false,
+        `visuals scale ${scale} must be rejected`,
+      );
+    }
+    // The cap counts every row — a visuals row doesn't squeeze in an 11th.
+    const tooMany = visualizerRenderSchema.safeParse({
       renderSettings: { width: 320, height: 240, fps: 30 },
-      globalVisuals: { video: { assetId: "a", layer: "sideways" } },
+      globalVisuals: { video: { layers: [...Array.from({ length: 9 }, (_, i) => ({ assetId: `a${i}` })), { kind: "visuals" }, { assetId: "a9" }] } },
       stems: [{ name: "x.wav" }],
     });
-    assert.equal(bad.success, false);
+    assert.equal(tooMany.success, false);
+    // Scale rides through the frame state on both row kinds.
+    const scaled = globalsWith({ layers: [{ assetId: "a", scale: 0.5 }, { kind: "visuals", scale: 1.5 }] });
+    assert.deepEqual(
+      computeFrame(stems, scaled, 320, 240, 0.5).videoLayers.map((v) => v.scale),
+      [0.5, 1.5],
+    );
   });
 
   it("coverCrop computes the centered cover-fit source rect", () => {
@@ -507,23 +623,111 @@ describe("visualizer — video layer", () => {
     assert.deepEqual(coverCrop(640, 480, 320, 240), [0, 0, 640, 480]);
   });
 
-  it("frameSvg orders the <image> under the visuals or over them", () => {
-    const state = computeFrame(stems, globalsWith({ assetId: "asset-1", layer: "under" }), 320, 240, 0.5);
-    const svgU = frameSvg(state, 320, 240, "#050508", "data:image/jpeg;base64,QUJD");
-    const imgU = svgU.indexOf("<image");
-    assert.ok(imgU > svgU.indexOf("<rect")); // after the background
-    assert.ok(imgU > 0 && imgU < svgU.indexOf("<path")); // before mode visuals
-    assert.ok(svgU.includes('opacity="1"'));
-
-    const stateO = computeFrame(stems, globalsWith({ assetId: "asset-1", layer: "over", opacity: 0.7 }), 320, 240, 0.5);
-    const svgO = frameSvg(stateO, 320, 240, "#050508", "data:image/jpeg;base64,QUJD");
-    const imgO = svgO.indexOf("<image");
-    assert.ok(imgO > svgO.lastIndexOf("<path")); // after all mode paths (dancer off)
-    assert.ok(svgO.includes('opacity="0.7"'));
-
-    // No decoded frame supplied → no <image> element at all.
+  it("frameSvg draws media and visuals rows in stack order", () => {
+    const g = globalsWith({
+      layers: [
+        { assetId: "a1" },            // bottom
+        { kind: "visuals" },          // waveforms in the middle
+        { assetId: "a2", opacity: 0.7 }, // top
+      ],
+    });
+    const state = computeFrame(stems, g, 320, 240, 0.5);
+    assert.equal(state.videoLayers.length, 3);
+    // Hrefs stay index-aligned — the visuals row takes a null slot.
+    const svg = frameSvg(state, 320, 240, "#050508", ["data:AAAA", null, "data:CCCC"]);
+    const ia = svg.indexOf("data:AAAA");
+    const ic = svg.indexOf("data:CCCC");
+    const gStart = svg.indexOf("<g opacity");
+    const gEnd = svg.indexOf("</g>");
+    const firstPath = svg.indexOf("<path");
+    assert.ok(ia > svg.indexOf("<rect"));              // a1 over the background
+    assert.ok(ia < gStart && gStart < firstPath);      // then the visuals group
+    assert.ok(firstPath > 0 && firstPath < gEnd);      // mode visuals inside it
+    assert.ok(ic > gEnd);                              // a2 on top of everything
+    assert.ok(svg.includes('opacity="0.7"'));
+    // A missing href leaves a gap, not an <image>.
     const svgNone = frameSvg(state, 320, 240, "#050508");
     assert.equal(svgNone.indexOf("<image"), -1);
+    assert.ok(svgNone.indexOf("<path") > 0); // visuals row still draws
+  });
+
+  it("frameSvg draws no mode visuals without a visuals row", () => {
+    // Media-only stack: no mode-visual <path>s anywhere (dancer off; the star
+    // is a <circle> — only the layer <image> + background remain).
+    const mediaOnly = computeFrame(stems, globalsWith({ layers: [{ assetId: "a" }] }), 320, 240, 0.5);
+    const svgM = frameSvg(mediaOnly, 320, 240, "#050508", ["data:X"]);
+    assert.ok(svgM.indexOf("<image") > 0);
+    assert.equal(svgM.indexOf("<path"), -1);
+    // Visuals-only stack: waveforms with no media <image>.
+    const visualsOnly = computeFrame(stems, globalsWith({ layers: [{ kind: "visuals" }] }), 320, 240, 0.5);
+    const svgV = frameSvg(visualsOnly, 320, 240, "#050508");
+    assert.equal(svgV.indexOf("<image"), -1);
+    assert.ok(svgV.indexOf("<path") > 0);
+    // Empty stack: literally just the background + convergence star.
+    const bare = computeFrame(stems, globalsWith({ layers: [] }), 320, 240, 0.5);
+    const svgB = frameSvg(bare, 320, 240, "#050508");
+    assert.equal(svgB.indexOf("<image"), -1);
+    assert.equal(svgB.indexOf("<path"), -1);
+  });
+
+  it("frameSvg wraps a visuals row in its own opacity/scale group", () => {
+    const g = globalsWith({ layers: [{ kind: "visuals", opacity: 0.5, scale: 1.5 }] });
+    const svg = frameSvg(computeFrame(stems, g, 320, 240, 0.5), 320, 240, "#050508");
+    assert.ok(svg.includes('<g opacity="0.5" transform="translate(160 120) scale(1.5) translate(-160 -120)">'));
+    // Scale 1 → no transform attribute at all.
+    const svg1 = frameSvg(computeFrame(stems, globalsWith({ layers: [{ kind: "visuals" }] }), 320, 240, 0.5), 320, 240, "#050508");
+    assert.ok(svg1.includes('<g opacity="1">'));
+    assert.ok(!svg1.includes("transform="));
+  });
+
+  it("frameSvg centers a scaled layer — <1 shrinks, >1 overflows (zoom)", () => {
+    const small = computeFrame(stems, globalsWith({ layers: [{ assetId: "a", scale: 0.5 }] }), 320, 240, 0.5);
+    const svgS = frameSvg(small, 320, 240, "#050508", ["data:X"]);
+    assert.ok(svgS.includes('x="80" y="60" width="160" height="120"'));
+
+    const big = computeFrame(stems, globalsWith({ layers: [{ assetId: "a", scale: 1.5 }] }), 320, 240, 0.5);
+    const svgB = frameSvg(big, 320, 240, "#050508", ["data:X"]);
+    assert.ok(svgB.includes('x="-80" y="-60" width="480" height="360"'));
+  });
+
+  it("hidden rows keep their stack slot but draw nothing", () => {
+    const g = globalsWith({
+      layers: [
+        { assetId: "a1" },                  // bottom — visible
+        { kind: "visuals", hidden: true },  // waveforms off
+        { assetId: "a2", hidden: true },    // media off
+      ],
+    });
+    assert.deepEqual(g.video.layers.map((l) => l.hidden), [false, true, true]);
+    const state = computeFrame(stems, g, 320, 240, 0.5);
+    assert.deepEqual(state.videoLayers.map((v) => v.hidden), [false, true, true]);
+    const svg = frameSvg(state, 320, 240, "#050508", ["data:AAAA", null, "data:CCCC"]);
+    assert.ok(svg.includes("data:AAAA"));        // the visible media row still draws
+    assert.equal(svg.indexOf("data:CCCC"), -1);  // hidden media row — no <image>
+    assert.equal(svg.indexOf("<path"), -1);      // hidden visuals row — no waveforms
+    // Every row hidden → background + convergence star only.
+    const allHidden = computeFrame(stems, globalsWith({ layers: [{ assetId: "a", hidden: true }] }), 320, 240, 0.5);
+    assert.equal(frameSvg(allHidden, 320, 240, "#050508", ["data:X"]).indexOf("<image"), -1);
+  });
+
+  it("layer center x/y moves the drawn position — media rect + visuals group", () => {
+    const g = globalsWith({
+      layers: [
+        { assetId: "a", x: 0.25, y: 0.75 },
+        { kind: "visuals", x: 0.25, y: 0.75 },
+      ],
+    });
+    assert.deepEqual(g.video.layers.map((l) => [l.x, l.y]), [[0.25, 0.75], [0.25, 0.75]]);
+    const state = computeFrame(stems, g, 320, 240, 0.5);
+    assert.deepEqual(state.videoLayers.map((v) => [v.x, v.y]), [[0.25, 0.75], [0.25, 0.75]]);
+    const svg = frameSvg(state, 320, 240, "#050508", ["data:X", null]);
+    // Media row: the layer's center lands at (0.25·320, 0.75·240) = (80, 180).
+    assert.ok(svg.includes('x="-80" y="60"'));
+    // Visuals row: the group scales about that same center point.
+    assert.ok(svg.includes('<g opacity="1" transform="translate(80 180) scale(1) translate(-160 -120)">'));
+    // Centered rows (the default) emit no transform at all.
+    const centered = frameSvg(computeFrame(stems, globalsWith({ layers: [{ kind: "visuals" }] }), 320, 240, 0.5), 320, 240, "#050508");
+    assert.ok(!centered.includes("transform="));
   });
 
   it("chromaKeyFrame drops pixels within similarity and feathers the edge", () => {
@@ -540,28 +744,180 @@ describe("visualizer — video layer", () => {
     const px2 = new Uint8ClampedArray([0, 255, 0, 128]);
     chromaKeyFrame(px2, "#00FF00", 0.12, 0.02);
     assert.equal(px2[3], 0);
-    // state.video carries the key config only while enabled.
+    // state.videoLayers carries the key config only on media rows with one set.
     const gk = globalsWith({ assetId: "asset-1", chromaKey: { enabled: true, color: "#FF00FF", similarity: 0.2, blend: 0.05 } });
-    assert.deepEqual(computeFrame(stems, gk, 320, 240, 0.5).video, {
-      layer: "under",
-      opacity: 1,
-      chromaKey: { enabled: true, color: "#FF00FF", similarity: 0.2, blend: 0.05 },
-    });
+    assert.deepEqual(computeFrame(stems, gk, 320, 240, 0.5).videoLayers, [
+      {
+        kind: "media",
+        hidden: false,
+        x: 0.5,
+        y: 0.5,
+        opacity: 1,
+        scale: 1,
+        // Legacy chromaKey folds into key (colorkey method, despill kept off
+        // so old configs render identically).
+        key: { method: "colorkey", color: "#FF00FF", similarity: 0.2, blend: 0.05, despill: false, choke: 0, model: "mediapipe", feather: 1 },
+      },
+      { kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null },
+    ]);
   });
 
-  it("videoDecoderArgs switches to rgba + colorkey when keying is on", () => {
-    const off = videoDecoderArgs("/tmp/clip.mp4", 320, 240, 30, { enabled: false, color: "#00FF00", similarity: 0.12, blend: 0.02 });
-    assert.equal(off.channels, 3);
-    assert.ok(off.args.join(" ").includes("-pix_fmt rgb24"));
-    assert.ok(!off.args.join(" ").includes("colorkey"));
+  it("video key schema migrates legacy chromaKey and validates methods", () => {
+    // Old wire shape: chromaKey.enabled → key.method "colorkey".
+    const migrated = visualizerRenderSchema.parse({
+      renderSettings: { width: 320, height: 240, fps: 30 },
+      globalVisuals: { video: { assetId: "a", chromaKey: { enabled: true, color: "#112233", similarity: 0.3, blend: 0.04 } } },
+      stems: [{ name: "x.wav" }],
+    }).globalVisuals;
+    assert.equal(mediaAt(migrated, 0).key.method, "colorkey");
+    assert.equal(mediaAt(migrated, 0).key.color, "#112233");
+    assert.equal(mediaAt(migrated, 0).key.similarity, 0.3);
+    assert.equal(mediaAt(migrated, 0).key.despill, false); // legacy parity
+    // Explicit new-style key wins over a stray legacy field.
+    const both = visualizerRenderSchema.parse({
+      renderSettings: { width: 320, height: 240, fps: 30 },
+      globalVisuals: { video: { assetId: "a", chromaKey: { enabled: true }, key: { method: "hsv", color: "#00FF00" } } },
+      stems: [{ name: "x.wav" }],
+    }).globalVisuals;
+    assert.equal(mediaAt(both, 0).key.method, "hsv");
+    // Per-layer key config: a chromaKey field on a layers[] row folds too.
+    const perLayer = visualizerRenderSchema.parse({
+      renderSettings: { width: 320, height: 240, fps: 30 },
+      globalVisuals: { video: { layers: [{ assetId: "a", chromaKey: { enabled: true, color: "#112233" } }] } },
+      stems: [{ name: "x.wav" }],
+    }).globalVisuals;
+    assert.equal(mediaAt(perLayer, 0).key.method, "colorkey");
+    assert.equal(mediaAt(perLayer, 0).key.color, "#112233");
+    // cutout carries model + feather defaults.
+    const cut = visualizerRenderSchema.parse({
+      renderSettings: { width: 320, height: 240, fps: 30 },
+      globalVisuals: { video: { assetId: "a", key: { method: "cutout" } } },
+      stems: [{ name: "x.wav" }],
+    }).globalVisuals;
+    assert.equal(mediaAt(cut, 0).key.method, "cutout");
+    assert.equal(mediaAt(cut, 0).key.model, "mediapipe");
+    // Unknown method / model rejected.
+    assert.equal(vizVideoKeySchema.safeParse({ method: "magic" }).success, false);
+    assert.equal(vizVideoKeySchema.safeParse({ method: "cutout", model: "rvm" }).success, false);
+  });
+});
 
-    const on = videoDecoderArgs("/tmp/clip.mp4", 320, 240, 30, { enabled: true, color: "#FF00FF", similarity: 0.25, blend: 0.05 });
+describe("visualizer — advanced keying", () => {
+  const keyOf = (patch: Partial<VizVideoKeyConfig>): VizVideoKeyConfig =>
+    vizVideoKeySchema.parse(patch);
+
+  /** Fill an RGBA buffer with a flat color (alpha 255). */
+  const flat = (w: number, h: number, r: number, g: number, b: number): Uint8ClampedArray => {
+    const px = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      px[i * 4] = r;
+      px[i * 4 + 1] = g;
+      px[i * 4 + 2] = b;
+      px[i * 4 + 3] = 255;
+    }
+    return px;
+  };
+
+  it("chromaKeyYUVFrame keys a uniform key-color frame, keeps a far color", () => {
+    const green = flat(16, 8, 0, 255, 0);
+    chromaKeyYUVFrame(green, 16, 8, "#00FF00", 0.1, 0.02);
+    assert.ok(green.every((v, i) => i % 4 !== 3 || v === 0)); // all alpha 0
+
+    const magenta = flat(16, 8, 255, 0, 255);
+    chromaKeyYUVFrame(magenta, 16, 8, "#00FF00", 0.1, 0.02);
+    // Interior pixels (full 3×3 chroma neighbourhood) stay opaque.
+    const mid = (4 * 16 + 8) * 4 + 3;
+    assert.equal(magenta[mid], 255);
+  });
+
+  it("hsvKeyFrame keys by hue — greys survive, same-hue fades", () => {
+    const px = new Uint8ClampedArray([
+      0, 255, 0, 255,     // pure key green → gone
+      128, 128, 128, 255, // grey: no hue → survives
+      10, 250, 10, 255,   // near-key green → gone
+      255, 0, 0, 255,     // red → survives
+    ]);
+    hsvKeyFrame(px, 4, 1, "#00FF00", 0.12, 0.02);
+    assert.equal(px[3], 0);
+    assert.equal(px[7], 255);
+    assert.equal(px[11], 0);
+    assert.equal(px[15], 255);
+    // Black survives a green key (value term protects it).
+    const dark = new Uint8ClampedArray([10, 10, 10, 255]);
+    hsvKeyFrame(dark, 1, 1, "#00FF00", 0.12, 0.02);
+    assert.equal(dark[3], 255);
+  });
+
+  it("hsvKeyFrame choke erodes the opaque matte edge", () => {
+    // 7×1: skin-ish pixels at both ends, green middle.
+    const row = () => {
+      const buf = new Uint8ClampedArray(7 * 4);
+      const put = (x: number, r: number, g: number, b: number) => buf.set([r, g, b, 255], x * 4);
+      put(0, 200, 150, 120); put(1, 200, 150, 120);
+      put(2, 0, 255, 0); put(3, 0, 255, 0); put(4, 0, 255, 0);
+      put(5, 200, 150, 120); put(6, 200, 150, 120);
+      return buf;
+    };
+    const alphas = (b: Uint8ClampedArray) => [0, 1, 2, 3, 4, 5, 6].map((x) => b[x * 4 + 3]);
+    const unchoked = row();
+    hsvKeyFrame(unchoked, 7, 1, "#00FF00", 0.12, 0.02);
+    assert.deepEqual(alphas(unchoked), [255, 255, 0, 0, 0, 255, 255]);
+    // choke=1: opaque pixels adjacent to transparent ones erode away.
+    const choked = row();
+    hsvKeyFrame(choked, 7, 1, "#00FF00", 0.12, 0.02, 1);
+    assert.deepEqual(alphas(choked), [255, 0, 0, 0, 0, 0, 255]);
+  });
+
+  it("keyVideoFrame dispatches methods, applies despill, ignores cutout", () => {
+    // none → untouched.
+    const a = new Uint8ClampedArray([0, 255, 0, 255]);
+    keyVideoFrame(a, 1, 1, keyOf({ method: "none" }));
+    assert.equal(a[3], 255);
+    // cutout → no-op here (alpha rides the keyed WebM upstream).
+    const c = new Uint8ClampedArray([0, 255, 0, 255]);
+    keyVideoFrame(c, 1, 1, keyOf({ method: "cutout", model: "modnet" }));
+    assert.equal(c[3], 255);
+    // colorkey → green gone.
+    const k = new Uint8ClampedArray([0, 255, 0, 255]);
+    keyVideoFrame(k, 1, 1, keyOf({ method: "colorkey" }));
+    assert.equal(k[3], 0);
+    // despill clamps the dominant (green) channel toward the others on
+    // surviving edge pixels.
+    const d = new Uint8ClampedArray([60, 230, 60, 255]); // greenish, partial key
+    keyVideoFrame(d, 1, 1, keyOf({ method: "colorkey", similarity: 0.01, blend: 0.001, despill: true }));
+    assert.equal(d[3], 255); // far enough → opaque
+    assert.ok(d[1]! < 230);  // green excess removed
+    // Same pixel without despill keeps its green.
+    const d2 = new Uint8ClampedArray([60, 230, 60, 255]);
+    keyVideoFrame(d2, 1, 1, keyOf({ method: "colorkey", similarity: 0.01, blend: 0.001, despill: false }));
+    assert.equal(d2[1], 230);
+  });
+
+  it("videoDecoderArgs switches channels + input for keying and keyed WebM", () => {
+    const keyOff = keyOf({ method: "none" });
+    const off = videoDecoderArgs("/tmp/clip.mp4", 320, 240, 30, keyOff);
+    assert.equal(off.channels, 3);
+    assert.equal(off.keyed, false);
+    assert.ok(off.args.join(" ").includes("-pix_fmt rgb24"));
+    assert.ok(!off.args.join(" ").includes("format=rgba"));
+
+    // Color keyers decode to rgba; the JS key pass runs post-decode (no
+    // colorkey/chromakey filter in the pipe — parity with the Canvas preview).
+    const on = videoDecoderArgs("/tmp/clip.mp4", 320, 240, 30, keyOf({ method: "chromakey", color: "#FF00FF", similarity: 0.25, blend: 0.05 }));
     assert.equal(on.channels, 4);
-    const args = on.args.join(" ");
-    assert.ok(args.includes("-pix_fmt rgba"));
-    assert.ok(args.includes("colorkey=0xFF00FF:0.25:0.05"));
-    // Key applied after the cover crop so both paths see identical pixels.
-    assert.ok(on.args[on.args.indexOf("-vf") + 1]!.startsWith("fps=30,scale=320:240:force_original_aspect_ratio=increase,crop=320:240,format=rgba,colorkey="));
+    assert.equal(on.keyed, true);
+    const vf = on.args[on.args.indexOf("-vf") + 1]!;
+    assert.equal(vf, "fps=30,scale=320:240:force_original_aspect_ratio=increase,crop=320:240,format=rgba");
+    assert.ok(on.args.join(" ").includes("-pix_fmt rgba"));
+    assert.ok(!on.args.join(" ").includes("colorkey="));
+
+    // Cutout → decode the baked WebM with libvpx (alpha survives), ignore src.
+    const cut = videoDecoderArgs("/tmp/clip.mp4", 320, 240, 30, keyOf({ method: "cutout" }), "/tmp/keyed.webm");
+    assert.equal(cut.channels, 4);
+    assert.ok(cut.args.join(" ").includes("-c:v libvpx-vp9"));
+    // resolve()d inside — assert on the basename, not the literal posix path.
+    assert.ok(cut.args.some((a) => a.includes("keyed.webm")));
+    assert.ok(!cut.args.some((a) => a.includes("clip.mp4")));
   });
 });
 

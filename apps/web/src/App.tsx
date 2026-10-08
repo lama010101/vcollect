@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { api, ASSETS_CHANGED_EVENT, type Project, type Task } from "./api.js";
+import { api, ASSETS_CHANGED_EVENT, isMediaFile, type Project, type Task } from "./api.js";
 import { Dashboard } from "./pages/Dashboard.js";
 import { TimelinePage } from "./pages/Timeline.js";
 import { ShotReview } from "./pages/ShotReview.js";
 import { Help } from "./pages/Help.js";
 import { Folders } from "./pages/Folders.js";
-import { SearchPage } from "./pages/Search.js";
+import { LibraryPage } from "./pages/Library.js";
 import { Projects } from "./pages/Projects.js";
 import { ImportScript } from "./pages/ImportScript.js";
 import { MusicEdit } from "./pages/MusicEdit.js";
@@ -20,7 +20,7 @@ type View =
   | { name: "timeline" }
   | { name: "review"; shotId: string }
   | { name: "folders" }
-  | { name: "search" }
+  | { name: "library" }
   | { name: "projects" }
   | { name: "import" }
   | { name: "music" }
@@ -31,16 +31,13 @@ const PROJECT_STORAGE_KEY = "twio.activeProjectId";
 const SIDEBAR_STORAGE_KEY = "twio.ui.sidebarCollapsed";
 const THEME_STORAGE_KEY = "twio.theme";
 
-const VIDEO_FILE_RE = /\.(mp4|mov|webm|mkv|avi|m4v|mpg|mpeg)$/i;
-const isVideoFile = (f: File) => f.type.startsWith("video/") || VIDEO_FILE_RE.test(f.name);
-
 const NAV_ITEMS: Array<{ key: View["name"]; label: string; icon: string; desc: string }> = [
   { key: "dashboard", label: "Dashboard", icon: "▣", desc: "Overview & actions" },
+  { key: "library", label: "Library", icon: "⌕", desc: "Browse all assets — videos & images" },
   { key: "import", label: "Import Script", icon: "♪", desc: "Paste script to create shots + timeline" },
   { key: "timeline", label: "Timeline", icon: "▬", desc: "Shot schedule" },
   { key: "music", label: "Music Edit", icon: "♫", desc: "Beat-synced music video from a song" },
   { key: "visualizer", label: "Visualizer", icon: "∿", desc: "Multi-stem waveform video renderer" },
-  { key: "search", label: "Search", icon: "⌕", desc: "Find assets" },
   { key: "folders", label: "Folders", icon: "▤", desc: "Browse files" },
   { key: "projects", label: "Projects", icon: "◇", desc: "Manage projects" },
   { key: "help", label: "Help", icon: "?", desc: "How it works" },
@@ -53,6 +50,7 @@ const VIEW_SLUGS = NAV_ITEMS.map((n) => n.key) as string[];
 function viewFromHash(hash: string): View {
   const [head = "", arg] = hash.replace(/^#\/?/, "").split("/");
   if (head === "shot" && arg) return { name: "review", shotId: decodeURIComponent(arg) };
+  if (head === "search") return { name: "library" }; // legacy hash → Library
   if (head && VIEW_SLUGS.includes(head)) return { name: head as Exclude<View["name"], "review"> };
   return { name: "dashboard" };
 }
@@ -82,8 +80,8 @@ export default function App() {
     localStorage.getItem(THEME_STORAGE_KEY) === "light" ? "light" : "dark",
   );
   const { push, Toasts } = useToast();
-  // Global drag & drop: files dropped anywhere on the window upload into the
-  // active project's assets folder.
+  // Global drag & drop: videos/images dropped anywhere on the window upload
+  // into the active project's assets folder.
   const [dragActive, setDragActive] = useState(false);
   const dragDepth = useRef(0);
   const [uploading, setUploading] = useState<{ done: number; total: number; failed: number } | null>(null);
@@ -148,19 +146,19 @@ export default function App() {
 
   async function handleDroppedFiles(files: FileList | File[] | null | undefined) {
     if (!files || files.length === 0) return;
-    const videos = [...files].filter(isVideoFile);
-    if (videos.length === 0) {
-      push("No video files in that drop (mp4, mov, webm, mkv, avi, m4v).", "error");
+    const media = [...files].filter(isMediaFile);
+    if (media.length === 0) {
+      push("No video or image files in that drop (mp4, mov, webm, mkv, avi, m4v, jpg, png, webp…).", "error");
       return;
     }
     if (isAllProjects) {
-      push("Select a specific project before dropping videos — each project has its own assets folder.", "error");
+      push("Select a specific project before dropping files — each project has its own assets folder.", "error");
       return;
     }
-    setUploading({ done: 0, total: videos.length, failed: 0 });
+    setUploading({ done: 0, total: media.length, failed: 0 });
     let ok = 0;
     let failed = 0;
-    for (const f of videos) {
+    for (const f of media) {
       try {
         await api.uploadProjectAsset(activeProjectId, f);
         ok++;
@@ -168,14 +166,14 @@ export default function App() {
         failed++;
         console.error(`[upload] ${f.name}: ${(e as Error).message}`);
       }
-      setUploading({ done: ok + failed, total: videos.length, failed });
+      setUploading({ done: ok + failed, total: media.length, failed });
     }
     setUploading(null);
     window.dispatchEvent(new Event(ASSETS_CHANGED_EVENT));
     if (failed === 0) {
-      push(`${ok} video${ok === 1 ? "" : "s"} added to ${activeProject?.name ?? "the project"}.`, "success");
+      push(`${ok} file${ok === 1 ? "" : "s"} added to ${activeProject?.name ?? "the project"}.`, "success");
     } else {
-      push(`${ok} uploaded, ${failed} failed — check the files and try again.`, failed === videos.length ? "error" : "info");
+      push(`${ok} uploaded, ${failed} failed — check the files and try again.`, failed === media.length ? "error" : "info");
     }
   }
 
@@ -381,7 +379,7 @@ export default function App() {
             )}
             {view.name === "review" && <ShotReview shotId={view.shotId} onBack={() => navigate({ name: "timeline" })} />}
             {view.name === "folders" && <Folders projectId={activeProjectId} projects={projects} />}
-            {view.name === "search" && <SearchPage projectId={activeProjectId} />}
+            {view.name === "library" && <LibraryPage projectId={activeProjectId} />}
             {view.name === "projects" && <Projects onChanged={loadProjects} onSwitch={switchProject} onImport={(pid) => { switchProject(pid); navigate({ name: "import" }); }} activeProjectId={activeProjectId} />}
             {view.name === "import" && !isAllProjects && (
               <ImportScript
@@ -428,7 +426,7 @@ export default function App() {
             <div className="text-lg font-semibold text-sky-300">
               {isAllProjects
                 ? "Select a project first"
-                : `Drop videos to add to ${activeProject?.name ?? "the project"}`}
+                : `Drop videos or images to add to ${activeProject?.name ?? "the project"}`}
             </div>
             <div className="text-xs text-slate-400 mt-1">
               Files land in the project's assets/uploads folder
@@ -440,7 +438,7 @@ export default function App() {
       {/* Upload progress indicator */}
       {uploading && (
         <div className="fixed bottom-4 right-4 z-[80] ui-card px-4 py-3 text-sm text-slate-200 shadow-lg">
-          Uploading {uploading.done}/{uploading.total} video{uploading.total === 1 ? "" : "s"}
+          Uploading {uploading.done}/{uploading.total} file{uploading.total === 1 ? "" : "s"}
           {uploading.failed > 0 && <span className="text-rose-400"> · {uploading.failed} failed</span>}
         </div>
       )}

@@ -9,28 +9,49 @@
 
 import type { ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import sharp from "sharp";
-import { computeDancer, computeFrame, frameCenter, type FrameStem, type VisualizerRenderInput, type VizChromaKeyConfig, type VizVideoLayer } from "@twio/shared";
+import { computeDancer, computeFrame, frameCenter, keyVideoFrame, VIZ_JS_KEY_METHODS, type FrameStem, type VisualizerRenderInput, type VizVideoKeyConfig } from "@twio/shared";
 import { ffmpegService } from "../video/ffmpeg.js";
 import { probe, probeAudio } from "../video/ffprobe.js";
 import { VisualizerError } from "./errors.js";
 import { frameSvg } from "./svg.js";
 
 export interface VizRenderProgress {
-  phase: "decode" | "frames" | "mux" | "verify";
+  phase: "decode" | "keying" | "frames" | "mux" | "verify";
   done: number;
   total: number;
 }
+
+/** A resolved stack row — aligned by index with `globalVisuals.video.layers`
+ *  and `state.videoLayers`. Media rows carry the local file + keying; visuals
+ *  rows are placeholders — their pixels come from modeVisualsSvg, not a file.
+ *  Ordering/opacity/scale ride through `state.videoLayers`, so placement
+ *  logic stays in the shared frame state. */
+export type VizRenderLayer =
+  | { kind: "visuals" }
+  | {
+      kind: "media";
+      path: string;
+      /** Static image layer — decoded once instead of streamed per frame. */
+      isImage: boolean;
+      key: VizVideoKeyConfig;
+      /** Engine-baked VP9-alpha WebM used for `key.method = "cutout"` (videos
+       *  only); when set the decoder reads it instead of `path` and the alpha
+       *  arrives baked into the rgba frames (no in-process key pass). */
+      keyedPath?: string;
+    };
 
 export interface VizRenderOptions {
   /** Absolute paths of the audible stems, in the same order as stems[]. */
   audiblePaths: string[];
   outPath: string;
-  /** Optional video layer — resolved local file + draw placement/opacity/key. */
-  video?: { path: string; layer: VizVideoLayer; opacity: number; chromaKey: VizChromaKeyConfig } | null;
+  /** Ordered stack rows — index matches `globalVisuals.video.layers` and
+   *  `state.videoLayers`; media rows emit their <image> at that row position
+   *  (row N-1 under row N), visuals rows are no-op placeholders. */
+  videoLayers?: VizRenderLayer[];
   signal?: AbortSignal;
   onProgress?: (p: VizRenderProgress) => void;
 }
@@ -49,8 +70,30 @@ function aborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
 }
 
-async function writeFrame(stdin: NodeJS.WritableStream, buf: Buffer): Promise<void> {
-  if (!stdin.write(buf)) await once(stdin, "drain");
+async function writeFrame(stdin: Writable, buf: Buffer): Promise<void> {
+  // A dead encoder leaves stdin destroyed — writes to it either throw or
+  // silently drop, and a pending 'drain' then never settles ('error'/'close'
+  // may already have fired by the time we attach). Bail fast instead.
+  if (stdin.destroyed || stdin.closed || !stdin.writable) {
+    throw new Error("Encoder stdin is closed.");
+  }
+  if (!stdin.write(buf)) {
+    // 'close'/'error' can beat 'drain' when the encoder dies mid-pipe — listen
+    // for all three so a dead encoder can't hang the frame loop, and detach on
+    // settle (events.once would leak the losing waiter's listeners).
+    await new Promise<void>((resolve, reject) => {
+      const done = (e?: Error) => {
+        stdin.off("drain", onDrain).off("close", onEnd).off("error", onErr);
+        e ? reject(e) : resolve();
+      };
+      const onDrain = () => done();
+      const onEnd = () => done(new Error("Encoder stdin closed mid-write."));
+      const onErr = (e: Error) => done(e);
+      stdin.once("drain", onDrain);
+      stdin.once("close", onEnd);
+      stdin.once("error", onErr);
+    });
+  }
 }
 
 /** Buffered reader that yields exactly `size` bytes per call — one decoded
@@ -109,28 +152,36 @@ class FrameReader {
 
 /** Decoder child argv for the video layer: emits exactly one cover-cropped
  *  raw frame per output frame (fps filter + stream_loop → short clips loop
- *  instead of truncating). When chroma-key is on the pipe carries rgba —
- *  the ffmpeg `colorkey` filter writes the alpha channel — otherwise rgb24. */
+ *  instead of truncating). The pipe carries rgba whenever a key is active —
+ *  color methods get a bare `format=rgba` and the shared `keyVideoFrame` does
+ *  the keying in-process (pixel-identical to the preview's Canvas pass), while
+ *  `cutout` reads the engine-baked VP9-alpha WebM (`keyedPath`, decoded with
+ *  the libvpx decoder — the native vp9 decoder drops the alpha stream). */
 export function videoDecoderArgs(
   srcPath: string,
   width: number,
   height: number,
   fps: number,
-  chromaKey: VizChromaKeyConfig,
-): { args: string[]; channels: 3 | 4 } {
+  key: VizVideoKeyConfig | null,
+  keyedPath?: string,
+): { args: string[]; channels: 3 | 4; keyed: boolean } {
+  const keyed = !!keyedPath || (!!key && key.method !== "none");
   let vf = `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`;
-  if (chromaKey.enabled) vf += `,format=rgba,colorkey=0x${chromaKey.color.slice(1)}:${chromaKey.similarity}:${chromaKey.blend}`;
-  const channels = chromaKey.enabled ? 4 : 3;
+  if (keyed) vf += ",format=rgba";
+  const channels = keyed ? 4 : 3;
+  const input: string[] = keyedPath
+    ? ["-c:v", "libvpx-vp9", "-stream_loop", "-1", "-i", resolve(keyedPath)]
+    : ["-stream_loop", "-1", "-i", resolve(srcPath)];
   return {
     args: [
       "-v", "error", "-nostdin",
-      "-stream_loop", "-1",
-      "-i", resolve(srcPath),
+      ...input,
       "-vf", vf,
       "-an", "-sn", "-dn",
       "-f", "rawvideo", "-pix_fmt", channels === 4 ? "rgba" : "rgb24", "pipe:1",
     ],
     channels,
+    keyed,
   };
 }
 
@@ -177,7 +228,7 @@ export async function renderVisualizer(
   const totalFrames = Math.max(1, Math.ceil(duration * fps));
   const outPath = resolve(opts.outPath);
   const workDir = `${outPath}.parts`;
-  rmSync(workDir, { recursive: true, force: true });
+  rmSync(workDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
   mkdirSync(workDir, { recursive: true });
   const videoPath = join(workDir, "video.mp4");
 
@@ -202,29 +253,81 @@ export async function renderVisualizer(
     stderr += d.toString();
     if (stderr.length > 4000) stderr = stderr.slice(-4000);
   });
-  const closed = once(child, "close").then(([code]) => code as number | null);
-
-  // Optional video layer: a second ffmpeg child decodes the source into
-  // exactly one cover-cropped frame per output frame (fps filter +
-  // stream_loop, so a short clip loops instead of truncating the render).
-  // The raw frame is image-embedded into the SVG (JPEG, or PNG when the
-  // chroma-key alpha channel is on) so the same rasterize pass composites
-  // it — the ordering comes from state.video, identical to the Canvas
-  // preview's drawImage placement.
-  let decoder: ChildProcess | null = null;
-  let videoFrames: FrameReader | null = null;
-  let videoChannels: 3 | 4 = 3;
-  let decErr = "";
-  const videoCfg = opts.video && globals.video.assetId ? opts.video : null;
-  if (videoCfg) {
-    const plan = videoDecoderArgs(videoCfg.path, width, height, fps, videoCfg.chromaKey);
-    videoChannels = plan.channels;
-    decoder = await ffmpegService.ffmpegSpawn(plan.args, { signal: opts.signal });
-    decoder.stderr?.on("data", (d) => {
-      decErr += d.toString();
-      if (decErr.length > 4000) decErr = decErr.slice(-4000);
+  // Swallow async error events — killing the encoder on cancel emits EPIPE on
+  // stdin (and possibly 'error' on the child); an unhandled 'error' event
+  // would crash the whole server. Failures still surface via the exit code.
+  child.on("error", () => {});
+  child.stdin?.on("error", () => {});
+  // once("close") rejects on 'error' — which abort() emits synchronously —
+  // and until `await closed` runs the rejection is unhandled and crashes the
+  // process. Catch eagerly; failures still surface as exit code null below.
+  const closed = once(child, "close")
+    .then(([code]) => code as number | null)
+    .catch((e: Error) => {
+      stderr += ` ${e.message}`;
+      return null;
     });
-    videoFrames = new FrameReader(decoder.stdout!, width * height * videoChannels);
+
+  // Media layers: each video layer gets an ffmpeg decoder child emitting
+  // exactly one cover-cropped frame per output frame (fps filter +
+  // stream_loop, so a short clip loops instead of truncating the render);
+  // each image layer is decoded once by sharp up front (identical cover-fit).
+  // Frames are image-embedded into the SVG (JPEG, or PNG when an alpha
+  // channel is on) so the same rasterize pass composites them — ordering
+  // comes from state.videoLayers, identical to the Canvas preview's drawImage
+  // placement.
+  interface LayerPipe {
+    /** Visuals stack row — no pixels of its own (modeVisualsSvg draws it). */
+    isVisuals: boolean;
+    reader: FrameReader | null;
+    proc: ChildProcess | null;
+    channels: 3 | 4;
+    /** Shared-JS color key pass (never `cutout` — that alpha rides the WebM). */
+    jsKey: VizVideoKeyConfig | null;
+    /** Static image layers: the single already-encoded data URI. */
+    href: string | null;
+    err: string;
+  }
+  const layerPipes: LayerPipe[] = [];
+  const renderLayers = opts.videoLayers ?? [];
+  for (let i = 0; i < renderLayers.length; i++) {
+    const l = renderLayers[i]!;
+    if (l.kind === "visuals") {
+      layerPipes.push({ isVisuals: true, reader: null, proc: null, channels: 3, jsKey: null, href: null, err: "" });
+      continue;
+    }
+    const jsKey = !l.keyedPath && VIZ_JS_KEY_METHODS.has(l.key.method) ? l.key : null;
+    if (l.isImage) {
+      const meta = await sharp(l.path).metadata().catch(() => null);
+      if (!meta?.width) {
+        throw new VisualizerError(422, "LAYER_IMAGE_UNREADABLE", `Media layer ${i + 1} is not a readable image: ${l.path}`);
+      }
+      const wantAlpha = !!jsKey || !!meta.hasAlpha;
+      const img = sharp(l.path).rotate().resize(width, height, { fit: "cover" });
+      const channels = wantAlpha ? 4 : 3;
+      const raw = await (wantAlpha ? img.ensureAlpha() : img.removeAlpha()).raw().toBuffer();
+      if (jsKey) keyVideoFrame(raw, width, height, jsKey);
+      const enc =
+        channels === 4
+          ? { buf: await sharp(raw, { raw: { width, height, channels: 4 } }).png().toBuffer(), mime: "image/png" }
+          : { buf: await sharp(raw, { raw: { width, height, channels: 3 } }).jpeg({ quality: 82 }).toBuffer(), mime: "image/jpeg" };
+      layerPipes.push({ isVisuals: false, reader: null, proc: null, channels, jsKey, href: `data:${enc.mime};base64,${enc.buf.toString("base64")}`, err: "" });
+      continue;
+    }
+    const plan = videoDecoderArgs(l.path, width, height, fps, l.key, l.keyedPath);
+    const proc = await ffmpegService.ffmpegSpawn(plan.args, { signal: opts.signal });
+    const pipe: LayerPipe = { isVisuals: false, reader: null, proc, channels: plan.channels, jsKey, href: null, err: "" };
+    proc.stderr?.on("data", (d) => {
+      pipe.err += d.toString();
+      if (pipe.err.length > 4000) pipe.err = pipe.err.slice(-4000);
+    });
+    // Same unhandled-'error' crash guard as the encoder child above.
+    proc.on("error", (e) => {
+      pipe.err += ` ${e.message}`;
+    });
+    proc.stdin?.on("error", () => {});
+    pipe.reader = new FrameReader(proc.stdout!, width * height * plan.channels);
+    layerPipes.push(pipe);
   }
 
   try {
@@ -235,24 +338,36 @@ export async function renderVisualizer(
       if (globals.dancer.enabled) {
         state.dancer = computeDancer(stems, globals.dancer, width, height, t, frameCenter(stems, globals, width, height, t));
       }
-      let videoImageHref: string | null = null;
-      if (videoFrames) {
-        const raw = await videoFrames.next();
+      const layerHrefs: (string | null)[] = [];
+      for (let li = 0; li < layerPipes.length; li++) {
+        const pipe = layerPipes[li]!;
+        if (pipe.isVisuals) {
+          layerHrefs.push(null);
+          continue;
+        }
+        if (pipe.href) {
+          layerHrefs.push(pipe.href);
+          continue;
+        }
+        const raw = await pipe.reader!.next();
         if (!raw) {
           throw new VisualizerError(
             500,
             "VIDEO_DECODE_FAILED",
-            `The selected video stopped yielding frames at t=${t.toFixed(2)}s${decErr.trim() ? `: ${decErr.trim().slice(-400)}` : "."}`,
+            `Media layer ${li + 1} stopped yielding frames at t=${t.toFixed(2)}s${pipe.err.trim() ? `: ${pipe.err.trim().slice(-400)}` : "."}`,
           );
         }
+        // Color methods are keyed here via the shared JS implementation — the
+        // exact same function the Canvas preview runs, so export pixels match.
+        if (pipe.jsKey) keyVideoFrame(raw, width, height, pipe.jsKey);
         // Keyed frames carry alpha → must embed as PNG; otherwise JPEG.
         const enc =
-          videoChannels === 4
+          pipe.channels === 4
             ? { buf: await sharp(raw, { raw: { width, height, channels: 4 } }).png().toBuffer(), mime: "image/png" }
             : { buf: await sharp(raw, { raw: { width, height, channels: 3 } }).jpeg({ quality: 82 }).toBuffer(), mime: "image/jpeg" };
-        videoImageHref = `data:${enc.mime};base64,${enc.buf.toString("base64")}`;
+        layerHrefs.push(`data:${enc.mime};base64,${enc.buf.toString("base64")}`);
       }
-      const svg = frameSvg(state, width, height, globals.backgroundColor, videoImageHref);
+      const svg = frameSvg(state, width, height, globals.backgroundColor, layerHrefs);
       const { data } = await sharp(Buffer.from(svg), { density: 72 })
         .flatten({ background: globals.backgroundColor })
         .raw()
@@ -297,7 +412,11 @@ export async function renderVisualizer(
       frames: totalFrames,
     };
   } catch (e) {
-    rmSync(outPath, { force: true });
+    try {
+      rmSync(outPath, { force: true, maxRetries: 5, retryDelay: 120 });
+    } catch {
+      /* partial output can stay locked briefly — cosmetic, cleaned next run */
+    }
     if (aborted(opts.signal)) throw new VisualizerError(499, "RENDER_CANCELLED", "Render cancelled.");
     if ((e as Error).name === "AbortError") throw new VisualizerError(499, "RENDER_CANCELLED", "Render cancelled.");
     throw e;
@@ -308,12 +427,21 @@ export async function renderVisualizer(
     } catch {
       /* already gone */
     }
-    try {
-      decoder?.stdout?.destroy();
-      if (decoder && decoder.exitCode === null) decoder.kill("SIGKILL");
-    } catch {
-      /* already gone */
+    for (const pipe of layerPipes) {
+      try {
+        pipe.proc?.stdout?.destroy();
+        if (pipe.proc && pipe.proc.exitCode === null) pipe.proc.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
     }
-    rmSync(workDir, { recursive: true, force: true });
+    // Windows releases a killed child's file handles a beat late — retry the
+    // scratch-dir removal, then swallow: a leftover .parts dir is cosmetic and
+    // the next render's pre-clean removes it. Never mask the real outcome.
+    try {
+      rmSync(workDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
+    } catch {
+      /* stale .parts — cleaned by the next render's pre-clean */
+    }
   }
 }

@@ -12,7 +12,7 @@ import fastifyCors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import { resolve } from "node:path";
 import { createReadStream, existsSync } from "node:fs";
-import { config, OUTPUT_ROOT, projectPaths } from "./config.js";
+import { config, mediaMimeForFile, OUTPUT_ROOT, projectPaths } from "./config.js";
 import { ffmpegService } from "./video/ffmpeg.js";
 import { migrate } from "./db/migrate.js";
 import { db } from "./db/client.js";
@@ -811,7 +811,7 @@ export async function buildServer() {
     if (!a?.local_path) return reply.code(404).send({ error: "no local file" });
     const abs = resolve(OUTPUT_ROOT, a.local_path);
     if (!existsSync(abs)) return reply.code(404).send({ error: "file missing" });
-    reply.type("video/mp4");
+    reply.type(mediaMimeForFile(a.local_path));
     return reply.send(createReadStream(abs));
   });
   app.get("/api/assets/:id/thumb", async (req, reply) => {

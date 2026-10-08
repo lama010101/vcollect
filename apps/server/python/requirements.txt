@@ -8,3 +8,6 @@ numba>=0.61,<0.64
 librosa>=0.11,<0.12
 soundfile>=0.13
 opencv-python-headless>=4.10,<5
+# MODNet ONNX inference (cv2.dnn can't parse its dynamic-shape graph);
+# MediaPipe segmentation runs through cv2.dnn alone.
+onnxruntime>=1.20,<2

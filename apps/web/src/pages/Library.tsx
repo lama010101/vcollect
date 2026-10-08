@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type AcquireBatchProgress, type Asset, type AssetCandidate, type AssetSearchFilters, type AssetSortKey, type Provider, type Task } from "../api.js";
+import { api, ASSETS_CHANGED_EVENT, isImageFileName, type AcquireBatchProgress, type Asset, type AssetCandidate, type AssetSearchFilters, type AssetSortKey, type Provider, type Task } from "../api.js";
 import { RatingSlider } from "../components/RatingSlider.js";
 import { Button, Badge, ProgressBar, EmptyState, Spinner } from "../components/ui.js";
 
@@ -84,7 +84,7 @@ function pollTask(taskId: string, onUpdate: (t: Task) => void, intervalMs = 800)
   });
 }
 
-export function SearchPage({ projectId }: { projectId: string }) {
+export function LibraryPage({ projectId }: { projectId: string }) {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [results, setResults] = useState<Asset[]>([]);
   const [count, setCount] = useState(0);
@@ -147,7 +147,7 @@ export function SearchPage({ projectId }: { projectId: string }) {
   const [downloadedAfter, setDownloadedAfter] = useState("");
   const [downloadedBefore, setDownloadedBefore] = useState("");
   const [sort, setSort] = useState<AssetSortKey>("final_score_desc");
-  const [limit, setLimit] = useState("100");
+  const [limit, setLimit] = useState("500");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   useEffect(() => {
@@ -239,6 +239,9 @@ export function SearchPage({ projectId }: { projectId: string }) {
         setHasSearched(true);
       } else {
         saveRecentQuery(q);
+        // Register any media placed in the project's assets folder outside the
+        // app before listing — the folder contents are the source of truth.
+        await api.syncProjectAssets(projectId).catch(() => {});
         const r = await api.searchAssetsAdvanced(buildFilters(), projectId);
         setResults(r.assets);
         setCount(r.count);
@@ -266,6 +269,16 @@ export function SearchPage({ projectId }: { projectId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, searchMode]);
 
+  // Reload the local pool when files are dropped onto the app (uploads land in
+  // the active project's assets folder).
+  useEffect(() => {
+    const onChanged = () => {
+      if (searchMode === "local") runSearch().catch(console.error);
+    };
+    window.addEventListener(ASSETS_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(ASSETS_CHANGED_EVENT, onChanged);
+  }, [projectId, searchMode, runSearch]);
+
   function clearAll() {
     setQ(""); setProvider(""); setCreator(""); setTag(""); setTitle("");
     setMinDuration(""); setMaxDuration(""); setMinWidth(""); setMinHeight("");
@@ -273,7 +286,7 @@ export function SearchPage({ projectId }: { projectId: string }) {
     setCommercialStatus(""); setRightsReviewStatus(""); setSourceLicense("");
     setMinRating(""); setMaxRating(""); setMinScore(""); setMaxScore("");
     setDiscoveredAfter(""); setDiscoveredBefore(""); setDownloadedAfter(""); setDownloadedBefore("");
-    setSort("final_score_desc"); setLimit("100");
+    setSort("final_score_desc"); setLimit("500");
   }
 
   async function setRating(assetId: string, prev: number | null, next: number | null) {
@@ -443,13 +456,13 @@ export function SearchPage({ projectId }: { projectId: string }) {
     <div className="space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-3">
-          {/* Mode toggle: local pool vs live providers */}
+          {/* Mode toggle: this project's library (all assets) vs live providers */}
           <div className="flex rounded-lg overflow-hidden border border-slate-700">
             <button
               onClick={() => setSearchMode("local")}
               className={`px-3 py-1.5 text-xs font-medium transition-colors ${searchMode === "local" ? "bg-sky-600 text-white" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}`}
             >
-              ⌕ Local pool
+              ⌕ Library
             </button>
             <button
               onClick={() => setSearchMode("providers")}
@@ -535,7 +548,7 @@ export function SearchPage({ projectId }: { projectId: string }) {
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && runSearch()}
-            placeholder={searchMode === "providers" ? "Search providers for new assets…" : "Search assets…"}
+            placeholder={searchMode === "providers" ? "Search providers for new assets…" : "Search the library…"}
             className="ui-input flex-1"
           />
           <Button variant="primary" onClick={runSearch} disabled={searching}>
@@ -770,6 +783,7 @@ function SearchAssetCard({
   }, [playing]);
 
   const downloaded = !!asset.local_path;
+  const isImage = isImageFileName(asset.local_path ?? asset.title);
 
   async function startAcquire() {
     if (acquireState === "acquiring") return;
@@ -815,10 +829,13 @@ function SearchAssetCard({
     <div className={`ui-card overflow-hidden border-2 ${ratingBorder(rating)}`}>
       <div
         className="aspect-video bg-black flex items-center justify-center relative cursor-pointer group"
-        onClick={() => !playing && downloaded && setPlaying(true)}
-        title={downloaded ? (playing ? "" : "Click to play") : "Not downloaded"}
+        onClick={() => {
+          if (isImage && downloaded) window.open(api.assetFileUrl(asset.id), "_blank");
+          else if (!playing && downloaded) setPlaying(true);
+        }}
+        title={!downloaded ? "Not downloaded" : isImage ? "Click to open" : playing ? "" : "Click to play"}
       >
-        {playing && downloaded ? (
+        {playing && downloaded && !isImage ? (
           <video
             ref={videoRef}
             src={api.assetFileUrl(asset.id)}
@@ -837,7 +854,7 @@ function SearchAssetCard({
               loading="lazy"
             />
             <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/30 transition-colors">
-              <span className="text-3xl text-white/0 group-hover:text-white/90 transition-colors">▶</span>
+              <span className="text-3xl text-white/0 group-hover:text-white/90 transition-colors">{isImage ? "↗" : "▶"}</span>
             </div>
           </>
         ) : (
@@ -852,7 +869,12 @@ function SearchAssetCard({
           <span className="font-mono text-xs text-sky-400 truncate" title={asset.title ?? asset.id}>
             {asset.title ?? asset.id}
           </span>
-          <span className="text-[10px] text-slate-500 shrink-0">{asset.provider_id}</span>
+          <span className="flex items-center gap-1 shrink-0">
+            {isImage && (
+              <span className="text-[10px] px-1 rounded bg-violet-700/60 text-violet-200 border border-violet-600/60">image</span>
+            )}
+            <span className="text-[10px] text-slate-500">{asset.provider_id}</span>
+          </span>
         </div>
         {asset.creator_name && (
           <div className="text-xs text-slate-400 truncate">by {asset.creator_name}</div>

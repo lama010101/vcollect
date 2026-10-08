@@ -94,7 +94,8 @@ export type VizVideoLayer = z.infer<typeof vizVideoLayerSchema>;
  *  `colorkey` filter — a pixel goes transparent when its normalized RGB
  *  distance to `color` is under `similarity`, with a linear feather ramp of
  *  half-width `blend` around the threshold (same ramp `chromaKeyFrame`
- *  applies in the browser preview). */
+ *  applies in the browser preview).
+ *  @deprecated legacy wire format — folded into `vizVideoKeySchema` on parse. */
 export const vizChromaKeySchema = z.object({
   enabled: z.boolean().default(false),
   /** #RRGGBB flat background color to remove. */
@@ -106,18 +107,198 @@ export const vizChromaKeySchema = z.object({
 });
 export type VizChromaKeyConfig = z.infer<typeof vizChromaKeySchema>;
 
-/** Optional project-asset video composited into every frame: `under` puts it
- *  behind the visuals as a backdrop (default), `over` on top of the mode
- *  visuals (still below the dancer + convergence star). The source loops when
- *  shorter than the mix and is cover-cropped to the frame. */
-export const vizVideoSchema = z.object({
-  /** Id of a project asset with a downloaded local file; null = no video. */
-  assetId: z.string().min(1).max(64).nullable().default(null),
-  layer: vizVideoLayerSchema.default("under"),
-  /** 0..1 opacity multiplier applied to the video image. */
-  opacity: z.number().min(0).max(1).default(1),
-  chromaKey: vizChromaKeySchema.default({}),
+/** Background-removal methods for the video layer:
+ *  - `none`      — video drawn as-is;
+ *  - `colorkey`  — RGB-distance key, byte-compatible with ffmpeg `colorkey`
+ *    (the original implementation);
+ *  - `chromakey` — YUV chroma key, a port of ffmpeg `vf_chromakey` (3×3
+ *    half-res chroma neighbourhood + similarity/blend alpha ramp) plus a
+ *    `vf_despill`-style spill suppression generalized to the key's dominant
+ *    channel;
+ *  - `hsv`       — custom keyer: circular hue distance weighted by the
+ *    pixel's own saturation (greys/whites never key), choke erodes/dilates
+ *    the alpha edge, despill clamps the dominant channel;
+ *  - `cutout`    — AI person matting; the Python engine bakes a matte into a
+ *    cached VP9-alpha WebM (`visualizer/keys/*.webm`) that both renderers
+ *    consume directly — the alpha rides the pixels, so no in-frame keying
+ *    pass runs for this method.
+ *  All color methods run the shared per-pixel functions on the decoded RGBA
+ *  frame in BOTH renderers → preview and MP4 are pixel-identical by
+ *  construction. */
+export const VIZ_KEY_METHODS = ["none", "colorkey", "chromakey", "hsv", "cutout"] as const;
+export const vizKeyMethodSchema = z.enum(VIZ_KEY_METHODS);
+export type VizKeyMethod = z.infer<typeof vizKeyMethodSchema>;
+
+/** Engine matting models for `cutout` — Apache-2.0 only (no GPL RVM). */
+export const VIZ_CUTOUT_MODELS = ["mediapipe", "modnet"] as const;
+export const vizCutoutModelSchema = z.enum(VIZ_CUTOUT_MODELS);
+export type VizCutoutModel = z.infer<typeof vizCutoutModelSchema>;
+
+/** Methods that key the live frame pixels in-process (no engine artifact). */
+export const VIZ_JS_KEY_METHODS: ReadonlySet<VizKeyMethod> = new Set(["colorkey", "chromakey", "hsv"]);
+
+export const vizVideoKeySchema = z.object({
+  method: vizKeyMethodSchema.default("none"),
+  /** #RRGGBB key color (color methods only). */
+  color: hexColorSchema.default("#00FF00"),
+  /** Normalized distance threshold, 0..1 (scale depends on method). */
+  similarity: z.number().min(0).max(1).default(0.12),
+  /** Edge feather width for the color keyers, 0..0.5. */
+  blend: z.number().min(0).max(0.5).default(0.02),
+  /** Suppress key-color spill on the surviving foreground. */
+  despill: z.boolean().default(true),
+  /** `hsv` only: shrink (negative) / grow (positive) the matte edge, px. */
+  choke: z.number().min(-8).max(8).default(0),
+  /** `cutout` only: which engine model produces the matte. */
+  model: vizCutoutModelSchema.default("mediapipe"),
+  /** `cutout` only: gaussian blur radius applied to the matte edge, px. */
+  feather: z.number().min(0).max(10).default(1),
 });
+export type VizVideoKeyConfig = z.infer<typeof vizVideoKeySchema>;
+
+/** Fold a deprecated `chromaKey` field into `key` (old configs had no despill
+ *  in the colorkey path, so legacy folds with `despill:false` to keep renders
+ *  identical). Shared by the single-video legacy shape and each layer row. */
+function foldChromaKey<T extends { chromaKey?: VizChromaKeyConfig; key: VizVideoKeyConfig }>(v: T): Omit<T, "chromaKey"> {
+  const { chromaKey, ...rest } = v;
+  let { key } = rest;
+  if (key.method === "none" && chromaKey) {
+    key = {
+      ...key,
+      method: chromaKey.enabled ? "colorkey" : "none",
+      color: chromaKey.color,
+      similarity: chromaKey.similarity,
+      blend: chromaKey.blend,
+      // The legacy colorkey path had no despill — keep old configs identical.
+      despill: false,
+    };
+  }
+  return { ...rest, key };
+}
+
+/** One media layer: a downloaded project asset (video or image) composited
+ *  into every frame at its row position — row N-1 renders under row N (row
+ *  order is the only z-order). Video sources loop when shorter than the mix
+ *  and every layer is cover-cropped to the frame. `layer` is a deprecated
+ *  band hint kept so the `vizVideoSchema` transform can restore the visuals
+ *  row at the old under/over boundary; renderers ignore it. */
+const vizMediaAssetLayerSchema = z
+  .object({
+    kind: z.literal("media").default("media"),
+    /** Id of a project asset with a downloaded local file. */
+    assetId: z.string().min(1).max(64),
+    /** @deprecated under/over band hint — see vizVideoSchema. */
+    layer: vizVideoLayerSchema.optional(),
+    /** Hidden rows keep their config + stack position but draw nothing —
+     *  renderers skip them and the export doesn't even decode the media. */
+    hidden: z.boolean().default(false),
+    /** Normalized position of the layer's center in the frame — 0.5 =
+     *  centered (default); the edge values put the layer's center on the
+     *  frame edge (half the layer clipped). `scale` resizes about this point. */
+    x: z.number().min(0).max(1).default(0.5),
+    y: z.number().min(0).max(1).default(0.5),
+    /** 0..1 opacity multiplier applied to the layer image. */
+    opacity: z.number().min(0).max(1).default(1),
+    /** Size multiplier on the cover-cropped layer, drawn about the layer's
+     *  center: 1 fills the frame (default), <1 shrinks to an inset, >1 zooms
+     *  (clipped at the frame edge). */
+    scale: z.number().min(0.1).max(2).default(1),
+    /** @deprecated use `key` — accepted for backwards compatibility with old
+     *  render configs; folded into `key` during parse. */
+    chromaKey: vizChromaKeySchema.optional(),
+    key: vizVideoKeySchema.default({}),
+  })
+  .transform(foldChromaKey);
+
+/** The mode visuals ("2. Look") as a stack row — the waveforms draw at this
+ *  row's position; a stack without a visuals row renders no mode visuals at
+ *  all. Carries opacity/scale like media rows (no asset, no keying). */
+const vizVisualsLayerSchema = z.object({
+  kind: z.literal("visuals"),
+  hidden: z.boolean().default(false),
+  x: z.number().min(0).max(1).default(0.5),
+  y: z.number().min(0).max(1).default(0.5),
+  opacity: z.number().min(0).max(1).default(1),
+  scale: z.number().min(0.1).max(2).default(1),
+});
+
+export const vizMediaLayerSchema = z.union([vizMediaAssetLayerSchema, vizVisualsLayerSchema]);
+export type VizMediaLayerConfig = z.infer<typeof vizMediaLayerSchema>;
+
+export const VIZ_MAX_VIDEO_LAYERS = 10;
+
+/** The visuals stack row added by default and inserted when migrating
+ *  band-model configs. */
+export const vizVisualsLayer = (): VizMediaLayerConfig => ({ kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1 });
+
+/** Stacked layers composited into every frame. `layers` is the ordered row
+ *  list (index 0 = bottom); a `kind:"visuals"` row marks where the mode
+ *  visuals draw — without one they don't render. The legacy single-video
+ *  fields (and band-model `layer` hints on rows) are kept on the wire for
+ *  backwards compatibility and folded into `layers` on parse; a `layers` key
+ *  that is present but empty is respected literally (nothing draws). */
+export const vizVideoSchema = z
+  .object({
+    layers: z.array(vizMediaLayerSchema).max(VIZ_MAX_VIDEO_LAYERS).optional(),
+    /** @deprecated legacy single-video config — folded into `layers`. */
+    assetId: z.string().min(1).max(64).nullable().default(null),
+    layer: vizVideoLayerSchema.default("under"),
+    opacity: z.number().min(0).max(1).default(1),
+    scale: z.number().min(0.1).max(2).default(1),
+    chromaKey: vizChromaKeySchema.optional(),
+    key: vizVideoKeySchema.default({}),
+  })
+  .transform((v) => {
+    const { layers, ...legacy } = v;
+    // No `layers` key at all → the pre-stack shapes. Empty/omitted video {}
+    // rendered visuals-only back then, so the baseline is a lone visuals row;
+    // a flat single-video config folds to [media, visuals] (under) or
+    // [visuals, media] (over) — reproducing its old band render.
+    if (layers === undefined) {
+      if (!legacy.assetId) return { layers: [vizVisualsLayer()] };
+      const media = foldChromaKey({
+        kind: "media" as const,
+        assetId: legacy.assetId,
+        layer: legacy.layer,
+        hidden: false,
+        x: 0.5,
+        y: 0.5,
+        opacity: legacy.opacity,
+        scale: legacy.scale,
+        chromaKey: legacy.chromaKey,
+        key: legacy.key,
+      });
+      return { layers: legacy.layer === "over" ? [vizVisualsLayer(), media] : [media, vizVisualsLayer()] };
+    }
+    const out: VizMediaLayerConfig[] = [...layers];
+    // A stray legacy flat assetId on top of a layers list — insert next to
+    // the visuals row when there is one, else append on top.
+    if (legacy.assetId && !out.some((l) => l.kind === "media" && l.assetId === legacy.assetId) && out.length < VIZ_MAX_VIDEO_LAYERS) {
+      const media = foldChromaKey({
+        kind: "media" as const,
+        assetId: legacy.assetId,
+        layer: legacy.layer,
+        hidden: false,
+        x: 0.5,
+        y: 0.5,
+        opacity: legacy.opacity,
+        scale: legacy.scale,
+        chromaKey: legacy.chromaKey,
+        key: legacy.key,
+      });
+      const vi = out.findIndex((l) => l.kind === "visuals");
+      if (vi >= 0) out.splice(legacy.layer === "under" ? vi : vi + 1, 0, media);
+      else out.push(media);
+    }
+    // Band-model rows (each carrying the deprecated `layer` hint) without a
+    // visuals row: the mode visuals drew between the under and over bands —
+    // restore that row at the boundary so old configs still show waveforms.
+    if (!out.some((l) => l.kind === "visuals") && out.length < VIZ_MAX_VIDEO_LAYERS && out.some((l) => l.kind === "media" && l.layer !== undefined)) {
+      const firstOver = out.findIndex((l) => l.kind === "media" && l.layer === "over");
+      out.splice(firstOver >= 0 ? firstOver : out.length, 0, vizVisualsLayer());
+    }
+    return { layers: out.slice(0, VIZ_MAX_VIDEO_LAYERS) };
+  });
 export type VizVideoConfig = z.infer<typeof vizVideoSchema>;
 
 export const visualizerStemSchema = z.object({
@@ -138,7 +319,8 @@ export type VisualizerStemInput = z.infer<typeof visualizerStemSchema>;
 export const visualizerRenderSchema = z.object({
   renderSettings: z.object({
     width: z.number().int().min(240).max(3840),
-    height: z.number().int().min(240).max(2160),
+    // 3840 on both axes so portrait 4K (2160×3840) is valid too.
+    height: z.number().int().min(240).max(3840),
     fps: z.number().int().min(12).max(60),
   }),
   globalVisuals: z.object({
@@ -187,11 +369,12 @@ export type VisualizerRenderInput = z.infer<typeof visualizerRenderSchema>;
 export type VisualizerRenderRequest = z.input<typeof visualizerRenderSchema>;
 export type VisualizerGlobals = VisualizerRenderInput["globalVisuals"];
 
-/** Resolution presets offered by the UI (explicit w/h are also accepted). */
+/** Resolution presets offered by the UI — aspect × quality (explicit w/h are
+ *  also accepted). */
 export const VIZ_RESOLUTIONS = {
-  "1080p": { width: 1920, height: 1080 },
-  "4k": { width: 3840, height: 2160 },
-  square: { width: 1080, height: 1080 },
+  "16:9": { "1080p": { width: 1920, height: 1080 }, "4k": { width: 3840, height: 2160 } },
+  "9:16": { "1080p": { width: 1080, height: 1920 }, "4k": { width: 2160, height: 3840 } },
+  "1:1": { "1080p": { width: 1080, height: 1080 }, "4k": { width: 2160, height: 2160 } },
 } as const;
 
 // --- Resolved stem config (all defaults applied) ------------------------------
@@ -733,12 +916,14 @@ export interface VizDancer {
 
 export interface VizFrameState {
   mode: VizMode;
-  /** Placement of the optional project-video layer — null when no video is
-   *  configured. Carries ordering + opacity only (no pixels): the renderers
-   *  inject the image (Canvas <video> frame / embedded SVG <image>) at this
-   *  position in the draw order. `under` → right after the background;
-   *  `over` → after the mode visuals, below the dancer + star. */
-  video: { layer: VizVideoLayer; opacity: number; chromaKey: VizChromaKeyConfig | null } | null;
+  /** The ordered layer stack — one entry per configured row, same order as
+   *  `globals.video.layers` (empty when none). `kind:"media"` rows carry an
+   *  injected image (Canvas element / embedded SVG <image>); `kind:"visuals"`
+   *  rows draw the mode visuals at that stack position — no visuals row means
+   *  no waveforms at all. `hidden` rows keep their slot but draw nothing.
+   *  Row order is the only z-order; the dancer + star
+   *  still draw on top of the whole stack. */
+  videoLayers: Array<{ kind: "media" | "visuals"; hidden: boolean; x: number; y: number; opacity: number; scale: number; key: VizVideoKeyConfig | null }>;
   stems: VizFrameStem[];
   rings: VizRing[];
   bars: VizBarGroup[];
@@ -900,6 +1085,220 @@ export function chromaKeyFrame(rgba: Uint8ClampedArray | Uint8Array, colorHex: s
     const a = Math.min(1, Math.max(0, (d - (similarity - half)) / (2 * half)));
     rgba[i + 3] = Math.round(rgba[i + 3]! * a);
   }
+}
+
+// --- Advanced keyers (shared preview/export pixel math) ------------------------
+// The following helpers implement the richer keying methods. They run on the
+// decoded RGBA frame inside BOTH renderers (browser offscreen canvas, server
+// post-decode pass), so the MP4 matches the preview pixel-for-pixel.
+
+const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+
+/** ffmpeg vf_chromakey RGB→U/V fixed-point macros (FIXNUM = 10-bit lrint). */
+function rgbToUV(r: number, g: number, b: number): [number, number] {
+  const u = ((-173 * r - 339 * g + 512 * b + 511) >> 10) + 128;
+  const v = ((512 * r - 429 * g - 83 * b + 511) >> 10) + 128;
+  return [u, v];
+}
+
+/** vf_despill port generalized to the key's dominant channel: the spillmap is
+ *  the excess of the key channel over `mix·other1 + factor·other2`, removed
+ *  from that channel (defaults: mix 0.5, expand 0, key-channel scale −1). */
+export function despillChannels(rgba: Uint8ClampedArray | Uint8Array, keyChannel: 0 | 1 | 2, mix = 0.5, expand = 0): void {
+  const o1 = ((keyChannel + 1) % 3) as 0 | 1 | 2;
+  const o2 = ((keyChannel + 2) % 3) as 0 | 1 | 2;
+  const factor = (1 - mix) * (1 - expand);
+  for (let i = 0; i + 3 < rgba.length; i += 4) {
+    const k = rgba[i + keyChannel]! / 255;
+    const a = rgba[i + o1]! / 255;
+    const b = rgba[i + o2]! / 255;
+    const spill = Math.max(k - (a * mix + b * factor), 0);
+    if (spill <= 0) continue;
+    // ffmpeg scales: key channel −1, others 0 → subtract the spill.
+    rgba[i + keyChannel] = Math.max(0, Math.round((k - spill) * 255));
+  }
+}
+
+/** Dominant channel index (0=r,1=g,2=b) of a #RRGGBB color — despill target. */
+function dominantChannel(colorHex: string): 0 | 1 | 2 {
+  const c = parseInt(colorHex.slice(1), 16);
+  const r = (c >> 16) & 0xff;
+  const g = (c >> 8) & 0xff;
+  const b = c & 0xff;
+  return r >= g && r >= b ? 0 : g >= b ? 1 : 2;
+}
+
+/** Port of ffmpeg `vf_chromakey` (8-bit path): the chroma key operates on the
+ *  half-resolution U/V planes — for each pixel the mean chroma distance over
+ *  its 3×3 neighbourhood (out-of-bounds taps read the key color) drives a
+ *  linear alpha ramp clipped by similarity/blend. Identical result to running
+ *  `chromakey=<color>:<similarity>:<blend>` on a yuv420p frame, modulo chroma
+ *  downsampling being a box average here instead of swscale's filter. */
+export function chromaKeyYUVFrame(
+  rgba: Uint8ClampedArray | Uint8Array,
+  width: number,
+  height: number,
+  colorHex: string,
+  similarity: number,
+  blend: number,
+): void {
+  const c = parseInt(colorHex.slice(1), 16);
+  const [ku, kv] = rgbToUV((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+
+  // Half-res chroma planes (2×2 box average → BT.601 U/V at chroma coords),
+  // mirroring the subsampled planes vf_chromakey sees on yuv420p input.
+  const cw = Math.ceil(width / 2);
+  const ch = Math.ceil(height / 2);
+  const U = new Float32Array(cw * ch);
+  const V = new Float32Array(cw * ch);
+  for (let cy = 0; cy < ch; cy++) {
+    for (let cx = 0; cx < cw; cx++) {
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let dy = 0; dy < 2; dy++) {
+        for (let dx = 0; dx < 2; dx++) {
+          const x = cx * 2 + dx;
+          const y = cy * 2 + dy;
+          if (x >= width || y >= height) continue;
+          const i = (y * width + x) * 4;
+          r += rgba[i]!;
+          g += rgba[i + 1]!;
+          b += rgba[i + 2]!;
+          n++;
+        }
+      }
+      const [u, v] = rgbToUV(r / n, g / n, b / n);
+      U[cy * cw + cx] = u;
+      V[cy * cw + cx] = v;
+    }
+  }
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let diff = 0;
+      for (let yo = -1; yo <= 1; yo++) {
+        for (let xo = -1; xo <= 1; xo++) {
+          const px = x + xo;
+          const py = y + yo;
+          // OOB taps contribute the key color (ffmpeg leaves the memset'd key
+          // value in the 3×3 window), i.e. zero distance.
+          let u = ku;
+          let v = kv;
+          if (px >= 0 && px < width && py >= 0 && py < height) {
+            const ci = (py >> 1) * cw + (px >> 1);
+            u = U[ci]!;
+            v = V[ci]!;
+          }
+          const du = u - ku;
+          const dv = v - kv;
+          diff += Math.sqrt((du * du + dv * dv) / (255 * 255 * 2));
+        }
+      }
+      diff /= 9;
+      const a = blend > 0.0001 ? clamp01((diff - similarity) / blend) : diff > similarity ? 1 : 0;
+      const i = (y * width + x) * 4;
+      rgba[i + 3] = Math.round(rgba[i + 3]! * a);
+    }
+  }
+}
+
+/** RGB (0..255) → [h 0..360, s 0..1, v 0..1]. */
+function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
+  const mx = Math.max(r, g, b);
+  const mn = Math.min(r, g, b);
+  const d = mx - mn;
+  const v = mx / 255;
+  const s = mx === 0 ? 0 : d / mx;
+  let h = 0;
+  if (d !== 0) {
+    if (mx === r) h = ((g - b) / d) % 6;
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return [h, s, v];
+}
+
+/** Separable min/max on the alpha channel — `choke` px radius. Positive choke
+ *  erodes the matte (removes fringing), negative dilates it. Two passes
+ *  (rows then columns) so cost stays O(w·h) not O(w·h·r²). */
+function chokeAlpha(rgba: Uint8ClampedArray | Uint8Array, width: number, height: number, choke: number): void {
+  const r = Math.min(8, Math.round(Math.abs(choke)));
+  if (r === 0) return;
+  const erode = choke > 0;
+  const src = new Uint8Array(width * height);
+  const dst = new Uint8Array(width * height);
+  for (let i = 0; i < width * height; i++) src[i] = rgba[i * 4 + 3]!;
+  const pick = (a: number, b: number) => (erode ? Math.min(a, b) : Math.max(a, b));
+  // Horizontal pass.
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      let v = src[row + x]!;
+      for (let k = 1; k <= r; k++) {
+        if (x - k >= 0) v = pick(v, src[row + x - k]!);
+        if (x + k < width) v = pick(v, src[row + x + k]!);
+      }
+      dst[row + x] = v;
+    }
+  }
+  // Vertical pass back into rgba.
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) {
+      let v = dst[y * width + x]!;
+      for (let k = 1; k <= r; k++) {
+        if (y - k >= 0) v = pick(v, dst[(y - k) * width + x]!);
+        if (y + k < height) v = pick(v, dst[(y + k) * width + x]!);
+      }
+      rgba[(y * width + x) * 4 + 3] = v;
+    }
+  }
+}
+
+/** Custom HSV keyer: circular hue distance weighted by the pixel's own
+ *  saturation (desaturated pixels carry no hue, so greys/whites never key),
+ *  plus a small value-difference term so dark-green keys don't eat black.
+ *  similarity/blend drive the same alpha ramp as the other keyers; `choke`
+ *  erodes (negative value dilates) the matte edge by up to 8 px. */
+export function hsvKeyFrame(
+  rgba: Uint8ClampedArray | Uint8Array,
+  width: number,
+  height: number,
+  colorHex: string,
+  similarity: number,
+  blend: number,
+  choke = 0,
+): void {
+  const c = parseInt(colorHex.slice(1), 16);
+  const [hk, sk, vk] = rgbToHsv((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+  const half = Math.max(blend, 1e-4);
+  for (let i = 0; i + 3 < rgba.length; i += 4) {
+    const [h, s, v] = rgbToHsv(rgba[i]!, rgba[i + 1]!, rgba[i + 2]!);
+    const hd = Math.min(Math.abs(h - hk), 360 - Math.abs(h - hk)) / 180;
+    // d ∈ [0,1]: 0 = same hue, fully saturated; →1 = hue far or pixel grey.
+    // When the key itself is grey (sk≈0) hue is meaningless — fall back to
+    // pure value distance so a black/white screen still keys.
+    const d = sk < 0.08
+      ? Math.abs(v - vk)
+      : clamp01(1 - (1 - hd) * Math.min(1, s / Math.max(sk, 0.15)) + Math.abs(v - vk) * 0.2);
+    const a = clamp01((d - similarity) / (2 * half));
+    rgba[i + 3] = Math.round(rgba[i + 3]! * a);
+  }
+  if (choke !== 0) chokeAlpha(rgba, width, height, choke);
+}
+
+/** Dispatch the active key method over a decoded RGBA frame. `cutout` never
+ *  reaches here — its alpha is baked into the keyed WebM upstream. */
+export function keyVideoFrame(rgba: Uint8ClampedArray | Uint8Array, width: number, height: number, key: VizVideoKeyConfig | null | undefined): void {
+  if (!key || key.method === "none" || key.method === "cutout") return;
+  if (key.method === "colorkey") {
+    chromaKeyFrame(rgba, key.color, key.similarity, key.blend);
+  } else if (key.method === "chromakey") {
+    chromaKeyYUVFrame(rgba, width, height, key.color, key.similarity, key.blend);
+  } else {
+    hsvKeyFrame(rgba, width, height, key.color, key.similarity, key.blend, key.choke);
+  }
+  if (key.despill) despillChannels(rgba, dominantChannel(key.color));
 }
 
 /** Source rect [sx, sy, sw, sh] for cover-fit ("object-fit: cover") — the same
@@ -1754,9 +2153,15 @@ export function computeFrame(
 
   const state: VizFrameState = {
     mode,
-    video: globals.video.assetId
-      ? { layer: globals.video.layer, opacity: globals.video.opacity, chromaKey: globals.video.chromaKey.enabled ? globals.video.chromaKey : null }
-      : null,
+    videoLayers: globals.video.layers.map((l) => ({
+      kind: l.kind,
+      hidden: l.hidden,
+      x: l.x,
+      y: l.y,
+      opacity: l.opacity,
+      scale: l.scale,
+      key: l.kind === "media" && l.key.method !== "none" ? l.key : null,
+    })),
     stems: [],
     rings: [],
     bars: [],

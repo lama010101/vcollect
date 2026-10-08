@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ASSETS_CHANGED_EVENT, type FoldersResponse, type FolderNode, type FolderAsset, type Project } from "../api.js";
+import { api, ASSETS_CHANGED_EVENT, isImageFileName, type FoldersResponse, type FolderNode, type FolderAsset, type Project } from "../api.js";
 import { RatingSlider } from "../components/RatingSlider.js";
 import { PROJECT_ID_ALL } from "@twio/shared";
 
@@ -380,9 +380,12 @@ function AssetTile({
 }) {
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const isImage = isImageFileName(asset.filename);
 
   function handleClick() {
-    if (!playing) setPlaying(true);
+    // Images have no inline player — clicking opens the full file in a tab.
+    if (isImage) window.open(api.assetFileUrl(asset.assetId), "_blank");
+    else if (!playing) setPlaying(true);
   }
 
   // When switching to playing mode, auto-play.
@@ -397,9 +400,16 @@ function AssetTile({
       <div
         className="aspect-video bg-black flex items-center justify-center relative cursor-pointer group"
         onClick={handleClick}
-        title={playing ? "" : "Click to play"}
+        title={isImage ? "Click to open" : playing ? "" : "Click to play"}
       >
-        {playing ? (
+        {isImage ? (
+          <img
+            src={api.assetThumbUrl(asset.assetId)}
+            alt={asset.filename}
+            className="max-h-full max-w-full object-contain"
+            loading="lazy"
+          />
+        ) : playing ? (
           <video
             ref={videoRef}
             src={api.assetFileUrl(asset.assetId)}
@@ -516,6 +526,7 @@ function AssetListRow({
 }) {
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const isImage = isImageFileName(asset.filename);
 
   useEffect(() => {
     if (playing && videoRef.current) {
@@ -526,13 +537,16 @@ function AssetListRow({
   return (
     <div className={`rounded bg-slate-900 border p-2 ${ratingBorder(rating)}`}>
       <div className="flex items-start gap-3">
-        {/* Thumbnail / inline player */}
+        {/* Thumbnail / inline player (images open the file instead) */}
         <div
           className="w-28 shrink-0 aspect-video bg-black rounded overflow-hidden cursor-pointer relative group"
-          onClick={() => !playing && setPlaying(true)}
-          title={playing ? "" : "Click to play"}
+          onClick={() => {
+            if (isImage) window.open(api.assetFileUrl(asset.assetId), "_blank");
+            else if (!playing) setPlaying(true);
+          }}
+          title={isImage ? "Click to open" : playing ? "" : "Click to play"}
         >
-          {playing ? (
+          {playing && !isImage ? (
             <video
               ref={videoRef}
               src={api.assetFileUrl(asset.assetId)}
@@ -551,7 +565,7 @@ function AssetListRow({
                 loading="lazy"
               />
               <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/40 transition-colors">
-                <span className="text-xl text-white/0 group-hover:text-white/90 transition-colors">▶</span>
+                <span className="text-xl text-white/0 group-hover:text-white/90 transition-colors">{isImage ? "↗" : "▶"}</span>
               </div>
             </>
           )}

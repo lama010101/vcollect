@@ -1,30 +1,47 @@
 // =============================================================================
-// Local video uploads — drag & drop files onto the webapp land here.
+// Local media uploads — drag & drop files (videos AND images) onto the webapp
+// land here.
 //
-// POST /api/assets/upload?project=<id>&name=<filename> with the raw video as
-// the request body (Content-Type: application/octet-stream or video/*). The
-// file is validated (extension + real container via ffprobe), hashed, probed
-// and stored inside the target project's dedicated assets folder:
+// POST /api/assets/upload?project=<id>&name=<filename> with the raw file as
+// the request body (Content-Type: application/octet-stream, video/* or
+// image/*). The file is validated (extension + real content — ffprobe for
+// videos, sharp metadata for images), hashed and stored inside the target
+// project's dedicated assets folder:
 //   OUTPUT_ROOT/<slug>/assets/uploads/<filename>
 // A 'local'-provider asset row is created so the upload shows up in Folders
-// (Uploads section) and in the Music Edit source library.
+// (Uploads section); video uploads also appear in the Music Edit source
+// library.
 // =============================================================================
 
 import type { FastifyInstance } from "fastify";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import { config, OUTPUT_ROOT, projectAssetDir, VIDEO_FILE_EXTENSIONS } from "../config.js";
+import sharp from "sharp";
+import { config, IMAGE_FILE_EXTENSIONS, OUTPUT_ROOT, projectAssetDir, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { getProject } from "../db/projectRepository.js";
 import { db } from "../db/client.js";
 import { getAsset, insertLocalAsset } from "../db/repository.js";
 import { syncProjectAssets } from "../db/assetSync.js";
 import { isPlayableVideo, probe } from "../video/ffprobe.js";
-import { generateThumbnail } from "../video/thumbnails.js";
+import { generateImageThumbnail, generateThumbnail } from "../video/thumbnails.js";
 import { PROJECT_ID_ALL, DEFAULT_PROJECT_ID } from "@twio/shared";
 
 /** Video file extensions accepted for upload (canonical set in config.ts). */
 export const VIDEO_EXTENSIONS: ReadonlySet<string> = VIDEO_FILE_EXTENSIONS;
+
+/** Image file extensions accepted for upload (canonical set in config.ts). */
+export const IMAGE_EXTENSIONS: ReadonlySet<string> = IMAGE_FILE_EXTENSIONS;
+
+export type MediaKind = "video" | "image";
+
+/** Classify an extension (with leading dot, any case) as video/image. */
+export function mediaKindForExt(ext: string): MediaKind | null {
+  const e = ext.toLowerCase();
+  if (VIDEO_FILE_EXTENSIONS.has(e)) return "video";
+  if (IMAGE_FILE_EXTENSIONS.has(e)) return "image";
+  return null;
+}
 
 /** Strip path separators + filesystem-unsafe characters from an uploaded
  *  filename — never trust client-supplied paths. The original name (and its
@@ -59,11 +76,11 @@ export interface UploadResult {
 }
 
 /**
- * Persist an uploaded video buffer into a project's dedicated assets folder.
- * Throws an Error with a `.statusCode` (400/415/422) on validation failure —
- * the route maps it to an HTTP status.
+ * Persist an uploaded video or image buffer into a project's dedicated assets
+ * folder. Throws an Error with a `.statusCode` (400/415/422) on validation
+ * failure — the route maps it to an HTTP status.
  */
-export async function saveUploadedVideo(
+export async function saveUploadedFile(
   projectId: string,
   rawName: string,
   data: Buffer,
@@ -76,8 +93,9 @@ export async function saveUploadedVideo(
 
   const filename = sanitizeFilename(rawName) || "upload.mp4";
   const ext = extname(filename).toLowerCase();
-  if (!VIDEO_EXTENSIONS.has(ext)) {
-    throw err(415, `unsupported file type "${ext || "(none)"}" — allowed: ${[...VIDEO_EXTENSIONS].join(", ")}`);
+  const kind = mediaKindForExt(ext);
+  if (!kind) {
+    throw err(415, `unsupported file type "${ext || "(none)"}" — allowed: ${[...VIDEO_EXTENSIONS, ...IMAGE_EXTENSIONS].join(", ")}`);
   }
   if (data.length === 0) throw err(400, "empty upload");
 
@@ -110,23 +128,36 @@ export async function saveUploadedVideo(
   }
   writeFileSync(destAbs, data);
 
-  // Never trust the extension — verify it's a real video container.
-  if (!(await isPlayableVideo(destAbs))) {
-    try { rmSync(destAbs, { force: true }); } catch { /* ignore */ }
-    throw err(422, `"${filename}" is not a playable video file`);
-  }
-
   let width: number | null = null;
   let height: number | null = null;
   let durationSeconds: number | null = null;
   let fps: number | null = null;
-  try {
-    const p = await probe(destAbs);
-    width = p.width;
-    height = p.height;
-    durationSeconds = p.durationSeconds;
-    fps = p.fps;
-  } catch { /* metadata stays null — the file still counts as uploaded */ }
+
+  if (kind === "image") {
+    // Never trust the extension — verify sharp can decode real pixel metadata.
+    try {
+      const meta = await sharp(destAbs).metadata();
+      width = meta.width ?? null;
+      height = meta.height ?? null;
+      if (!width || !height) throw new Error("no dimensions");
+    } catch {
+      try { rmSync(destAbs, { force: true }); } catch { /* ignore */ }
+      throw err(422, `"${filename}" is not a readable image file`);
+    }
+  } else {
+    // Never trust the extension — verify it's a real video container.
+    if (!(await isPlayableVideo(destAbs))) {
+      try { rmSync(destAbs, { force: true }); } catch { /* ignore */ }
+      throw err(422, `"${filename}" is not a playable video file`);
+    }
+    try {
+      const p = await probe(destAbs);
+      width = p.width;
+      height = p.height;
+      durationSeconds = p.durationSeconds;
+      fps = p.fps;
+    } catch { /* metadata stays null — the file still counts as uploaded */ }
+  }
 
   const orientation =
     width != null && height != null
@@ -150,16 +181,17 @@ export async function saveUploadedVideo(
   });
 
   // Thumbnail is best-effort — never fail the upload over it.
-  await generateThumbnail(destAbs, assetId).catch(() => null);
+  await (kind === "image" ? generateImageThumbnail(destAbs, assetId) : generateThumbnail(destAbs, assetId)).catch(() => null);
 
   return { assetId, filename: basename(destAbs), localPath, sizeBytes: data.length, alreadyUploaded: false };
 }
 
 export async function registerUploadRoutes(app: FastifyInstance): Promise<void> {
-  // Scan the project's assets folder and register video files that were
-  // placed there outside the app (explorer copy, another tool, …) so they
-  // show up in Folders and the Music Edit source library. __ALL__ syncs every
-  // project (the library aggregates across projects in that view).
+  // Scan the project's assets folder and register media files (videos +
+  // images) that were placed there outside the app (explorer copy, another
+  // tool, …) so they show up in Folders and in the Music Edit source library
+  // (videos only). __ALL__ syncs every project (the library aggregates
+  // across projects in that view).
   app.post("/api/assets/sync", async (req, reply) => {
     const q = req.query as Record<string, unknown>;
     const projectId = String(q.project ?? DEFAULT_PROJECT_ID).trim();
@@ -181,9 +213,12 @@ export async function registerUploadRoutes(app: FastifyInstance): Promise<void> 
   });
 
   await app.register(async (scope) => {
-    // Raw video body. Cap at the same limit used for provider downloads.
+    // Raw file body. Cap at the same limit used for provider downloads.
+    // The webapp always sends application/octet-stream; video/* + image/* are
+    // matched by RegExp (Fastify doesn't treat "video/*" strings as
+    // wildcards) so direct API callers can send a proper media type.
     scope.addContentTypeParser(
-      ["application/octet-stream", "video/*"],
+      /^application\/octet-stream$|^video\/|^image\//,
       { parseAs: "buffer", bodyLimit: config.maxDownloadMb * 1024 * 1024 },
       (_req, body, done) => done(null, body),
     );
@@ -196,9 +231,9 @@ export async function registerUploadRoutes(app: FastifyInstance): Promise<void> 
       }
       const name = String(q.name ?? "upload.mp4");
       if (!Buffer.isBuffer(req.body)) {
-        return reply.code(400).send({ error: "send the video file as the raw request body" });
+        return reply.code(400).send({ error: "send the file as the raw request body" });
       }
-      const result = await saveUploadedVideo(projectId, name, req.body);
+      const result = await saveUploadedFile(projectId, name, req.body);
       return reply.code(result.alreadyUploaded ? 200 : 201).send({
         ...result,
         asset: getAsset(result.assetId) ?? null,

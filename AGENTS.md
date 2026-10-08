@@ -34,18 +34,25 @@
 
 - **Per-project asset folders:** real asset files live in each project's
   dedicated folder — `OUTPUT_ROOT/<slug>/assets/<query>/` for provider
-  downloads and `OUTPUT_ROOT/<slug>/assets/uploads/` for drag & drop videos.
-  `local_path` stays relative to `OUTPUT_ROOT` (so `<slug>/assets/...`).
-  Build dirs via `projectAssetDir(slug, subdir)`, never `OUTPUT_ROOT/<query>`
-  directly (that global layout is legacy; `migrateAssetsToProjectFolders`
-  moves old files). Uploads: `POST /api/assets/upload?project=<id>&name=`
-  (raw body) → `routes/uploads.ts` → `provider_id='local'` asset row; the
-  frontend drop zone is global in `App.tsx` and fires `ASSETS_CHANGED_EVENT`
-  so Folders/Music Edit refresh. **Folder = source of truth:**
-  `db/assetSync.ts#syncProjectAssets` + `POST /api/assets/sync?project=<id>`
-  register any video file found on disk inside `<slug>/assets/` that has no
-  DB row — Music Edit's library and the Folders page call it before loading,
-  so manually-copied files appear everywhere a downloaded asset would.
+  downloads and `OUTPUT_ROOT/<slug>/assets/uploads/` for drag & drop files
+  (videos AND images — `VIDEO_FILE_EXTENSIONS` + `IMAGE_FILE_EXTENSIONS` in
+  config.ts). `local_path` stays relative to `OUTPUT_ROOT` (so
+  `<slug>/assets/...`). Build dirs via `projectAssetDir(slug, subdir)`, never
+  `OUTPUT_ROOT/<query>` directly (that global layout is legacy;
+  `migrateAssetsToProjectFolders` moves old files). Uploads: `POST
+  /api/assets/upload?project=<id>&name=` (raw body) → `routes/uploads.ts`
+  `saveUploadedFile` → `provider_id='local'` asset row; videos validate via
+  ffprobe `isPlayableVideo`, images via `sharp().metadata()` — never trust
+  the extension. The frontend drop zone is global in `App.tsx` and fires
+  `ASSETS_CHANGED_EVENT` so Folders/Music Edit refresh. **Folder = source of
+  truth:** `db/assetSync.ts#syncProjectAssets` + `POST
+  /api/assets/sync?project=<id>` register any video or image file found on
+  disk inside `<slug>/assets/` that has no DB row — Music Edit's library and
+  the Folders page call it before loading, so manually-copied files appear
+  everywhere a downloaded asset would. Image assets are kept out of
+  video-only surfaces via `isImageFileName(local_path)` (Music Edit source
+  library filters them; Folders/Library render `<img>` instead of a player).
+  `/api/assets/:id/file` sets Content-Type via `mediaMimeForFile`.
 
 - **Imports:** Source files use `.js` extensions in relative imports (Node ESM
   convention). Tests use `.ts` extensions (tsx resolves those). The
@@ -145,6 +152,63 @@
   the preview decodes into `StemSignal`. Errors are `VisualizerError`.
   Tests: `apps/server/test/visualizer.node.test.ts`.
 
+  **Layer stack (compositing):** `globalVisuals.video.layers` is a
+  bottom→top stack of up to `VIZ_MAX_VIDEO_LAYERS` (10)
+  `VizMediaLayerConfig`s — a discriminated union: media rows
+  `{kind:"media", assetId, hidden, x, y, opacity, scale, key}` for downloaded videos AND
+  images, plus the visuals row `{kind:"visuals", hidden, x, y, opacity, scale}` which
+  draws the whole "2. Look" mode-visual set at its stack position. **Row
+  order is the only z-order** (row N-1 sits under row N) and **only listed
+  rows draw** — no `kind:"visuals"` row means no waveforms at all. The UI
+  lists the stack **top-first** (row 1 = top layer, like a Layers panel)
+  and rows reorder via a **vertical-only drag** (horizontal gestures belong
+  to the row's sliders — the li's `draggable` is armed only after the
+  pointer moves mostly up/down; the ⠿ grip arms instantly). Any row's
+  `hidden` flag (eye toggle in the UI) keeps its slot but draws nothing —
+  hidden media rows aren't even validated/decoded on export. The
+  dancer + convergence star always ride on top of the stack.
+  `x`/`y` (0–1, default 0.5) place the row's center anywhere in the
+  frame, and `scale` (0.1–2, default 1) resizes the row about that
+  point — the raster is still cover-cropped to frame aspect, so <1 =
+  inset, >1 = zoom clipped by the viewBox (visuals rows get a
+  `translate(cx cy) scale(s) translate(-w/2 -h/2)` `<g transform>` /
+  offscreen-canvas equivalent).
+  Backwards compatibility on schema parse: a missing `layers` key
+  defaults to a lone visuals row (old configs kept waveforms); the legacy
+  flat `{assetId, layer, opacity, key/chromaKey}` config folds to
+  `[media, visuals]` / `[visuals, media]` per its old under/over band;
+  band-model rows (a deprecated `layer` hint on a `layers[]` entry) get a
+  visuals row re-inserted at the under/over boundary. New-format lists
+  are trusted verbatim. The preview keeps one hidden `<video>`/`<img>`
+  per media row index (visuals rows skip it) and the export runs one
+  decoder pipe per video row (`sharp` one-shot decode for images; visuals
+  rows are aligned no-op placeholders) — both draw the same
+  `state.videoLayers` ordering via `modeVisualsSvg`/`drawVisuals`.
+
+  **Layer background removal:** each layer's `key`
+  (`VizVideoKeyConfig`) replaces the deprecated `chromaKey` field — old
+  configs fold in on schema parse (`enabled → method:"colorkey"`,
+  `despill:false`). Methods (`VIZ_KEY_METHODS`): `colorkey` (ffmpeg
+  `colorkey` ramp), `chromakey` (`chromaKeyYUVFrame`, a `vf_chromakey`
+  port), `hsv` (`hsvKeyFrame`, hue×saturation distance + `choke` matte
+  erode/dilate), all dispatched by `keyVideoFrame()` on decoded RGBA —
+  the decoder just emits `format=rgba` and the SAME shared function runs in
+  the Canvas preview and the export, so pixels are identical by
+  construction; keyed frames embed PNG (not JPEG). `cutout` is different:
+  `visualizer/keying.ts` asks the engine's `key_video` RPC for a
+  content-addressed VP9-alpha WebM under `OUTPUT_ROOT/cache/keys/`
+  (`key-<sha1(path+size+mtime+params)>.webm`, in-flight dedupe, sidecar
+  progress JSON, abort → worker kill → 499). The preview `<video>` plays
+  that WebM directly and the export decodes it with `-c:v libvpx-vp9`
+  (the native vp9 decoder drops alpha). Models (Apache-2.0 only, no GPL
+  RVM): `mediapipe` (`selfie_segmenter_landscape.tflite` via `cv2.dnn` —
+  input MUST be normalized to [-1,1]) and `modnet` (ONNX via
+  `onnxruntime`; `cv2.dnn` can't parse its graph). Model files download
+  on demand into `OUTPUT_ROOT/cache/models/` with sha256 pinning
+  (`twio_engine/models.py`). Routes: `POST/GET /api/visualizer/video-key`,
+  `POST .../cancel`. UI params snapshot gates the keyed preview (stale
+  params → "regenerate").
+
 - **Procedural dancer (`@twio/shared` `dancer.ts`):** a deterministic
   forward-kinematic 15-joint skeleton rendered as tapered ribbon limbs.
   `computeDancer(stems, cfg, w, h, t, center)` is a pure function of t and
@@ -169,8 +233,8 @@
   features (tempo, onsets, 6-band envelopes, beats) under
   `OUTPUT_ROOT/cache/engine/`. The built-in TS beat tracker remains the
   primary beat engine — librosa only enriches. Deps: numpy, scipy,
-  librosa, soundfile, opencv-python-headless (pinned in
-  `requirements.txt`; MoviePy deliberately excluded).
+  librosa, soundfile, opencv-python-headless, onnxruntime (MODNet cutout;
+  pinned in `requirements.txt`; MoviePy deliberately excluded).
 
 ## Progress tracking (REQUIRED)
 

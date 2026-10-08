@@ -54,6 +54,13 @@ def _analyze_stem(params):
     return features.analyze_stem(params)
 
 
+@method("key_video")
+def _key_video(params):
+    # Lazy: imports cv2/onnxruntime only for this method.
+    from . import matting
+    return matting.key_video(params)
+
+
 def _respond(req_id, ok, **kw):
     sys.stdout.write(json.dumps({"id": req_id, "ok": ok, **kw}) + "\n")
     sys.stdout.flush()

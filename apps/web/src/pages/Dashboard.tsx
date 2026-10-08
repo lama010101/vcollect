@@ -5,7 +5,7 @@ import { Card, StatCard, Button, Badge, ProgressBar, SectionTitle, EmptyState, S
 interface DashboardProps {
   projectId: string;
   onToast: (text: string, tone?: "info" | "success" | "error") => void;
-  onNavigate: (v: { name: "dashboard" } | { name: "search" } | { name: "timeline" } | { name: "folders" } | { name: "projects" } | { name: "help" }) => void;
+  onNavigate: (v: { name: "dashboard" } | { name: "library" } | { name: "timeline" } | { name: "folders" } | { name: "projects" } | { name: "help" }) => void;
 }
 
 export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
@@ -152,8 +152,8 @@ export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
               </Button>
             </div>
             <div className="pt-2 border-t border-slate-700/40 space-y-1.5">
-              <button onClick={() => onNavigate({ name: "search" })} className="w-full text-left text-sm text-slate-400 hover:text-sky-400 transition-colors py-1.5 px-2 rounded hover:bg-slate-800/40">
-                ⌕ Search assets & providers →
+              <button onClick={() => onNavigate({ name: "library" })} className="w-full text-left text-sm text-slate-400 hover:text-sky-400 transition-colors py-1.5 px-2 rounded hover:bg-slate-800/40">
+                ⌕ Browse the library →
               </button>
               <button onClick={() => onNavigate({ name: "timeline" })} className="w-full text-left text-sm text-slate-400 hover:text-sky-400 transition-colors py-1.5 px-2 rounded hover:bg-slate-800/40">
                 ▬ Open timeline & review shots →
@@ -202,7 +202,7 @@ export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
           </SectionTitle>
 
           {activeTasks.length === 0 ? (
-            <EmptyState icon="↓" title="No active downloads" description="Start an acquisition or download assets from the Search page." />
+            <EmptyState icon="↓" title="No active downloads" description="Start an acquisition or download assets from the Library page." />
           ) : (
             <div className="space-y-2 max-h-64 overflow-y-auto">
               {activeTasks.map((t) => {

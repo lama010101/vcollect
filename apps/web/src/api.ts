@@ -1,12 +1,24 @@
 // Thin fetch wrapper for the backend API.
 // Same-origin "/api" in dev (Vite proxy) and when the backend serves the SPA.
 // Set VITE_API_URL to point the deployed frontend at a hosted backend.
-import type { BeatAnalysis, EditPlan, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest } from "@twio/shared";
+import type { BeatAnalysis, EditPlan, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VizVideoKeyConfig } from "@twio/shared";
 const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
 /** Fired on `window` after local uploads complete so asset lists (Folders,
  *  Music Edit library) refresh without a page reload. */
 export const ASSETS_CHANGED_EVENT = "twio:assets-changed";
+
+// File-type helpers for drag & drop — mirror the server's accepted extension
+// sets (VIDEO_FILE_EXTENSIONS / IMAGE_FILE_EXTENSIONS in apps/server config).
+export const VIDEO_FILE_RE = /\.(mp4|mov|webm|mkv|avi|m4v|mpg|mpeg)$/i;
+export const IMAGE_FILE_RE = /\.(jpe?g|png|webp|gif|avif|tiff?|svg)$/i;
+export const isVideoFile = (f: File) => f.type.startsWith("video/") || VIDEO_FILE_RE.test(f.name);
+export const isImageFile = (f: File) => f.type.startsWith("image/") || IMAGE_FILE_RE.test(f.name);
+export const isMediaFile = (f: File) => isVideoFile(f) || isImageFile(f);
+/** True when a stored filename/path (e.g. asset.local_path) is an image —
+ *  used to keep stills out of video-only surfaces (Music Edit sources,
+ *  inline players). */
+export const isImageFileName = (name: string | null | undefined): boolean => !!name && IMAGE_FILE_RE.test(name);
 
 /** Extract a human-readable error message from a failed fetch response. */
 async function errorMessage(r: Response, url: string): Promise<string> {
@@ -575,6 +587,22 @@ export interface VizRenderedFile {
   sizeBytes: number;
   createdAt: string;
 }
+/** Engine-baked keyed-WebM job (AI cutout). `keyId` is the cache hash —
+ *  identical (asset, params) produce the same id so stale results are
+ *  detectable client-side. */
+export interface VizKeyJob {
+  id: string;
+  keyId: string;
+  projectId: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  progress: { done: number; total: number };
+  error: { code: string; message: string } | null;
+  /** /files/… URL of the keyed WebM once done. */
+  url: string | null;
+  path: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
 
 // --- Python engine (analysis worker status) -----------------------------------
 export interface EngineStatus {
@@ -760,7 +788,7 @@ export const api = {
     postJson<{ started?: boolean; alreadyRunning?: boolean }>(`/api/assets/${id}/acquire`),
   acquireAssetProgress: (id: string) =>
     getJson<AcquireAssetProgress>(`/api/assets/${id}/acquire/progress`),
-  // --- Acquire multiple discovered assets (Acquire All on search page) ---
+  // --- Acquire multiple discovered assets (Acquire All on the Library page) ---
   acquireAssetsBatch: (assetIds: string[]) =>
     postJson<{ started?: boolean; alreadyRunning?: boolean }>(`/api/assets/acquire-batch`, { assetIds }),
   acquireAssetsBatchProgress: () =>
@@ -873,6 +901,11 @@ export const api = {
   // Coarse phase of the in-flight signal analysis (null when idle/cached).
   vizStemSignalStatus: (projectId: string, name: string) =>
     getJson<{ phase: string | null }>(withProject(`/api/visualizer/stems/${encodeURIComponent(name)}/signal/status`, projectId)),
+  // AI cutout: bake a keyed (alpha) WebM of a downloaded asset via the engine.
+  vizVideoKey: (projectId: string, assetId: string, key: VizVideoKeyConfig) =>
+    postJson<{ job: VizKeyJob }>(withProject("/api/visualizer/video-key", projectId), { assetId, key }),
+  vizVideoKeyJob: (id: string) => getJson<{ job: VizKeyJob }>(`/api/visualizer/video-key/${encodeURIComponent(id)}`),
+  vizCancelVideoKey: (id: string) => postJson<{ job: VizKeyJob }>(`/api/visualizer/video-key/${encodeURIComponent(id)}/cancel`),
   // --- Python engine ---
   engineStatus: () => getJson<EngineStatus>("/api/engine/status"),
   engineSetup: () => postJson<EngineStatus>("/api/engine/setup"),

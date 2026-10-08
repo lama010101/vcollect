@@ -45,7 +45,7 @@ apps/server/src/
   python/        pythonService.ts (interpreter resolution + managed venv
                  auto-install) · engineClient.ts (worker lifecycle/RPC)
   routes/        dashboard.ts · folders.ts · review.ts · musicEdit.ts ·
-                 uploads.ts (drag & drop video upload → project assets/) ·
+                 uploads.ts (drag & drop media upload → project assets/) ·
                  visualizer.ts · engine.ts
 apps/server/python/
   twio_engine/   worker.py (NDJSON RPC) · features.py (librosa analysis)
@@ -54,7 +54,7 @@ apps/server/python/
   db/            client.ts (Sql wrapper, lazy stmts)
   video/         ffmpeg.ts (resolution: env → PATH → bundled npm binary)
 apps/web/src/
-  pages/         Dashboard, Projects, Search, ShotList, ShotReview, Timeline,
+  pages/         Dashboard, Projects, Library, ShotList, ShotReview, Timeline,
                  Folders, ImportScript, MusicEdit, Visualizer, Help
   components/    RatingSlider, TasksPanel, ui, useToast
 ```
@@ -75,11 +75,11 @@ apps/web/src/
 | Multi-stem visualizer | ✅ Done | Waveform-convergence video renderer; shared frame math in `@twio/shared` |
 | Visualizer modes | ✅ Done | ribbons / circular / particles / mirror / blocks / eqbars / eqradial / stereo / silk (engine-free) + spectrum (engine band features) |
 | Procedural dancer | ✅ Done | 15-joint FK skeleton, deterministic f(t) from stem envelopes/onsets; neon/silhouette |
-| Visualizer video layer | ✅ Done | Downloaded project asset composited under/over the visuals; looped + cover-cropped, deterministic t=k/fps timing; chroma-key bg removal |
+| Visualizer video layer | ✅ Done | Downloaded project asset composited under/over the visuals; looped + cover-cropped, deterministic t=k/fps timing; bg removal via colorkey/chromakey/hsv keyers (shared TS, preview=export) or AI cutout (MediaPipe/MODNet → cached VP9-alpha WebM) |
 | Beat-synced Look auto modes | ✅ Done | autoGlow (per-beat random glow in range) + autoCenter (center glides to a hashed spot per beat) |
 | Python engine | ✅ Done (optional) | Managed venv + librosa worker; stem features enrich visualizer — app runs without it |
 | Per-project asset folders | ✅ Done | `OUTPUT_ROOT/<slug>/assets/`; existing files migrated |
-| Drag & drop upload | ✅ Done | Drop videos anywhere → `<slug>/assets/uploads/` + asset row |
+| Drag & drop upload | ✅ Done | Drop videos or images anywhere → `<slug>/assets/uploads/` + asset row |
 | P2 AI vision analysis | ⬜ Not started | Out of scope; schema nullable-ready |
 | Mixkit import / rough-cut export | ⬜ Deferred | P3 |
 
@@ -105,7 +105,7 @@ npm run dev          # server :3001 + web :5174
 #   (needs MUSIC_EDIT_SONG + MUSIC_EDIT_VIDEOS=≥4 paths)
 ```
 
-Last verified: `npm run typecheck` + server tests (97 incl. chroma-key) ✅ (2026-10-06).
+Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-10-07).
 
 ## Gotchas (short list — see AGENTS.md for full detail)
 
@@ -126,6 +126,390 @@ Last verified: `npm run typecheck` + server tests (97 incl. chroma-key) ✅ (202
 > tooling) MUST add a dated entry here before the work is considered done.
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
+
+### 2026-10-08 — Visualizer: "3. Media layers" panel in fullscreen preview (and/or with Look)
+- The fullscreen live preview now has TWO independent overlay panels: the
+  existing **◈ Look** (top-right) plus a new **▣ Layers** toggle (top-left,
+  `w-[26rem]` panel). Both can be open at once — tweak visuals + layer
+  stack while the video plays.
+- Done by extracting Section 3's children (~480 lines) into a
+  `layersContent` JSX const — the exact pattern `lookContent` already used.
+  The same JSX renders inside `<Section title="3. Media layers">` and in
+  the overlay, so every control (picker, drag-reorder, eye, position/size/
+  key cards, cutout jobs) works identically in both places.
+- Files touched: `apps/web/src/pages/Visualizer.tsx` only.
+- Verified: `tsc --noEmit` ✅ (`@twio/web`).
+
+### 2026-10-08 — Visualizer: per-layer position (center X/Y) + mini-card settings UI
+- **New `x`/`y` fields on every layer row** (media AND ◈ visuals):
+  normalized 0–1, default 0.5 = frame center. The layer's raster is drawn
+  so its center lands at `(x·w, y·h)`; `scale` now resizes about that point
+  instead of the frame center. Edge values clip half the layer off-frame.
+- `x`/`y` ride the same path as `scale`/`opacity`: schema defaults →
+  `computeFrame` → `state.videoLayers` → Canvas `drawState`
+  (`dx = x·w − dw/2`; off-center visuals rows fall back to the offscreen
+  composite) → `frameSvg` (`layerImageTag` takes cx/cy; the visuals `<g>`
+  gets `translate(cx cy) scale(s) translate(-w/2 -h/2)`). Preview = export,
+  pixel-identical. `hidden`+`x`/`y` carried through localStorage migration.
+- **Mini-cards:** each row's second line is now a flex-wrap of titled
+  mini-cards (`LAYER_CARD`/`LAYER_CARD_LABEL`) — **Position** (X + Y
+  sliders, ⌖ re-center), **Size**, and **Background removal** (media rows:
+  method select + all key params + cutout status/progress folded inside).
+- Files touched: `packages/shared/src/visualizer.ts`,
+  `apps/server/src/visualizer/svg.ts`,
+  `apps/web/src/pages/Visualizer.tsx`,
+  `apps/server/test/visualizer.node.test.ts` (+1 test, deepEqual shapes).
+- Verified: `npm run typecheck` ✅ all workspaces;
+  `tsx --test visualizer.node.test.ts` 42/42 ✅ (incl. new
+  "layer center x/y moves the drawn position").
+
+### 2026-10-08 — Visualizer: vertical-only row drag + top-first layer list
+- **Drag gate:** layer rows used to be blanket-`draggable`, so horizontal
+  slider gestures (opacity/size/similarity…) dragged the whole row. A row's
+  `draggable` now arms only after a press moves ≥6px mostly vertically —
+  horizontal intent releases the gesture back to the control. The ⠿ grip
+  arms instantly on mousedown (any direction); a window `mouseup` listener
+  disarms so a stale armed row can't hijack the next slider drag. The layer
+  thumbnail gets `draggable={false}` so it can't become the drag source.
+- **Top-first order:** the stack (`layers[0]` = bottom, unchanged — render
+  order untouched) is now listed like a Layers panel: row 1 is the TOP
+  layer, and ↑/↓ + drag/drop renumber accordingly. New layers still land on
+  top (= row 1). Header/hint text updated.
+- Files touched: `apps/web/src/pages/Visualizer.tsx` only (no render-path
+  changes — internal stack order is still bottom→top).
+- Verified: `tsc --noEmit` ✅ (`@twio/web`).
+
+### 2026-10-08 — Visualizer: per-layer show/hide toggle (media layers)
+- Every layer-stack row (media AND ◈ visuals) gets an eye button next to its
+  index — hide keeps the row's settings + stack position but draws nothing.
+  Hidden rows show an eye-off glyph and a dimmed thumb/title.
+- `hidden: z.boolean().default(false)` added to both layer schemas
+  (`vizMediaAssetLayerSchema`, `vizVisualsLayerSchema`), carried through
+  `computeFrame` → `state.videoLayers` (index-aligned, so hidden rows keep
+  their slot — the z-order contract is unchanged). Legacy folds produce
+  `hidden:false`; the UI's localStorage migration carries the flag.
+- Both renderers skip hidden rows (`if (v.hidden || v.opacity <= 0) return`)
+  — Canvas `drawState` and `frameSvg` stay pixel-identical. The preview also
+  skips mounting the hidden `<video>`/`<img>` for hidden media rows (saves
+  the decode loop).
+- Export (`service.ts`): hidden media rows resolve to the same no-op
+  placeholder as visuals rows — the asset is NOT validated/downloaded, no
+  decoder pipe or probe/cutout work is spent, and a stale asset on a hidden
+  row can't fail the render.
+- Files touched: `packages/shared/src/visualizer.ts`,
+  `apps/web/src/pages/Visualizer.tsx` (EyeIcon + row UI),
+  `apps/server/src/visualizer/{svg,service}.ts`,
+  `apps/server/test/visualizer.node.test.ts` (+1 test, deepEqual shapes).
+- Verified: `npm run typecheck` ✅ all workspaces; `npm run test:server`
+  113/113 ✅ (incl. new "hidden rows keep their stack slot but draw nothing").
+
+### 2026-10-07 — Fix: render cancel crashed the server (process kill)
+- Live-verifying the layer stack surfaced a **pre-existing fatal bug**:
+  cancelling a mid-render job took the whole server down. Root cause is a
+  Node subtlety — `spawn({signal})` makes `abort()` emit `'error'` on every
+  registered child *synchronously inside the route handler*, and
+  `once(child, "close")` rejects its promise on that 'error' — **before
+  `await closed` runs the rejection is unhandled → process exits**
+  (`child_process.js:759` → `abortChildProcess`).
+- Fixes in `apps/server/src/visualizer/render.ts`: `'error'` listeners on the
+  encoder child, its stdin, and every decoder proc (unhandled `'error'` on a
+  signal child throws back through `abort()`); `closed` gets an **eager
+  `.catch`** at creation so it can never be an unhandled rejection;
+  `writeFrame` bails on a destroyed/closed stdin and waits on
+  drain+close+error with **self-cleaning listeners** (`once()`-racing would
+  leak the loser's listeners — MaxListenersExceeded warning); `.parts`
+  scratch-dir `rmSync` gets `maxRetries`/`retryDelay` (a killed child's file
+  handles release a beat late on Windows → EPERM) and cleanup failure never
+  masks the real render outcome.
+- Plus a belt-and-suspenders `try/catch` around `controller.abort()` in
+  `service.ts#cancelRenderJob` — the job still flips to cancelled via the
+  render loop's aborted checks.
+- Verified live: media+visuals render cancelled mid-frames → server stays
+  up (200), job settles `cancelled`/`RENDER_CANCELLED`, no orphan ffmpeg
+  procs, no `.parts` debris. Before the fix the same flow crashed the
+  process every time. `npm run typecheck` ✅, `test:server` 112/112 ✅.
+
+### 2026-10-07 — Visualizer: "Open folder" button in section 5. Render
+- A `📁 Open folder` button in the Render controls calls the existing
+  `POST /api/visualizer/reveal` endpoint with no `name`, which opens the
+  project's renders dir (`OUTPUT_ROOT/<slug>/visualizer/renders/`) in the
+  OS file explorer. `visualizerDir` creates it on demand, so the button
+  works before the first render.
+- `revealInExplorer` (`routes/folders.ts`) is now directory-aware: a dir
+  is *opened* (Windows `explorer "dir"`, macOS `open "dir"`, Linux
+  `xdg-open dir`) instead of selected inside its parent; files keep the
+  reveal/select behavior.
+- Files: `apps/web/src/pages/Visualizer.tsx`,
+  `apps/server/src/routes/folders.ts`, this file.
+- Verified: `npm run typecheck` ✅ all workspaces.
+
+### 2026-10-07 — Visualizer: add-layer picker with thumbnails + filters
+- Section "3. Media layers" replaces the plain `<select>` with a popover
+  picker: the ◈ Waveform-visuals row is pinned at the top (disabled once
+  in the stack), then a name filter input, independent ▶ videos / 🖼
+  images kind toggles, and a result list with per-asset thumbnails,
+  image/video badge, duration and dimensions. Already-added assets get an
+  "in stack ×N" badge; the picker stays open for multi-add and closes on
+  click-away or Esc.
+- Files: `apps/web/src/pages/Visualizer.tsx`, this file.
+- Verified: `npm run typecheck` ✅ (web workspace).
+
+### 2026-10-07 — Visualizer: list position is the only z-order (no band buttons)
+- Confirmed/kept the unified-stack UI: media-layer rows have no
+  under/over buttons — row position in the list is the layer position for
+  every row type (media assets and the ◈ waveform-visuals row alike).
+- **Fix:** `loadPersisted`'s migration no longer copies the deprecated
+  `layer` hint onto migrated rows — it only steers the visuals-row
+  insertion index. Persisting it would have let the server-side fold
+  resurrect a ◈ visuals row after the user deliberately removed it.
+- Files: `apps/web/src/pages/Visualizer.tsx`, this file.
+- Verified: `npm run typecheck` ✅ (web workspace).
+
+### 2026-10-07 — Visualizer: fullscreen preview click = play/pause
+- Clicking the canvas while the live preview is in fullscreen toggles
+  playback (`pausePlayback`/`startPlayback`), with a brief centered ▶/⏸
+  glyph as feedback. `e.detail` disambiguates the existing
+  double-click-to-exit gesture: click #1 arms a 280 ms timer, click #2
+  cancels it, so exiting fullscreen never toggles playback. No-op when
+  there are no stems; normal (non-fullscreen) clicks are unaffected —
+  double-click to enter/exit fullscreen is unchanged.
+- Files: `apps/web/src/pages/Visualizer.tsx`, this file.
+- Verified: `npm run typecheck` ✅ (web workspace).
+
+### 2026-10-07 — Visualizer: the 2. Look waveforms become an explicit layer-stack row
+- **New compositing model**: `globalVisuals.video.layers` rows are now a
+  discriminated union — media rows `{kind:"media", assetId, opacity,
+  scale, key}` plus a visuals row `{kind:"visuals", opacity, scale}`. Row
+  order is the sole z-order and **only listed rows draw**: remove the ◈
+  "Waveform visuals" row and the 2. Look visuals render nowhere — not in
+  the live preview and not in the MP4 export. The old per-row
+  `under`/`over` band toggle is gone (the visuals row's position replaces
+  it; dancer + convergence star still ride on top).
+- **Schema** (`packages/shared/src/visualizer.ts`): `vizMediaLayerSchema`
+  = `vizMediaAssetLayerSchema ∪ vizVisualsLayerSchema` (same 10-row cap
+  counts every row). `vizVideoSchema` keeps backwards compatibility: no
+  `layers` key → a lone visuals row (old visuals-only configs keep their
+  waveforms); the flat legacy `{assetId, layer, ...}` shape folds to
+  `[media, visuals]` (under) or `[visuals, media]` (over); band-model rows
+  (deprecated `layer` hint) without a visuals row get one re-inserted at
+  the under/over boundary. New-format lists pass verbatim. `VizFrameState
+  .videoLayers` carries `{kind, opacity, scale, key|null}` per row.
+- **Server** (`svg.ts`, `render.ts`, `service.ts`): the mode-visual emit
+  code moved into `modeVisualsSvg()`; `frameSvg` walks the stack once —
+  media rows emit their `<image>` (centered `scale` rect + `opacity`),
+  visuals rows emit the mode visuals inside `<g opacity transform>`.
+  `render.ts` keeps one `LayerPipe` per row aligned with
+  `state.videoLayers` — visuals rows are no-op placeholders; `service.ts`
+  validates/probes/cuts-out media rows only.
+- **Web** (`pages/Visualizer.tsx`): the add-select gains a "◈ Waveform
+  visuals (the 2. Look layer)" pseudo-option (single instance, disabled
+  once present); the visuals row renders a violet ◈ tile + `visuals`
+  badge + mode name and supports the same drag-reorder, opacity and size
+  controls (no keying). `drawVisuals()` was extracted from `drawState`
+  (mirrors `modeVisualsSvg`); the preview iterates the stack — media rows
+  draw their hidden element, a visuals row draws the mode visuals
+  (offscreen-canvas composited when opacity<1 or scale≠1). `loadPersisted`
+  migrates old saves by restoring the visuals row at the under/over
+  boundary; new-format lists without a visuals row are honored literally.
+- Files: `packages/shared/src/visualizer.ts`,
+  `apps/server/src/visualizer/{service,render,svg}.ts`,
+  `apps/web/src/pages/Visualizer.tsx`,
+  `apps/server/test/visualizer.node.test.ts` (suite renamed to "layer
+  stack (media + visuals rows)" — stack-order/absence/presence svg
+  assertions, band→stack migration, visuals-row opacity/scale, 10-row cap
+  across row kinds), `AGENTS.md`, this file.
+- Verified: `npm run typecheck` ✅ all workspaces; `npm run test:server`
+  112/112 ✅; `npm run test:shared` 4/4 ✅.
+
+### 2026-10-07 — Visualizer: multi-layer media compositing (up to 10 videos/images)
+- **Schema** (`packages/shared/src/visualizer.ts`): `globalVisuals.video` is
+  now `{ layers: VizMediaLayerConfig[] }` (max `VIZ_MAX_VIDEO_LAYERS` = 10).
+  Each layer = `{ assetId, layer:"under"|"over", opacity, key }`. The legacy
+  flat `{assetId, layer, opacity, key/chromaKey}` shape folds into a one-item
+  `layers` array on parse, and a `chromaKey` field on a `layers[]` row folds
+  too — old configs (and persisted previews) keep working. `VizFrameState`
+  gained `videoLayers: {layer, opacity, key|null}[]`; `computeFrame` emits
+  them in row order.
+- **Row order = z-order**: rows are the stack bottom→top (row N-1 under row
+  N). Each layer also picks a band — `under` draws between the background and
+  the mode visuals, `over` draws above the visuals (below the dancer/star).
+- **Server** (`svg.ts`, `render.ts`, `service.ts`): the render resolves every
+  layer's asset (project-scoped, downloaded, video or image), runs one
+  ffmpeg decoder pipe per video layer and a one-shot `sharp` decode for
+  image layers, keys each frame with that layer's key config, and hands
+  `frameSvg` a per-layer href array — `frameSvg` emits one `<image>` per
+  layer inside its band, in row order, with per-layer opacity.
+- **UI** (`pages/Visualizer.tsx`, section "3. Media layers"): an add-select
+  of downloaded video+image assets (≤10), then an enriched row per layer —
+  thumbnail, title, media-kind badge, under/over band toggle, opacity slider
+  with % readout, ↑/↓ fallback buttons, remove, and per-row key controls
+  (color-key methods + AI cutout for videos). Rows are HTML5-drag-droppable
+  (`draggable` + drop-highlight) — dropping reorders `video.layers`, which
+  instantly reorders both the Canvas preview and the export. Preview keeps
+  one hidden `<video>`/`<img>` element per row index (videos loop via
+  `t % duration`, matching the export's `-stream_loop`); persisted
+  localStorage sessions migrate the old single-video shape.
+- Files: `packages/shared/src/visualizer.ts`,
+  `apps/server/src/visualizer/{service,render,svg}.ts`,
+  `apps/web/src/pages/Visualizer.tsx`,
+  `apps/server/test/visualizer.node.test.ts` (video-layer suite → layers
+  shape; +10-layer cap, +legacy fold, +multi-layer ordering tests),
+  `AGENTS.md`, this file.
+- Verified: `npm run typecheck` ✅ all workspaces; `npm run test:server`
+  106/106 ✅; `npm run test:shared` 4/4 ✅.
+
+### 2026-10-07 — Visualizer: per-layer size control on media layers
+- Each media layer gains a `scale` field (`VizMediaLayerConfig.scale`,
+  0.1–2.0, default 1) — a centered size multiplier on the cover-cropped
+  frame: <100% shrinks the layer to a centered inset, >100% zooms in
+  (clipped at the frame edge).
+- Applied identically in both renderers: `frameSvg` emits the `<image>` at
+  `x/y = (frame − scaled)/2` with `width/height = frame × scale`; the Canvas
+  preview draws the same centered destination rect (keyed path included —
+  the keyed canvas scales with the layer). Source pixels stay cover-cropped
+  to the frame aspect, so no render.ts decoder change was needed.
+- UI: a `size NN%` slider (10–200%, step 5) heads each layer row's second
+  control line, beside the keying controls; persisted sessions default
+  missing `scale` to 1 via the `toLayer` migration.
+- Files: `packages/shared/src/visualizer.ts` (schema + frame state),
+  `apps/server/src/visualizer/svg.ts`, `apps/web/src/pages/Visualizer.tsx`,
+  `apps/server/test/visualizer.node.test.ts` (+scale bounds, +centered-rect
+  svg assertions), `AGENTS.md`, this file.
+- Verified: `npm run typecheck` ✅ all workspaces; `npm run test:server`
+  107/107 ✅; `npm run test:shared` 4/4 ✅.
+
+### 2026-10-07 — Visualizer: aspect-ratio picker (16:9 / 9:16 / 1:1) + portrait 4K
+- Section "5. Render" splits the old resolution dropdown into an **aspect
+  segmented control** (▭ 16:9 / ▯ 9:16 / ◻ 1:1 — square kept) plus a
+  **quality select** (1080p / 4K); a `w×h` readout shows the resolved output
+  dims. Picking either remaps `renderSettings` to the matching preset
+  (16:9 → 1920×1080/3840×2160, 9:16 → 1080×1920/2160×3840, 1:1 →
+  1080²/2160²).
+- **Live preview resizes automatically**: the canvas backing store
+  (`canvasH = 640·h/w`), its `aspect-ratio` CSS, and the fullscreen sizer
+  already derive from `renderSettings`, so flipping to 9:16 immediately
+  reshapes the preview to a portrait box (and the export renders at the new
+  dims — same shared math, no other code needed).
+- Schema: `renderSettings.height` max raised 2160 → 3840 so portrait 4K
+  parses; `VIZ_RESOLUTIONS` expanded to the aspect×quality matrix.
+- Files: `packages/shared/src/visualizer.ts`,
+  `apps/web/src/pages/Visualizer.tsx`,
+  `apps/server/test/visualizer.node.test.ts` (+portrait/4K parse bounds),
+  this file.
+- Verified: `npm run typecheck` ✅ all workspaces; visualizer suite 36/36 ✅.
+
+### 2026-10-07 — "Search" page renamed to "Library" (2nd tab, shows all media)
+- The `search` view/page is now `library`: sidebar label "Library", moved to
+  position 2 (right after Dashboard); `#/library` is the URL, `#/search`
+  remains as a hash alias so old links still land correctly.
+- `pages/Search.tsx` → `pages/Library.tsx` (`SearchPage` → `LibraryPage`);
+  local-pool toggle relabeled "Library" (provider-search mode unchanged);
+  default result limit 100 → 500 (the server cap) so "all assets" is literal;
+  image cards get a small `image` badge next to the provider id.
+- The Library now lists every registered asset — videos **and** images — and
+  stays current: it runs `api.syncProjectAssets(projectId)` before each local
+  search (folder = source of truth, same as Folders/Music Edit) and refreshes
+  on `ASSETS_CHANGED_EVENT` so drag-and-drop uploads appear immediately.
+- Touched: `App.tsx` (view union, nav order, hash alias, render), the renamed
+  page file, `Dashboard.tsx` (nav union + "Browse the library" shortcut),
+  `Visualizer.tsx`/`MusicEdit.tsx` empty-state copy, `api.ts` comment,
+  `AGENTS.md`, this file.
+
+### 2026-10-07 — Visualizer: background-removal methods + AI cutout (MediaPipe/MODNet)
+- **Schema**: `video.chromaKey{enabled,color,similarity,blend}` →
+  `video.key{method,color,similarity,blend,despill,choke,model,feather}`.
+  `vizVideoSchema` keeps `chromaKey` as a deprecated input and folds it into
+  `key` on parse (enabled → `colorkey`, `despill:false` so old configs render
+  identically); the web UI does the same fold for localStorage persistence.
+  Methods: `none | colorkey | chromakey | hsv | cutout`
+  (`VIZ_KEY_METHODS`); `cutout` models `mediapipe | modnet` —
+  **Apache-2.0 only, no GPL RVM**.
+- **Shared keyers** (`@twio/shared` `visualizer.ts`): `keyVideoFrame()`
+  dispatches over a decoded RGBA frame — `colorkey` = legacy
+  `chromaKeyFrame` (ffmpeg `colorkey` ramp); `chromakey` =
+  `chromaKeyYUVFrame` (faithful port of `vf_chromakey`: half-res chroma
+  planes + 3×3 neighbourhood mean + similarity/blend alpha ramp); `hsv` =
+  `hsvKeyFrame` (circular hue distance weighted by pixel saturation so
+  greys/whites never key, plus `choke` ±8 px matte erode/dilate). Optional
+  `despill` runs a generalized `vf_despill` port on the key's dominant
+  channel. `cutout` never reaches the pixel pass — its alpha is baked.
+- **Render** (`render.ts`): `videoDecoderArgs()` emits `format=rgba` +
+  4-channel frames for every keyed path; color methods are keyed in-process
+  by the shared `keyVideoFrame` (byte-identical to the Canvas preview —
+  no ffmpeg filter in the pipe), keyed frames embed as PNG (was JPEG).
+  `cutout` decodes the engine WebM with `-c:v libvpx-vp9` (the native vp9
+  decoder drops the alpha stream).
+- **Python engine**: `twio_engine/models.py` (download-on-demand registry,
+  sha256-pinned mirrors; MediaPipe `selfie_segmenter_landscape.tflite`,
+  MODNet ONNX) + `twio_engine/matting.py` (`key_video` RPC: OpenCV decode →
+  per-frame matte → confidence→alpha soft ramp + temporal EMA + gaussian
+  feather + alpha-weighted despill → pipes BGRA into the server ffmpeg →
+  `libvpx-vp9 yuva420p` WebM). MediaPipe runs via `cv2.dnn` with the model's
+  trained `[-1,1]` input range (feeding [0,1] collapses confidence ≤0.9 —
+  verified live); MODNet via new `onnxruntime` dep (cv2.dnn can't parse its
+  dynamic-shape graph). Requirements re-stamp auto-provisions the venv.
+- **Keying service** (`visualizer/keying.ts`): content-addressed cache at
+  `OUTPUT_ROOT/cache/keys/key-<sha1>.webm` (path+size+mtime+params), in-flight
+  dedupe, progress polled from a sidecar JSON the worker rewrites every 10
+  frames, abort → worker kill → 499. `service.ts` runs it inside the render
+  job when `key.method==="cutout"` and no prepared file exists (phase
+  "keying"), so a UI-prepared cutout costs the render nothing.
+- **Routes**: `POST /api/visualizer/video-key?project=` `{assetId,key}` →
+  job (cached builds return done instantly); `GET/POST
+  /api/visualizer/video-key/:id(/cancel)`. Errors are `VisualizerError`.
+- **UI** (`Visualizer.tsx`): "Background removal" select replaces the old
+  Color-key toggle — Off / Color key / Chroma key / HSV key / AI cutout.
+  Color methods keep picker + corner-sample + Tolerance/Feather + new
+  despill checkbox and HSV-only Choke slider. Cutout adds a model picker
+  (MediaPipe fast / MODNet clean hair), matte feather + despill, a Generate
+  button gated on engine status, progress bar, cancel, and stale-params
+  detection — the preview `<video>` swaps to the keyed WebM when the job
+  matches current params, so preview = export by construction.
+- Files: `packages/shared/src/visualizer.ts`,
+  `apps/server/src/visualizer/{render,service,keying.ts}`,
+  `apps/server/src/routes/visualizer.ts`,
+  `apps/server/python/twio_engine/{worker.py,matting.py,models.py}`,
+  `apps/server/python/requirements.txt`, `apps/web/src/api.ts`,
+  `apps/web/src/pages/Visualizer.tsx`,
+  `apps/server/test/visualizer.node.test.ts`,
+  `apps/server/scripts/smoke-keying.ts` (dev smoke script).
+- Verified: `npm run typecheck` ✅ all workspaces; `npm run test:server` ✅
+  105/105 (new: schema migration, YUV/HSV keyers, despill, choke, decoder
+  args incl. keyedPath). Real-media smoke: 2 s clip keyed through the engine
+  for both models — MediaPipe 50f→WebM (93% transparent, opaque subject
+  core, matte verified visually) and MODNet (firmer matte, onnxruntime
+  auto-installed); decoded back via the exact `videoDecoderArgs` path —
+  alpha intact.
+
+### 2026-10-07 — Drag & drop accepts images (stored in the project folder)
+- Dropping an **image or a video** anywhere on the app now stores it in the
+  active project's folder (`OUTPUT_ROOT/<slug>/assets/uploads/`). Images get
+  a `provider_id='local'` asset row exactly like video uploads, so they show
+  up in Folders (Uploads) and the Library local pool with rating/copy/reveal.
+- Server: `IMAGE_FILE_EXTENSIONS` (jpg/jpeg/png/webp/gif/avif/tif/tiff/svg)
+  + `mediaMimeForFile` in `config.ts`; `saveUploadedVideo` →
+  `saveUploadedFile` in `routes/uploads.ts` (ext whitelist for both kinds,
+  `image/*` added to the raw-body content-type parser, images validated by
+  `sharp().metadata()` instead of ffprobe); new `generateImageThumbnail`
+  (sharp → jpeg, alpha flattened, ≤1920×1080) in `video/thumbnails.ts`;
+  `assetSync.ts#syncProjectAssets` walks images too; `/api/assets/:id/file`
+  now sends the real content type instead of hardcoded `video/mp4`.
+- Web: `api.ts` exports `isVideoFile`/`isImageFile`/`isMediaFile`/
+  `isImageFileName`; `App.tsx` drop handler accepts both kinds + updated
+  overlay/toast copy; Folders + Library render image assets as `<img>` (click
+  opens the full file) instead of a `<video>` player; Music Edit's source
+  library filters images out via `isImageFileName(local_path)`.
+- Tests: `uploads.node.test.ts` covers `IMAGE_EXTENSIONS` + `mediaKindForExt`.
+- Verified live: png + mp4 POSTs to `/api/assets/upload` land in
+  `output/ice_cream/assets/uploads/` with asset rows, jpeg thumbs, correct
+  `/file` content types (`image/png`, `video/mp4`), content-addressed dedup;
+  garbage `.png` rejected 422, `.exe` rejected 415; `POST /api/assets/sync`
+  registered a manually-copied jpg; Folders lists images under "uploads".
+  `npm run typecheck`: server + shared clean; web has **pre-existing**
+  `Visualizer.tsx` chromaKey errors (unrelated WIP in the working tree).
+  `test:server`: 97/100 — the 3 failures are pre-existing visualizer
+  chromaKey/key schema mismatches, not from this change. Test artifacts
+  cleaned from the ice_cream project afterwards.
 
 ### 2026-10-07 — Visualizer: new `silk` mode (spectral stacked waveform)
 - **New `silk` mode** (`packages/shared/src/visualizer.ts`): reproduces the

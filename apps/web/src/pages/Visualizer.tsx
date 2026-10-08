@@ -1,31 +1,39 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import {
-  chromaKeyFrame,
   computeDancer,
   computeFrame,
   coverCrop,
   frameCenter,
   detectStemKind,
   isStemAudible,
+  keyVideoFrame,
   resolveStem,
   STEM_KINDS,
+  VIZ_CUTOUT_MODELS,
+  VIZ_MAX_VIDEO_LAYERS,
+  vizVisualsLayer,
   type DancerConfig,
   type FrameStem,
   type StemKind,
   type StemSignal,
   type VisualizerRenderInput,
   type VizChromaKeyConfig,
+  type VizCutoutModel,
   type VizFrameState,
+  type VizKeyMethod,
   type VizLayout,
+  type VizMediaLayerConfig,
   type VizMode,
-  type VizVideoLayer,
+  type VizVideoKeyConfig,
   type VisualizerStemInput,
 } from "@twio/shared";
 import {
   api,
   ASSETS_CHANGED_EVENT,
+  isImageFileName,
   type Asset,
   type EngineStatus,
+  type VizKeyJob,
   type VizRenderJob,
   type VizRenderedFile,
   type VizStem,
@@ -50,6 +58,8 @@ interface PersistedViz {
 
 type VisualizerGlobals = VisualizerRenderInput["globalVisuals"];
 
+const DEFAULT_VIDEO_KEY: VizVideoKeyConfig = { method: "none", color: "#00FF00", similarity: 0.12, blend: 0.02, despill: true, choke: 0, model: "mediapipe", feather: 1 };
+
 const DEFAULT_GLOBALS: VisualizerGlobals = {
   mode: "ribbons",
   waveformLengthSec: 0.5,
@@ -60,7 +70,7 @@ const DEFAULT_GLOBALS: VisualizerGlobals = {
   backgroundColor: "#050508",
   innerRadius: 0.12,
   layout: "radial",
-  video: { assetId: null, layer: "under", opacity: 1, chromaKey: { enabled: false, color: "#00FF00", similarity: 0.12, blend: 0.02 } },
+  video: { layers: [vizVisualsLayer()] },
   dancer: { enabled: false, style: "neon", scale: 1, intensity: 1, colorMode: "stems", color: "#FFFFFF" },
   centerConvergence: { x: 0.5, y: 0.5, pulseSensitivity: 0.8 },
 };
@@ -87,14 +97,101 @@ const LAYOUTS: Array<{ value: VizLayout; label: string }> = [
   { value: "fan", label: "Fan (downward spread)" },
 ];
 
+/** Video background-removal methods (see VIZ_KEY_METHODS in @twio/shared). */
+const KEY_METHODS: Array<{ value: VizKeyMethod; label: string }> = [
+  { value: "none", label: "Off" },
+  { value: "colorkey", label: "Color key — flat color (legacy)" },
+  { value: "chromakey", label: "Chroma key — YUV, smoother edges" },
+  { value: "hsv", label: "HSV key — hue-aware + edge choke" },
+  { value: "cutout", label: "AI cutout — auto person matte (engine)" },
+];
+const COLOR_KEY_METHODS: ReadonlySet<VizKeyMethod> = new Set(["colorkey", "chromakey", "hsv"]);
+const CUTOUT_MODEL_LABELS: Record<VizCutoutModel, string> = {
+  mediapipe: "MediaPipe Selfie Segmentation — fast, light edges",
+  modnet: "MODNet — slower, cleaner hair edges",
+};
+
+/** Layer-row settings are grouped into mini-cards — a titled box per group. */
+const LAYER_CARD = "rounded-md border border-slate-700/50 bg-slate-900/50 px-2.5 py-1.5 space-y-1 text-[11px] text-slate-400";
+const LAYER_CARD_LABEL = "block text-[9px] font-semibold uppercase tracking-wider text-slate-500";
+
 function loadPersisted(projectId: string): PersistedViz | null {
   try {
     const raw = localStorage.getItem(storageKey(projectId));
     if (!raw) return null;
     const p = JSON.parse(raw) as Partial<PersistedViz>;
+    // Migrate persisted video configs to the layers stack: rows are either
+    // media assets or the `kind:"visuals"` row marking where the mode visuals
+    // draw. Old saves (band-model `layer` hints, the flat single-video shape,
+    // or a bare video block) always drew the waveforms — restore the visuals
+    // row at the under/over boundary so they keep rendering. New-format lists
+    // are trusted verbatim: no visuals row → the user removed the waveforms.
+    type RawLayer = {
+      kind?: unknown;
+      assetId?: unknown;
+      layer?: unknown;
+      hidden?: unknown;
+      opacity?: unknown;
+      scale?: unknown;
+      x?: unknown;
+      y?: unknown;
+      key?: Partial<VizVideoKeyConfig>;
+      chromaKey?: VizChromaKeyConfig;
+    };
+    const num = (x: unknown, d: number) => (typeof x === "number" && Number.isFinite(x) ? x : d);
+    const foldKey = (raw: RawLayer): VizVideoKeyConfig => {
+      const key: VizVideoKeyConfig = { ...DEFAULT_VIDEO_KEY, ...(raw.key ?? {}) };
+      const legacyCk = raw.chromaKey;
+      if (key.method === "none" && legacyCk?.enabled) {
+        key.method = "colorkey";
+        key.color = legacyCk.color ?? key.color;
+        key.similarity = legacyCk.similarity ?? key.similarity;
+        key.blend = legacyCk.blend ?? key.blend;
+        key.despill = false; // the legacy path had no despill
+      }
+      return key;
+    };
+    const toLayer = (raw: RawLayer | null | undefined): VizMediaLayerConfig | null => {
+      if (!raw || typeof raw !== "object") return null;
+      if (raw.kind === "visuals") return { kind: "visuals", hidden: raw.hidden === true, x: num(raw.x, 0.5), y: num(raw.y, 0.5), opacity: num(raw.opacity, 1), scale: num(raw.scale, 1) };
+      // NB: the deprecated `layer` hint is deliberately NOT carried over — it
+      // only steers the visuals-row insertion below (from `raws`). Persisting
+      // it would let the server-side fold resurrect a visuals row the user
+      // explicitly removed.
+      return typeof raw.assetId === "string" && raw.assetId
+        ? { kind: "media", assetId: raw.assetId, hidden: raw.hidden === true, x: num(raw.x, 0.5), y: num(raw.y, 0.5), opacity: num(raw.opacity, 1), scale: num(raw.scale, 1), key: foldKey(raw) }
+        : null;
+    };
+    const pv = (p.globals?.video ?? null) as (RawLayer & { layers?: RawLayer[] }) | null;
+    let layers: VizMediaLayerConfig[];
+    if (!pv) {
+      layers = [vizVisualsLayer()];
+    } else {
+      const raws = Array.isArray(pv.layers) ? pv.layers : [];
+      layers = raws.map(toLayer).filter((l): l is VizMediaLayerConfig => l !== null);
+      const newFormat = raws.some((r) => !!r && typeof r === "object" && r.kind != null);
+      if (!newFormat) {
+        let vi = raws.findIndex((r) => !!r && r.layer === "over"); // visuals sat between the bands
+        if (vi < 0) vi = layers.length;
+        if (typeof pv.assetId === "string" && pv.assetId && !layers.some((l) => l.kind === "media" && l.assetId === pv.assetId)) {
+          const media = toLayer({ ...pv, kind: "media" });
+          if (media) {
+            if (pv.layer === "over") layers.push(media);
+            else {
+              layers.splice(vi, 0, media);
+              vi += 1;
+            }
+          }
+        }
+        if (!layers.some((l) => l.kind === "visuals")) layers.splice(vi, 0, vizVisualsLayer());
+      } else if (typeof pv.assetId === "string" && pv.assetId && !layers.some((l) => l.kind === "media" && l.assetId === pv.assetId)) {
+        const media = toLayer({ ...pv, kind: "media" });
+        if (media) layers.push(media);
+      }
+    }
     return {
       stems: Array.isArray(p.stems) ? p.stems : [],
-      globals: { ...DEFAULT_GLOBALS, ...(p.globals ?? {}), dancer: { ...DEFAULT_GLOBALS.dancer, ...(p.globals?.dancer ?? {}) }, autoGlow: { ...DEFAULT_GLOBALS.autoGlow, ...(p.globals?.autoGlow ?? {}) }, video: { ...DEFAULT_GLOBALS.video, ...(p.globals?.video ?? {}), chromaKey: { ...DEFAULT_GLOBALS.video.chromaKey, ...(p.globals?.video?.chromaKey ?? {}) } }, autoCenter: { ...DEFAULT_GLOBALS.autoCenter, ...(p.globals?.autoCenter ?? {}) }, centerConvergence: { ...DEFAULT_GLOBALS.centerConvergence, ...(p.globals?.centerConvergence ?? {}) } },
+      globals: { ...DEFAULT_GLOBALS, ...(p.globals ?? {}), dancer: { ...DEFAULT_GLOBALS.dancer, ...(p.globals?.dancer ?? {}) }, autoGlow: { ...DEFAULT_GLOBALS.autoGlow, ...(p.globals?.autoGlow ?? {}) }, video: { layers: layers.slice(0, VIZ_MAX_VIDEO_LAYERS) }, autoCenter: { ...DEFAULT_GLOBALS.autoCenter, ...(p.globals?.autoCenter ?? {}) }, centerConvergence: { ...DEFAULT_GLOBALS.centerConvergence, ...(p.globals?.centerConvergence ?? {}) } },
       render: { ...DEFAULT_RENDER, ...(p.render ?? {}) },
       jobId: typeof p.jobId === "string" ? p.jobId : null,
     };
@@ -267,18 +364,19 @@ function quadAt(pts: Float32Array, i: number): Path2D {
 let keyCanvas: HTMLCanvasElement | null = null;
 let keyCtx: CanvasRenderingContext2D | null = null;
 
-/** Draw the cover-cropped video frame into the key canvas, apply the shared
- *  chroma-key pixel pass (same threshold+feather ramp as the export's ffmpeg
- *  `colorkey`), and return it as a draw source. */
+/** Draw the cover-cropped media frame into the key canvas, apply the shared
+ *  keying pixel pass (the exact `keyVideoFrame` the MP4 export runs), and
+ *  return it as a draw source. Only used for the in-frame color methods —
+ *  `cutout` alpha already rides the keyed-WebM <video> element. */
 function keyedVideoSource(
-  video: HTMLVideoElement,
+  media: HTMLVideoElement | HTMLImageElement,
   sx: number,
   sy: number,
   sw: number,
   sh: number,
   w: number,
   h: number,
-  key: VizChromaKeyConfig,
+  key: VizVideoKeyConfig,
 ): HTMLCanvasElement | null {
   if (!keyCanvas) {
     keyCanvas = document.createElement("canvas");
@@ -290,45 +388,27 @@ function keyedVideoSource(
   const kh = Math.max(1, Math.round(h * scale));
   if (keyCanvas.width !== kw) keyCanvas.width = kw;
   if (keyCanvas.height !== kh) keyCanvas.height = kh;
-  keyCtx.drawImage(video, sx, sy, sw, sh, 0, 0, kw, kh);
+  keyCtx.drawImage(media, sx, sy, sw, sh, 0, 0, kw, kh);
   const img = keyCtx.getImageData(0, 0, kw, kh);
-  chromaKeyFrame(img.data, key.color, key.similarity, key.blend);
+  keyVideoFrame(img.data, kw, kh, key);
   keyCtx.putImageData(img, 0, 0);
   return keyCanvas;
 }
 
-function drawState(
-  ctx: CanvasRenderingContext2D,
-  state: VizFrameState,
-  w: number,
-  h: number,
-  bg: string,
-  video?: HTMLVideoElement | null,
-): void {
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, w, h);
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
+/** Eye / eye-off glyph for the layer show-hide toggle. */
+function EyeIcon({ off, className = "" }: { off?: boolean; className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+      <circle cx="12" cy="12" r="3" />
+      {off && <line x1="3" y1="3" x2="21" y2="21" />}
+    </svg>
+  );
+}
 
-  // Video layer — same placement as the <image> in frameSvg: `under` right
-  // after the background, `over` after the mode visuals (below dancer + star).
-  // Cover-cropped with the shared coverCrop math — identical to the export's
-  // ffmpeg scale/crop.
-  const drawVideo = () => {
-    const v = state.video;
-    if (!v || !video || video.readyState < 2 || video.videoWidth === 0) return;
-    const [sx, sy, sw, sh] = coverCrop(video.videoWidth, video.videoHeight, w, h);
-    ctx.globalAlpha = v.opacity;
-    if (v.chromaKey) {
-      const src = keyedVideoSource(video, sx, sy, sw, sh, w, h, v.chromaKey);
-      if (src) ctx.drawImage(src, 0, 0, w, h);
-    } else {
-      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
-    }
-    ctx.globalAlpha = 1;
-  };
-  if (state.video?.layer === "under") drawVideo();
-
+/** All "2. Look" mode visuals — mirrors svg.ts's modeVisualsSvg so the
+ *  visuals layer emits identical shapes wherever it sits in the stack. */
+function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void {
   for (const s of state.stems) {
     if (s.glowWidth > 0 && s.glowAlpha > 0.01) {
       const p = pathOf(s.centerline);
@@ -581,7 +661,75 @@ function drawState(
     }
   }
 
-  if (state.video?.layer === "over") drawVideo();
+}
+
+/** Offscreen buffer for visuals layers drawn with opacity < 1 or scale ≠ 1:
+ *  compositing the rendered visuals once keeps the row's opacity a multiplier
+ *  over every sub-path — mirroring the export's <g opacity transform>. */
+let visualsCanvas: HTMLCanvasElement | null = null;
+let visualsCtx: CanvasRenderingContext2D | null = null;
+
+function drawState(
+  ctx: CanvasRenderingContext2D,
+  state: VizFrameState,
+  w: number,
+  h: number,
+  bg: string,
+  media?: ReadonlyArray<HTMLVideoElement | HTMLImageElement | null>,
+): void {
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  // The layer stack — row order is the z-order, iterated exactly like
+  // frameSvg. Media rows draw their element cover-cropped + scaled about the
+  // frame center; a visuals row draws the whole mode-visual set at that
+  // position (absent → no waveforms at all). Dancer + star stay on top.
+  state.videoLayers.forEach((v, i) => {
+    if (v.hidden || v.opacity <= 0) return;
+    const dw = w * v.scale;
+    const dh = h * v.scale;
+    const dx = v.x * w - dw / 2;
+    const dy = v.y * h - dh / 2;
+    if (v.kind === "visuals") {
+      if (v.opacity >= 0.999 && v.scale === 1 && v.x === 0.5 && v.y === 0.5) {
+        drawVisuals(ctx, state);
+        return;
+      }
+      if (!visualsCanvas) {
+        visualsCanvas = document.createElement("canvas");
+        visualsCtx = visualsCanvas.getContext("2d");
+      }
+      if (!visualsCtx) return;
+      if (visualsCanvas.width !== w) visualsCanvas.width = w;
+      if (visualsCanvas.height !== h) visualsCanvas.height = h;
+      visualsCtx.clearRect(0, 0, w, h);
+      drawVisuals(visualsCtx, state);
+      ctx.globalAlpha = v.opacity;
+      ctx.drawImage(visualsCanvas, dx, dy, dw, dh);
+      ctx.globalAlpha = 1;
+      return;
+    }
+    const el = media?.[i];
+    if (!el) return;
+    const isVid = el instanceof HTMLVideoElement;
+    const srcW = isVid ? el.videoWidth : el.naturalWidth;
+    const srcH = isVid ? el.videoHeight : el.naturalHeight;
+    const ready = isVid ? el.readyState >= 2 : el.complete;
+    if (!ready || srcW === 0 || srcH === 0) return;
+    const [sx, sy, sw, sh] = coverCrop(srcW, srcH, w, h);
+    ctx.globalAlpha = v.opacity;
+    // Color methods key the drawn pixels via the shared pass; `cutout` draws
+    // the keyed WebM directly (its alpha is baked into the frames).
+    if (v.key && v.key.method !== "cutout") {
+      const src = keyedVideoSource(el, sx, sy, sw, sh, w, h, v.key);
+      if (src) ctx.drawImage(src, dx, dy, dw, dh);
+    } else {
+      ctx.drawImage(el, sx, sy, sw, sh, dx, dy, dw, dh);
+    }
+    ctx.globalAlpha = 1;
+  });
 
   const dn = state.dancer;
   if (dn) {
@@ -656,7 +804,9 @@ export function Visualizer({
 
   // Preview state
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  /** Hidden media elements feeding the preview — one per layer row index
+   *  (<video> for video/keyed sources, <img> for image layers). */
+  const layerElsRef = useRef(new Map<number, HTMLVideoElement | HTMLImageElement>());
   const signalsRef = useRef(new Map<string, StemSignal>());
   const [signalsReady, setSignalsReady] = useState(0); // bump to re-render
   const [playing, setPlaying] = useState(false);
@@ -673,7 +823,33 @@ export function Visualizer({
    *  without restarting the stems already sounding. */
   const sourcesRef = useRef(new Map<string, AudioBufferSourceNode>());
 
-  // Downloaded project assets eligible as the optional video layer.
+  // Media-layer list drag & drop: index of the row being dragged + the row
+  // currently hovered as a drop target (drives the highlight ring).
+  const [dragLayer, setDragLayer] = useState<number | null>(null);
+  const [dropLayer, setDropLayer] = useState<number | null>(null);
+  // Row-drag gate: a row only becomes `draggable` once a press on it has
+  // moved mostly VERTICALLY — horizontal gestures belong to the row's own
+  // sliders/selects. The ⠿ grip arms instantly (it exists only to drag).
+  const [armedRow, setArmedRow] = useState<number | null>(null);
+  const dragGateRef = useRef<{ i: number; x: number; y: number } | null>(null);
+  // Releasing the button anywhere disarms — a stale armed row would turn
+  // the next slider drag into a row drag.
+  useEffect(() => {
+    const up = () => {
+      dragGateRef.current = null;
+      setArmedRow(null);
+    };
+    window.addEventListener("mouseup", up);
+    return () => window.removeEventListener("mouseup", up);
+  }, []);
+
+  // Add-layer picker popover: open state, name filter, kind toggles.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerQ, setPickerQ] = useState("");
+  const [pickerVideo, setPickerVideo] = useState(true);
+  const [pickerImage, setPickerImage] = useState(true);
+
+  // Downloaded project assets eligible as media layers (videos and images).
   const [videoAssets, setVideoAssets] = useState<Asset[]>([]);
   useEffect(() => {
     let cancelled = false;
@@ -812,6 +988,63 @@ export function Visualizer({
     return () => clearInterval(t);
   }, [job, onToast, loadRenders]);
 
+  // --- AI cutout (keyed WebM) ---------------------------------------------------
+  // The engine bakes a transparent WebM of a layer's video; the preview's
+  // <video> element then plays it directly (alpha rides the frames) and the
+  // export decodes the same file — no duplicated keying code. Jobs are tracked
+  // per (assetId, key params) — the composite key makes stale-params detection
+  // automatic: tweak a param and the row simply has no job for its new key.
+  const [keyJobs, setKeyJobs] = useState<Map<string, VizKeyJob>>(new Map());
+  const cutoutKeyOf = (l: VizMediaLayerConfig & { kind: "media" }) => `${l.assetId}|${JSON.stringify(l.key)}`;
+  const cutoutJobFor = (l: VizMediaLayerConfig): VizKeyJob | null =>
+    l.kind === "media" && l.key.method === "cutout" ? keyJobs.get(cutoutKeyOf(l)) ?? null : null;
+  /** The keyed WebM URL when this layer's cutout is live (done + params match). */
+  const keyedUrlFor = (l: VizMediaLayerConfig): string | null => {
+    const j = cutoutJobFor(l);
+    return j?.status === "done" && j.url ? j.url : null;
+  };
+  /** A finished job exists for this asset under different params → regenerate hint. */
+  const cutoutStaleFor = (l: VizMediaLayerConfig): boolean =>
+    l.kind === "media" && l.key.method === "cutout" && !cutoutJobFor(l) &&
+    [...keyJobs.keys()].some((k) => k.startsWith(`${l.assetId}|`));
+
+  const startCutout = async (l: VizMediaLayerConfig) => {
+    if (l.kind !== "media") return;
+    setError(null);
+    const mapKey = cutoutKeyOf(l);
+    try {
+      const r = await api.vizVideoKey(projectId, l.assetId, l.key);
+      setKeyJobs((m) => new Map(m).set(mapKey, r.job));
+      if (r.job.status === "done" && r.job.url) {
+        onToast("Cutout ready — keyed video is live in the preview", "success");
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  // Poll all active keying jobs (id "cached" jobs are already done — skip).
+  useEffect(() => {
+    const running = [...keyJobs.entries()].filter(([, j]) => j.status === "running" && j.id !== "cached");
+    if (running.length === 0) return;
+    const t = setInterval(() => {
+      for (const [mapKey, j] of running) {
+        api
+          .vizVideoKeyJob(j.id)
+          .then((r) => {
+            setKeyJobs((m) => new Map(m).set(mapKey, r.job));
+            if (r.job.status === "done") {
+              onToast("Cutout ready — keyed video is live in the preview", "success");
+            } else if (r.job.status === "failed") {
+              onToast(`Cutout failed: ${r.job.error?.message ?? "unknown error"}`, "error");
+            }
+          })
+          .catch(() => {});
+      }
+    }, 800);
+    return () => clearInterval(t);
+  }, [keyJobs, onToast]);
+
   /** Stems whose signal fetch failed → per-stem error text shown next to the
    *  stem (instead of silently vanishing from the preview). */
   const failedSignals = useRef(new Map<string, string>());
@@ -827,6 +1060,7 @@ export function Visualizer({
   const previewBoxRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [lookOpen, setLookOpen] = useState(false);
+  const [layersOpen, setLayersOpen] = useState(false);
 
   useEffect(() => {
     const onFs = () => setFullscreen(document.fullscreenElement === previewBoxRef.current);
@@ -1028,6 +1262,40 @@ export function Visualizer({
   playingRef.current = playing;
   const scrubRef = useRef(scrubT);
   scrubRef.current = scrubT;
+
+  // Fullscreen click-to-play/pause — e.detail disambiguates it from the
+  // double-click-to-exit gesture on the container: the first click arms a
+  // short timer, the second click of a double-click cancels it, so exiting
+  // fullscreen never toggles playback. A brief ▶/⏸ glyph flashes as feedback.
+  const clickTimerRef = useRef<number | null>(null);
+  const fsFlashTimerRef = useRef<number | null>(null);
+  const [fsFlash, setFsFlash] = useState<"play" | "pause" | null>(null);
+  useEffect(
+    () => () => {
+      if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
+      if (fsFlashTimerRef.current) clearTimeout(fsFlashTimerRef.current);
+    },
+    [],
+  );
+  const onCanvasClick = (e: ReactMouseEvent<HTMLCanvasElement>) => {
+    if (!fullscreen || resolvedStems.length === 0) return;
+    if (e.detail >= 2) {
+      if (clickTimerRef.current) {
+        clearTimeout(clickTimerRef.current);
+        clickTimerRef.current = null;
+      }
+      return; // second click of the exit-fullscreen double-click
+    }
+    clickTimerRef.current = window.setTimeout(() => {
+      clickTimerRef.current = null;
+      const wasPlaying = playingRef.current;
+      if (wasPlaying) pausePlayback();
+      else void startPlayback(scrubRef.current);
+      setFsFlash(wasPlaying ? "pause" : "play");
+      if (fsFlashTimerRef.current) clearTimeout(fsFlashTimerRef.current);
+      fsFlashTimerRef.current = window.setTimeout(() => setFsFlash(null), 650);
+    }, 280);
+  };
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1054,24 +1322,29 @@ export function Visualizer({
       if (globals.dancer.enabled) {
         state.dancer = computeDancer(resolvedStems, globals.dancer, w, h, t, frameCenter(resolvedStems, globals, w, h, t));
       }
-      // Video layer sync — the element free-runs while playing (drift-
-      // corrected each frame), and follows the scrub position when paused.
+      // Media-layer sync — each video element free-runs while playing (drift-
+      // corrected per frame) and follows the scrub position when paused.
       // `t % duration` mirrors the export's -stream_loop wrap.
-      const vid = videoRef.current;
-      if (vid && state.video) {
-        const vd = vid.duration;
-        if (Number.isFinite(vd) && vd > 0) {
-          const target = t % vd;
-          if (playingRef.current) {
-            if (vid.paused) void vid.play().catch(() => {});
-            if (Math.abs(vid.currentTime - target) > 0.25) vid.currentTime = target;
-          } else {
-            if (!vid.paused) vid.pause();
-            if (Math.abs(vid.currentTime - target) > 0.03) vid.currentTime = target;
+      const layerMedia = state.videoLayers.map((v, i) => {
+        if (v.kind !== "media") return null;
+        const el = layerElsRef.current.get(i);
+        if (!el) return null;
+        if (el instanceof HTMLVideoElement) {
+          const vd = el.duration;
+          if (Number.isFinite(vd) && vd > 0) {
+            const target = t % vd;
+            if (playingRef.current) {
+              if (el.paused) void el.play().catch(() => {});
+              if (Math.abs(el.currentTime - target) > 0.25) el.currentTime = target;
+            } else {
+              if (!el.paused) el.pause();
+              if (Math.abs(el.currentTime - target) > 0.03) el.currentTime = target;
+            }
           }
         }
-      }
-      drawState(ctx, state, w, h, globals.backgroundColor, videoRef.current);
+        return el;
+      });
+      drawState(ctx, state, w, h, globals.backgroundColor, layerMedia);
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
@@ -1200,27 +1473,77 @@ export function Visualizer({
 
   const setG = <K extends keyof VisualizerGlobals>(k: K, v: VisualizerGlobals[K]) => setGlobals((g) => ({ ...g, [k]: v }));
   const setDancer = (patch: Partial<DancerConfig>) => setGlobals((g) => ({ ...g, dancer: { ...g.dancer, ...patch } }));
-  const setKey = (patch: Partial<VizChromaKeyConfig>) =>
-    setGlobals((g) => ({ ...g, video: { ...g.video, chromaKey: { ...g.video.chromaKey, ...patch } } }));
 
-  // Sample the top-left 12×12 source pixels of the current video frame —
-  // that's where a flat monochrome background sits — and use the average as
-  // the key color. Needs a decoded frame (readyState ≥ 2).
-  const sampleVideoBg = () => {
-    const v = videoRef.current;
-    if (!v || v.readyState < 2 || v.videoWidth === 0) return;
+  // --- Media layers -------------------------------------------------------------
+  const setLayers = (fn: (ls: VizMediaLayerConfig[]) => VizMediaLayerConfig[]) =>
+    setGlobals((g) => ({ ...g, video: { layers: fn(g.video.layers) } }));
+  const addLayer = (assetId: string) =>
+    setLayers((ls) => (ls.length >= VIZ_MAX_VIDEO_LAYERS || !assetId ? ls : [...ls, { kind: "media", assetId, hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: { ...DEFAULT_VIDEO_KEY } }]));
+  const addVisualsLayer = () =>
+    setLayers((ls) => (ls.length >= VIZ_MAX_VIDEO_LAYERS || ls.some((l) => l.kind === "visuals") ? ls : [...ls, vizVisualsLayer()]));
+  const patchLayer = (i: number, patch: Partial<VizMediaLayerConfig>) =>
+    setLayers((ls) => ls.map((l, j) => (j === i ? ({ ...l, ...patch } as VizMediaLayerConfig) : l)));
+  const setLayerKey = (i: number, patch: Partial<VizVideoKeyConfig>) =>
+    setLayers((ls) => ls.map((l, j) => (j === i && l.kind === "media" ? { ...l, key: { ...l.key, ...patch } } : l)));
+  const removeLayer = (i: number) => {
+    layerElsRef.current.delete(i);
+    setLayers((ls) => ls.filter((_, j) => j !== i));
+  };
+  const moveLayer = (from: number, to: number) =>
+    setLayers((ls) => {
+      if (to < 0 || to >= ls.length || from === to) return ls;
+      const c = [...ls];
+      const [x] = c.splice(from, 1);
+      c.splice(to, 0, x!);
+      return c;
+    });
+
+  // Sample the top-left 12×12 source pixels of the layer's current frame —
+  // that's where a flat monochrome background sits — and use it as the key
+  // color. Needs a decoded frame (readyState ≥ 2 / complete image).
+  const sampleLayerBg = (i: number) => {
+    const el = layerElsRef.current.get(i);
+    if (!el) return;
+    const ready = el instanceof HTMLVideoElement ? el.readyState >= 2 && el.videoWidth > 0 : el.complete && el.naturalWidth > 0;
+    if (!ready) return;
     const c = document.createElement("canvas");
     c.width = c.height = 1;
     const x = c.getContext("2d");
     if (!x) return;
-    x.drawImage(v, 0, 0, 12, 12, 0, 0, 1, 1);
+    x.drawImage(el, 0, 0, 12, 12, 0, 0, 1, 1);
     const d = x.getImageData(0, 0, 1, 1).data;
-    setKey({ color: `#${((1 << 24) | (d[0]! << 16) | (d[1]! << 8) | d[2]!).toString(16).slice(1).toUpperCase()}` });
+    const layer = globals.video.layers[i];
+    if (layer?.kind !== "media") return;
+    patchLayer(i, { key: { ...layer.key, color: `#${((1 << 24) | (d[0]! << 16) | (d[1]! << 8) | d[2]!).toString(16).slice(1).toUpperCase()}` } });
   };
 
   const spectrumNeedsEngine = globals.mode === "spectrum";
+  const hasVisualsLayer = globals.video.layers.some((l) => l.kind === "visuals");
+  const pickerResults = useMemo(() => {
+    const q = pickerQ.trim().toLowerCase();
+    return videoAssets.filter((a) => {
+      const isImg = isImageFileName(a.local_path ?? a.title ?? "");
+      if (isImg ? !pickerImage : !pickerVideo) return false;
+      if (!q) return true;
+      return (a.title ?? "").toLowerCase().includes(q) || (a.local_path ?? "").toLowerCase().includes(q);
+    });
+  }, [videoAssets, pickerQ, pickerVideo, pickerImage]);
   const rendering = job?.status === "running";
   const canvasH = Math.round((640 * renderSettings.height) / renderSettings.width);
+
+  // Output aspect/quality — the segmented control + resolution select write
+  // concrete w/h back into renderSettings, and the preview resizes with them
+  // (canvasH + the aspectRatio style below + the fullscreen sizer all derive
+  // from renderSettings, so the canvas always matches the export shape).
+  const aspectId: "16:9" | "9:16" | "1:1" =
+    renderSettings.width === renderSettings.height ? "1:1" : renderSettings.width > renderSettings.height ? "16:9" : "9:16";
+  const quality: "1080p" | "4k" = Math.max(renderSettings.width, renderSettings.height) > 2000 ? "4k" : "1080p";
+  const applyOutput = (a: "16:9" | "9:16" | "1:1", q: "1080p" | "4k") => {
+    const long = q === "4k" ? 3840 : 1920;
+    const short = (long * 9) / 16; // 1080 | 2160 — square uses short×short
+    const [w, h] = a === "16:9" ? [long, short] : a === "9:16" ? [short, long] : [short, short];
+    setRenderSettings((s) => ({ ...s, width: w, height: h }));
+  };
   const inRender = new Set(stemInputs.map((s) => s.name));
   const colorByStem = new Map(stemInputs.map((s, i) => [s.name, resolveStem(s, i).color]));
 
@@ -1378,6 +1701,495 @@ export function Visualizer({
           </div>
         )}
       </div>
+    </>
+  );
+
+
+  // The "3. Media layers" controls — shared between the settings section and the
+  // fullscreen overlay (alongside "2. Look"), so edits apply live in both places.
+  const layersContent = (
+    <>
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <div className="relative w-80 max-w-full">
+            <button
+              type="button"
+              className="ui-input w-full text-left text-slate-300 flex items-center justify-between gap-2"
+              disabled={globals.video.layers.length >= VIZ_MAX_VIDEO_LAYERS}
+              onClick={() => {
+                setPickerQ("");
+                setPickerOpen((o) => !o);
+              }}
+            >
+              <span>
+                {globals.video.layers.length >= VIZ_MAX_VIDEO_LAYERS
+                  ? `Layer limit reached (${VIZ_MAX_VIDEO_LAYERS})`
+                  : "+ Add a layer…"}
+              </span>
+              <span className="text-slate-500">▾</span>
+            </button>
+            {pickerOpen && (
+              <>
+                {/* Click-away overlay + Esc close. */}
+                <div className="fixed inset-0 z-40" onClick={() => setPickerOpen(false)} />
+                <div
+                  className="absolute z-50 mt-1 w-96 max-w-[90vw] rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden"
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setPickerOpen(false);
+                  }}
+                >
+                  <button
+                    type="button"
+                    disabled={hasVisualsLayer}
+                    onClick={() => {
+                      addVisualsLayer();
+                      setPickerOpen(false);
+                    }}
+                    className="w-full flex items-center gap-2 px-2 py-2 text-left text-xs text-slate-200 hover:bg-slate-800/60 disabled:opacity-40 border-b border-slate-800"
+                    title="Add the 2. Look visuals as a layer at the top of the stack"
+                  >
+                    <span className="w-12 h-8 rounded border border-violet-600/50 bg-violet-950/50 flex items-center justify-center text-violet-300 shrink-0">◈</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate">Waveform visuals</span>
+                      <span className="text-[10px] text-slate-500">2. Look · {globals.mode}{hasVisualsLayer ? " — already in the stack" : ""}</span>
+                    </span>
+                  </button>
+                  <div className="flex items-center gap-1.5 px-2 py-1.5 border-b border-slate-800">
+                    <input
+                      autoFocus
+                      value={pickerQ}
+                      onChange={(e) => setPickerQ(e.target.value)}
+                      placeholder="Filter by name…"
+                      className="ui-input !py-1 flex-1 text-xs"
+                    />
+                    {(
+                      [
+                        { id: "video" as const, on: pickerVideo, set: setPickerVideo, label: "▶ videos" },
+                        { id: "image" as const, on: pickerImage, set: setPickerImage, label: "🖼 images" },
+                      ]
+                    ).map((k) => (
+                      <button
+                        key={k.id}
+                        type="button"
+                        onClick={() => k.set(!k.on)}
+                        className={`px-2 py-0.5 rounded border text-[11px] ${k.on ? "border-sky-500 text-sky-300 bg-sky-950/40" : "border-slate-700 text-slate-500 hover:text-slate-300"}`}
+                        title={`${k.on ? "Hide" : "Show"} ${k.id} results`}
+                      >
+                        {k.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="max-h-64 overflow-y-auto">
+                    {pickerResults.map((a) => {
+                      const isImg = isImageFileName(a.local_path ?? a.title ?? "");
+                      const inStack = globals.video.layers.filter((x) => x.kind === "media" && x.assetId === a.id).length;
+                      return (
+                        <button
+                          key={a.id}
+                          type="button"
+                          onClick={() => addLayer(a.id)}
+                          className="w-full flex items-center gap-2 px-2 py-1.5 text-left text-xs text-slate-200 hover:bg-slate-800/60"
+                        >
+                          <img
+                            src={api.assetThumbUrl(a.id)}
+                            alt=""
+                            loading="lazy"
+                            className="w-12 h-8 rounded object-cover border border-slate-700/60 bg-slate-800 shrink-0"
+                            onError={(e) => (e.currentTarget.style.display = "none")}
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate" title={a.title ?? a.id}>
+                              {a.title ?? a.id}
+                            </span>
+                            <span className="flex items-center gap-1.5 text-[10px] text-slate-500">
+                              <Badge tone={isImg ? "violet" : "info"}>{isImg ? "image" : "video"}</Badge>
+                              {a.duration_seconds ? <span>{a.duration_seconds.toFixed(0)}s</span> : null}
+                              {a.width && a.height ? (
+                                <span>
+                                  {a.width}×{a.height}
+                                </span>
+                              ) : null}
+                            </span>
+                          </span>
+                          {inStack > 0 && <span className="text-[10px] text-slate-500 shrink-0">in stack{inStack > 1 ? ` ×${inStack}` : ""}</span>}
+                        </button>
+                      );
+                    })}
+                    {pickerResults.length === 0 && (
+                      <p className="px-3 py-3 text-xs text-slate-500">
+                        {videoAssets.length === 0
+                          ? "No downloaded media in this project — KEEP assets on Library/Folders or drop files onto the app first."
+                          : "No matches — adjust the name filter or the media-kind toggles."}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+          {hasVisualsLayer && (
+            <p className="text-[11px] text-slate-500">◈ row = the 2. Look visuals — remove it and they won't render.</p>
+          )}
+          {videoAssets.length === 0 && (
+            <p className="text-[11px] text-slate-500">
+              No downloaded media in this project — KEEP assets on Library/Folders or drop files onto the app first.
+            </p>
+          )}
+        </div>
+
+        {globals.video.layers.length === 0 ? (
+          <p className="text-sm text-slate-500">
+            Nothing is drawn — the frame is empty (even the 2. Look visuals need an explicit ◈ row). Add layers above: each row is a layer, drawn in row order.
+          </p>
+        ) : (
+          <ol className="space-y-1.5">
+            {/* Row 1 = top layer: the stack (layers[0] = bottom) is listed
+                top-first like a Layers panel — `i` stays the config index. */}
+            {globals.video.layers
+              .map((l, i) => ({ l, i }))
+              .reverse()
+              .map(({ l, i }) => {
+              const isVis = l.kind === "visuals";
+              const asset = l.kind === "media" ? videoAssets.find((a) => a.id === l.assetId) : undefined;
+              const isImg = l.kind === "media" && isImageFileName(asset?.local_path ?? asset?.title ?? "");
+              const kj = cutoutJobFor(l);
+              return (
+                <li
+                  key={`${i}:${isVis ? "visuals" : l.kind === "media" ? l.assetId : i}`}
+                  draggable={armedRow === i}
+                  onMouseDown={(e) => {
+                    // Press on the row body starts a pending reorder drag —
+                    // interactive children (sliders, buttons, selects) own
+                    // their gestures, so they never arm the row.
+                    if (e.button !== 0) return;
+                    if ((e.target as HTMLElement).closest("input,select,button,a,label")) return;
+                    dragGateRef.current = { i, x: e.clientX, y: e.clientY };
+                  }}
+                  onMouseMove={(e) => {
+                    const g = dragGateRef.current;
+                    if (!g || g.i !== i || armedRow === i) return;
+                    const dx = Math.abs(e.clientX - g.x);
+                    const dy = Math.abs(e.clientY - g.y);
+                    if (Math.max(dx, dy) < 6) return;
+                    if (dy > dx) setArmedRow(i); // vertical intent → the native drag may start
+                    else dragGateRef.current = null; // horizontal → a slider gesture, not a row drag
+                  }}
+                  onMouseLeave={() => {
+                    if (dragGateRef.current?.i === i) dragGateRef.current = null;
+                  }}
+                  onDragStart={(e) => {
+                    setDragLayer(i);
+                    e.dataTransfer.effectAllowed = "move";
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    if (dragLayer !== null && dragLayer !== i) setDropLayer(i);
+                  }}
+                  onDragLeave={() => {
+                    if (dropLayer === i) setDropLayer(null);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    if (dragLayer !== null) moveLayer(dragLayer, i);
+                    setDragLayer(null);
+                    setDropLayer(null);
+                  }}
+                  onDragEnd={() => {
+                    setDragLayer(null);
+                    setDropLayer(null);
+                    setArmedRow(null);
+                    dragGateRef.current = null;
+                  }}
+                  className={`rounded-lg border px-2 py-2 space-y-2 transition-colors ${
+                    dragLayer === i
+                      ? "opacity-40 border-slate-700"
+                      : dropLayer === i
+                        ? "border-sky-500 bg-sky-950/30"
+                        : "border-slate-700/60 bg-slate-800/40"
+                  }`}
+                >
+                  <div className="flex items-center gap-2 text-sm">
+                    <span
+                      className="cursor-grab text-slate-500 select-none shrink-0"
+                      title="Drag to reorder — row position = layer position"
+                      onMouseDown={(e) => {
+                        // The grip exists only to drag — arm instantly, any direction.
+                        if (e.button === 0) setArmedRow(i);
+                      }}
+                    >
+                      ⠿
+                    </span>
+                    <span className="w-4 shrink-0 text-center text-[10px] text-slate-500" title={`Row ${globals.video.layers.length - i} of ${globals.video.layers.length} — row 1 is the top layer`}>
+                      {globals.video.layers.length - i}
+                    </span>
+                    <button
+                      type="button"
+                      className={`shrink-0 ${l.hidden ? "text-slate-600 hover:text-slate-300" : "text-slate-300 hover:text-white"}`}
+                      onClick={() => patchLayer(i, { hidden: !l.hidden })}
+                      title={l.hidden ? "Layer hidden — click to show" : "Layer visible — click to hide (keeps its settings and stack position)"}
+                    >
+                      <EyeIcon off={l.hidden} className="w-4 h-4" />
+                    </button>
+                    {isVis ? (
+                      <span
+                        className={`w-12 h-8 rounded border border-violet-600/50 bg-violet-950/50 flex items-center justify-center text-violet-300 shrink-0 ${l.hidden ? "opacity-40 grayscale" : ""}`}
+                        title="The visuals configured in section 2. Look"
+                      >
+                        ◈
+                      </span>
+                    ) : l.kind === "media" ? (
+                      <img
+                        src={api.assetThumbUrl(l.assetId)}
+                        alt=""
+                        draggable={false}
+                        className={`w-12 h-8 rounded object-cover border border-slate-700/60 shrink-0 ${l.hidden ? "opacity-40 grayscale" : ""}`}
+                        onError={(e) => (e.currentTarget.style.display = "none")}
+                      />
+                    ) : null}
+                    <div className={`min-w-0 flex-1 ${l.hidden ? "opacity-40" : ""}`}>
+                      <div className="truncate text-xs text-slate-200" title={isVis ? "Waveform visuals — section 2. Look" : asset?.title ?? (l.kind === "media" ? l.assetId : "")}>
+                        {isVis ? "Waveform visuals" : asset?.title ?? (l.kind === "media" ? l.assetId : "")}
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        {isVis ? (
+                          <>
+                            <Badge tone="violet">visuals</Badge>
+                            <span className="text-[10px] text-slate-500">2. Look · {globals.mode}</span>
+                          </>
+                        ) : (
+                          <>
+                            <Badge tone={isImg ? "violet" : "info"}>{isImg ? "image" : "video"}</Badge>
+                            {asset == null && videoAssets.length > 0 && (
+                              <span className="text-[10px] text-amber-400">not in this project anymore</span>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    <label className="flex items-center gap-1.5 text-[11px] text-slate-400 shrink-0" title="Layer opacity">
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={l.opacity}
+                        className="w-20"
+                        onChange={(e) => patchLayer(i, { opacity: Number(e.target.value) })}
+                      />
+                      <span className="w-8 text-right">{Math.round(l.opacity * 100)}%</span>
+                    </label>
+                    <button className="text-slate-500 hover:text-slate-200 disabled:opacity-30 shrink-0" disabled={i === globals.video.layers.length - 1} onClick={() => moveLayer(i, i + 1)} title="Move up (toward the top layer)">
+                      ↑
+                    </button>
+                    <button className="text-slate-500 hover:text-slate-200 disabled:opacity-30 shrink-0" disabled={i === 0} onClick={() => moveLayer(i, i - 1)} title="Move down (toward the bottom layer)">
+                      ↓
+                    </button>
+                    <button className="text-slate-500 hover:text-rose-400 shrink-0" onClick={() => removeLayer(i)} title="Remove this layer (file stays in the library)">
+                      ✕
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-stretch gap-1.5 pl-7">
+                    <div className={LAYER_CARD}>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className={LAYER_CARD_LABEL}>Position</span>
+                        <button
+                          type="button"
+                          className="text-slate-500 hover:text-slate-200 disabled:opacity-30"
+                          disabled={l.x === 0.5 && l.y === 0.5}
+                          onClick={() => patchLayer(i, { x: 0.5, y: 0.5 })}
+                          title="Re-center (50% / 50%)"
+                        >
+                          ⌖
+                        </button>
+                      </div>
+                      <label className="flex items-center gap-1" title="Layer center — horizontal position in the frame">
+                        <span className="w-3 text-slate-500">X</span>
+                        <input type="range" min={0} max={1} step={0.01} value={l.x} className="w-20" onChange={(e) => patchLayer(i, { x: Number(e.target.value) })} />
+                        <span className="w-8 text-right">{Math.round(l.x * 100)}%</span>
+                      </label>
+                      <label className="flex items-center gap-1" title="Layer center — vertical position in the frame">
+                        <span className="w-3 text-slate-500">Y</span>
+                        <input type="range" min={0} max={1} step={0.01} value={l.y} className="w-20" onChange={(e) => patchLayer(i, { y: Number(e.target.value) })} />
+                        <span className="w-8 text-right">{Math.round(l.y * 100)}%</span>
+                      </label>
+                    </div>
+                    <div className={LAYER_CARD}>
+                      <span className={LAYER_CARD_LABEL}>Size</span>
+                      <label className="flex items-center gap-1" title="Layer size — 100% fills the frame, smaller shrinks to an inset, larger zooms in">
+                        <input type="range" min={0.1} max={2} step={0.05} value={l.scale} className="w-20" onChange={(e) => patchLayer(i, { scale: Number(e.target.value) })} />
+                        <span className="w-9 text-right">{Math.round(l.scale * 100)}%</span>
+                      </label>
+                    </div>
+                    {l.kind === "media" && (
+                    <div className={`${LAYER_CARD} flex-1 min-w-[280px]`}>
+                      <span className={LAYER_CARD_LABEL}>Background removal</span>
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                    <select
+                      className="ui-input !py-0.5 text-[11px]"
+                      value={l.key.method}
+                      onChange={(e) => setLayerKey(i, { method: e.target.value as VizKeyMethod })}
+                      title={`How the ${isImg ? "image" : "video"}'s background is removed`}
+                    >
+                      {KEY_METHODS.filter((m) => !(isImg && m.value === "cutout")).map((m) => (
+                        <option key={m.value} value={m.value}>{m.label}</option>
+                      ))}
+                    </select>
+                    {isImg && l.key.method === "cutout" && (
+                      <span className="text-amber-400">AI cutout needs a video layer.</span>
+                    )}
+                    {COLOR_KEY_METHODS.has(l.key.method) && (
+                      <>
+                        <input
+                          type="color"
+                          value={l.key.color}
+                          onChange={(e) => setLayerKey(i, { color: e.target.value.toUpperCase() })}
+                          className="w-7 h-5 rounded border border-slate-600"
+                          title="The background color to remove"
+                        />
+                        <Button size="sm" variant="ghost" onClick={() => sampleLayerBg(i)} title="Sample the top-left pixel of this layer's current frame">
+                          ⤡ sample
+                        </Button>
+                        <span className="flex items-center gap-1">
+                          tol {Math.round(l.key.similarity * 100)}%
+                          <input
+                            type="range"
+                            min={0}
+                            max={0.5}
+                            step={0.01}
+                            value={l.key.similarity}
+                            className="w-20"
+                            onChange={(e) => setLayerKey(i, { similarity: Number(e.target.value) })}
+                          />
+                        </span>
+                        <span className="flex items-center gap-1">
+                          feather {Math.round(l.key.blend * 100)}%
+                          <input
+                            type="range"
+                            min={0}
+                            max={0.2}
+                            step={0.005}
+                            value={l.key.blend}
+                            className="w-16"
+                            onChange={(e) => setLayerKey(i, { blend: Number(e.target.value) })}
+                          />
+                        </span>
+                        {l.key.method === "hsv" && (
+                          <span className="flex items-center gap-1">
+                            choke {l.key.choke}px
+                            <input
+                              type="range"
+                              min={-8}
+                              max={8}
+                              step={1}
+                              value={l.key.choke}
+                              className="w-16"
+                              title="Shrink (negative) / grow (positive) the matte edge"
+                              onChange={(e) => setLayerKey(i, { choke: Number(e.target.value) })}
+                            />
+                          </span>
+                        )}
+                        <label className="flex items-center gap-1" title="Suppress key-color spill on surviving edge pixels">
+                          <input
+                            type="checkbox"
+                            checked={l.key.despill}
+                            onChange={(e) => setLayerKey(i, { despill: e.target.checked })}
+                          />
+                          despill
+                        </label>
+                      </>
+                    )}
+                    {l.key.method === "cutout" && !isImg && (
+                      <>
+                        <select
+                          className="ui-input !py-0.5 text-[11px]"
+                          value={l.key.model}
+                          onChange={(e) => setLayerKey(i, { model: e.target.value as VizCutoutModel })}
+                          title="Which engine model produces the matte"
+                        >
+                          {VIZ_CUTOUT_MODELS.map((m) => (
+                            <option key={m} value={m}>{CUTOUT_MODEL_LABELS[m]}</option>
+                          ))}
+                        </select>
+                        <span className="flex items-center gap-1">
+                          feather {l.key.feather}px
+                          <input
+                            type="range"
+                            min={0}
+                            max={6}
+                            step={0.5}
+                            value={l.key.feather}
+                            className="w-16"
+                            onChange={(e) => setLayerKey(i, { feather: Number(e.target.value) })}
+                          />
+                        </span>
+                        <label className="flex items-center gap-1" title="Clamp green spill on semi-transparent edges (baked into the keyed video)">
+                          <input
+                            type="checkbox"
+                            checked={l.key.despill}
+                            onChange={(e) => setLayerKey(i, { despill: e.target.checked })}
+                          />
+                          despill
+                        </label>
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          disabled={!engine?.ok || kj?.status === "running"}
+                          onClick={() => void startCutout(l)}
+                          title={engine?.ok ? "Bake a transparent-background WebM of this layer" : "Needs the Python engine"}
+                        >
+                          {kj?.status === "running" ? "Cutting out…" : keyedUrlFor(l) ? "Regenerate cutout" : "Generate cutout"}
+                        </Button>
+                        {kj?.status === "running" && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              void api
+                                .vizCancelVideoKey(kj.id)
+                                .then((r) => setKeyJobs((m) => new Map(m).set(cutoutKeyOf(l), r.job)))
+                                .catch(() => {})
+                            }
+                          >
+                            cancel
+                          </Button>
+                        )}
+                      </>
+                    )}
+                      </div>
+                      {l.key.method === "cutout" && !isImg && (
+                        <div className="space-y-1 pt-0.5">
+                      {kj?.status === "running" && (
+                        <div className="w-64">
+                          <ProgressBar value={kj.progress.done} max={Math.max(1, kj.progress.total)} height="h-1" />
+                          <p className="text-[10px] text-slate-500 mt-0.5">
+                            {kj.progress.total > 0 ? `${kj.progress.done}/${kj.progress.total} frames` : "decoding + matting…"}
+                          </p>
+                        </div>
+                      )}
+                      {kj?.status === "failed" && <p className="text-[11px] text-red-400">{kj.error?.message ?? "cutout failed"}</p>}
+                      {keyedUrlFor(l) && (
+                        <p className="text-[11px] text-emerald-400">Cutout live — the preview shows the keyed video (used by the export too).</p>
+                      )}
+                      {cutoutStaleFor(l) && kj?.status !== "running" && (
+                        <p className="text-[11px] text-amber-400">Cutout params changed — regenerate to refresh the preview.</p>
+                      )}
+                      {!engine?.ok && (
+                        <p className="text-[11px] text-amber-400">AI cutout needs the Python engine — set it up via the engine notice above.</p>
+                      )}
+                        </div>
+                      )}
+                    </div>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+        {globals.video.layers.length > 0 && (
+          <p className="text-[11px] text-slate-500">
+            Videos loop if shorter than the mix · every layer is cover-cropped to the frame · a layer's own audio is not used · row 1 draws on top · drag a row vertically to reorder · only rows in this list are drawn — no ◈ row, no 2. Look visuals · the eye hides a row without deleting it (hidden media isn't decoded on export).
+          </p>
+        )}
     </>
   );
 
@@ -1613,146 +2425,39 @@ export function Visualizer({
       {/* 2. Visual settings */}
       <Section icon="◈" title="2. Look">{lookContent}</Section>
 
-      {/* 3. Video */}
-      <Section icon="▣" title="3. Video" action={<span className="text-xs text-slate-500">optional project clip layered with the visuals</span>}>
-        <div className="flex flex-wrap items-end gap-x-6 gap-y-3 text-sm">
-          <div className="space-y-1 min-w-0">
-            <label className="block text-xs text-slate-400">Project asset video</label>
-            <select
-              className="ui-input w-80 max-w-full"
-              value={globals.video.assetId ?? ""}
-              onChange={(e) => setG("video", { ...globals.video, assetId: e.target.value || null })}
-            >
-              <option value="">None — visuals only</option>
-              {videoAssets.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.title ?? a.id}
-                  {a.duration_seconds ? ` · ${a.duration_seconds.toFixed(0)}s` : ""}
-                  {a.width && a.height ? ` · ${a.width}×${a.height}` : ""}
-                </option>
-              ))}
-            </select>
-            {videoAssets.length === 0 && (
-              <p className="text-[11px] text-slate-500">
-                No downloaded videos in this project — KEEP assets on Search/Folders or drop files onto the app first.
-              </p>
-            )}
-            {globals.video.assetId && videoAssets.length > 0 && !videoAssets.some((a) => a.id === globals.video.assetId) && (
-              <p className="text-[11px] text-amber-400">The saved video is no longer in this project — pick another one.</p>
-            )}
-          </div>
-          {globals.video.assetId && (
-            <>
-              <div className="space-y-1">
-                <label className="block text-xs text-slate-400">Layer</label>
-                <div className="flex gap-1">
-                  {(["under", "over"] as VizVideoLayer[]).map((l) => (
-                    <Button
-                      key={l}
-                      size="sm"
-                      variant={globals.video.layer === l ? "primary" : "ghost"}
-                      onClick={() => setG("video", { ...globals.video, layer: l })}
-                    >
-                      {l === "under" ? "Under" : "Above"}
-                    </Button>
-                  ))}
-                </div>
-                <p className="text-[10px] text-slate-500">
-                  {globals.video.layer === "under" ? "behind the equalizer, over the background" : "over the equalizer, under dancer/star"}
-                </p>
-              </div>
-              <div className="space-y-1 w-44">
-                <label className="block text-xs text-slate-400">Opacity: {Math.round(globals.video.opacity * 100)}%</label>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={globals.video.opacity}
-                  className="w-full"
-                  onChange={(e) => setG("video", { ...globals.video, opacity: Number(e.target.value) })}
-                />
-              </div>
-              <img
-                key={globals.video.assetId}
-                src={api.assetThumbUrl(globals.video.assetId)}
-                alt=""
-                className="h-14 rounded border border-slate-700/60 object-cover"
-                onError={(e) => (e.currentTarget.style.display = "none")}
-              />
-              <div className="space-y-1">
-                <label className="block text-xs text-slate-400">Remove flat background</label>
-                <Button
-                  size="sm"
-                  variant={globals.video.chromaKey.enabled ? "primary" : "ghost"}
-                  onClick={() => setKey({ enabled: !globals.video.chromaKey.enabled })}
-                  title="Chroma-key: make one flat color in the video transparent"
-                >
-                  Color key
-                </Button>
-                {globals.video.chromaKey.enabled && (
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-1">
-                    <span className="flex items-center gap-2">
-                      <input
-                        type="color"
-                        value={globals.video.chromaKey.color}
-                        onChange={(e) => setKey({ color: e.target.value.toUpperCase() })}
-                        className="w-8 h-6 rounded border border-slate-600"
-                        title="The flat background color to remove"
-                      />
-                      <Button size="sm" variant="ghost" onClick={sampleVideoBg} title="Sample the top-left pixel of the current video frame">
-                        ⤡ sample corner
-                      </Button>
-                    </span>
-                    <span className="flex items-center gap-2 text-xs text-slate-400">
-                      Tolerance {Math.round(globals.video.chromaKey.similarity * 100)}%
-                      <input
-                        type="range"
-                        min={0}
-                        max={0.5}
-                        step={0.01}
-                        value={globals.video.chromaKey.similarity}
-                        className="w-24"
-                        onChange={(e) => setKey({ similarity: Number(e.target.value) })}
-                      />
-                    </span>
-                    <span className="flex items-center gap-2 text-xs text-slate-400">
-                      Feather {Math.round(globals.video.chromaKey.blend * 100)}%
-                      <input
-                        type="range"
-                        min={0}
-                        max={0.2}
-                        step={0.005}
-                        value={globals.video.chromaKey.blend}
-                        className="w-20"
-                        onChange={(e) => setKey({ blend: Number(e.target.value) })}
-                      />
-                    </span>
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-        </div>
-        {globals.video.assetId && (
-          <p className="text-[11px] text-slate-500">
-            Loops if shorter than the mix · cover-cropped to the frame · the video's own audio is not used.
-          </p>
-        )}
+      {/* 3. Media layers */}
+      <Section
+        icon="▣"
+        title="3. Media layers"
+        action={
+          <span className="text-xs text-slate-500">
+            {globals.video.layers.length}/{VIZ_MAX_VIDEO_LAYERS} — row 1 is the top layer; the 2. Look visuals need a ◈ row
+          </span>
+        }
+      >
+        {layersContent}
       </Section>
 
       {/* 4. Preview */}
       <Section icon="▶" title="4. Live preview" action={<span className="text-xs text-slate-500">same math as the MP4 export — pixel-identical geometry</span>}>
-        <video
-          key={globals.video.assetId ?? "none"}
-          ref={videoRef}
-          src={globals.video.assetId ? api.assetFileUrl(globals.video.assetId) : undefined}
-          className="hidden"
-          muted
-          loop
-          playsInline
-          preload="auto"
-        />
+        {globals.video.layers.map((l, i) => {
+          // Visuals rows draw procedurally; hidden rows keep their config but
+          // don't draw — skipping the element also saves the video decode.
+          if (l.kind !== "media" || l.hidden) return null;
+          const asset = videoAssets.find((a) => a.id === l.assetId);
+          const isImg = isImageFileName(asset?.local_path ?? asset?.title ?? "");
+          const keyed = keyedUrlFor(l);
+          const src = isImg ? api.assetFileUrl(l.assetId) : keyed ?? api.assetFileUrl(l.assetId);
+          const setEl = (el: HTMLVideoElement | HTMLImageElement | null) => {
+            if (el) layerElsRef.current.set(i, el);
+            else layerElsRef.current.delete(i);
+          };
+          return isImg ? (
+            <img key={`${i}:${l.assetId}`} ref={setEl} src={src} className="hidden" alt="" />
+          ) : (
+            <video key={`${i}:${l.assetId}:${keyed ?? "raw"}`} ref={setEl} src={src} className="hidden" muted loop playsInline preload="auto" />
+          );
+        })}
         <div className="flex items-center gap-3">
           <Button
             size="sm"
@@ -1789,11 +2494,27 @@ export function Visualizer({
             ref={canvasRef}
             width={640}
             height={canvasH}
-            className={fullscreen ? "max-w-full max-h-full" : "mx-auto block rounded-lg border border-slate-700/60 bg-black"}
+            onClick={onCanvasClick}
+            title={fullscreen ? "Click to play/pause · double-click to exit fullscreen" : undefined}
+            className={fullscreen ? "max-w-full max-h-full cursor-pointer" : "mx-auto block rounded-lg border border-slate-700/60 bg-black"}
             style={fullscreen ? undefined : { aspectRatio: `${renderSettings.width}/${renderSettings.height}`, width: "auto", maxWidth: "100%", maxHeight: "50vh" }}
           />
+          {fullscreen && fsFlash && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
+              <span className="text-6xl text-white/80 drop-shadow-[0_2px_8px_rgba(0,0,0,0.8)]">{fsFlash === "play" ? "▶" : "⏸"}</span>
+            </div>
+          )}
           {fullscreen && (
             <>
+              <button
+                type="button"
+                onClick={() => setLayersOpen((o) => !o)}
+                onDoubleClick={(e) => e.stopPropagation()}
+                className="absolute top-3 left-3 z-10 rounded-md border border-slate-600 bg-slate-900/80 px-2.5 py-1.5 text-xs text-slate-200 hover:bg-slate-800"
+                title="Show/hide the Media layers panel"
+              >
+                {layersOpen ? "✕ Layers" : "▣ Layers"}
+              </button>
               <button
                 type="button"
                 onClick={() => setLookOpen((o) => !o)}
@@ -1815,6 +2536,18 @@ export function Visualizer({
                   {lookContent}
                 </div>
               )}
+              {layersOpen && (
+                <div
+                  className="absolute top-12 left-3 bottom-3 z-10 w-[26rem] max-w-[85vw] overflow-y-auto rounded-lg border border-slate-700 bg-slate-900/95 p-4 space-y-4 shadow-xl"
+                  onDoubleClick={(e) => e.stopPropagation()}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wide text-slate-300">▣ 3. Media layers</span>
+                    <button type="button" className="text-slate-500 hover:text-slate-200" onClick={() => setLayersOpen(false)}>✕</button>
+                  </div>
+                  {layersContent}
+                </div>
+              )}
             </>
           )}
         </div>
@@ -1834,19 +2567,35 @@ export function Visualizer({
       {/* 5. Render */}
       <Section icon="⇩" title="5. Render">
         <div className="flex flex-wrap items-center gap-3 text-sm">
+          <div
+            className="flex items-center rounded-md border border-slate-700 p-0.5"
+            title="Aspect ratio — the live preview and the exported MP4 both reshape to it"
+          >
+            {([
+              { id: "16:9", label: "▭ 16:9" },
+              { id: "9:16", label: "▯ 9:16" },
+              { id: "1:1", label: "◻ 1:1" },
+            ] as const).map((a) => (
+              <button
+                key={a.id}
+                type="button"
+                className={`px-2.5 py-1 rounded text-xs ${aspectId === a.id ? "bg-sky-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
+                onClick={() => applyOutput(a.id, quality)}
+              >
+                {a.label}
+              </button>
+            ))}
+          </div>
           <select
             className="ui-input"
-            value={`${renderSettings.width}x${renderSettings.height}`}
-            onChange={(e) => {
-              const [w, h] = e.target.value.split("x").map(Number);
-              setRenderSettings((s) => ({ ...s, width: w!, height: h! }));
-            }}
+            value={quality}
+            onChange={(e) => applyOutput(aspectId, e.target.value as "1080p" | "4k")}
+            title="Output resolution"
           >
-            <option value="1920x1080">1080p (1920×1080)</option>
-            <option value="3840x2160">4K (3840×2160)</option>
-            <option value="1080x1080">Square (1080×1080)</option>
-            <option value="1080x1920">Vertical 9:16 (1080×1920)</option>
+            <option value="1080p">1080p</option>
+            <option value="4k">4K</option>
           </select>
+          <span className="text-xs text-slate-500 tabular-nums">{renderSettings.width}×{renderSettings.height}</span>
           <select className="ui-input" value={renderSettings.fps} onChange={(e) => setRenderSettings((s) => ({ ...s, fps: Number(e.target.value) }))}>
             <option value={24}>24 fps</option>
             <option value={30}>30 fps</option>
@@ -1854,6 +2603,9 @@ export function Visualizer({
           </select>
           <Button variant="primary" onClick={render} disabled={stemInputs.length === 0 || rendering}>
             {rendering ? "Rendering…" : "Render MP4"}
+          </Button>
+          <Button variant="ghost" onClick={() => revealRender()} title="Open the renders folder in the file explorer (created on demand if empty)">
+            📁 Open folder
           </Button>
           {rendering && <Spinner />}
         </div>

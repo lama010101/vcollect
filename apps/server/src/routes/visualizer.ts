@@ -7,14 +7,20 @@
 //   GET    render/:id                job progress / result
 //   POST   render/:id/cancel
 //   GET    renders?project=          rendered MP4s + config sidecars
+//   POST   video-key?project=        { assetId, key } → engine-baked keyed WebM
+//   GET    video-key/:id             keying job progress / result
+//   POST   video-key/:id/cancel
 // =============================================================================
 
 import type { FastifyInstance } from "fastify";
+import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
-import { DEFAULT_PROJECT_ID, visualizerRenderSchema } from "@twio/shared";
+import { DEFAULT_PROJECT_ID, visualizerRenderSchema, vizVideoKeySchema } from "@twio/shared";
+import { getAsset } from "../db/repository.js";
 import { VisualizerError } from "../visualizer/errors.js";
+import { cancelKeyJob, getKeyJob, startKeyJob } from "../visualizer/keying.js";
 import { stemSignalPayload, stemSignalPhase } from "../visualizer/signals.js";
-import { revealInExplorer } from "./folders.js";
+import { assetAbsolutePath, revealInExplorer } from "./folders.js";
 import {
   cancelRenderJob,
   deleteStem,
@@ -86,6 +92,36 @@ export async function registerVisualizerRoutes(app: FastifyInstance): Promise<vo
   app.post("/api/visualizer/render/:id/cancel", async (req) => ({ job: cancelRenderJob((req.params as { id: string }).id) }));
 
   app.get("/api/visualizer/renders", async (req) => ({ renders: listRenders(projectOf(req.query)) }));
+
+  // AI cutout ("keyed") WebM generation — idempotent: a cached build for the
+  // same (asset, key params) returns a finished job immediately.
+  app.post("/api/visualizer/video-key", async (req) => {
+    const projectId = projectOf(req.query);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const assetId = typeof body.assetId === "string" ? body.assetId : "";
+    if (!assetId) throw new VisualizerError(400, "MISSING_ASSET", "assetId is required.");
+    const parsed = vizVideoKeySchema.safeParse(body.key ?? {});
+    if (!parsed.success) throw new VisualizerError(400, "INVALID_REQUEST", parsed.error.message);
+    if (parsed.data.method !== "cutout") {
+      throw new VisualizerError(400, "INVALID_REQUEST", 'video-key only applies to the "cutout" method.');
+    }
+    const a = getAsset(assetId);
+    if (!a || a.project_id !== projectId) {
+      throw new VisualizerError(404, "VIDEO_ASSET_NOT_FOUND", `Video asset not found in this project: ${assetId}`);
+    }
+    if (!a.local_path) {
+      throw new VisualizerError(422, "VIDEO_NOT_DOWNLOADED", `Asset "${a.title ?? a.id}" has no downloaded file — download it first.`);
+    }
+    const abs = assetAbsolutePath(a.local_path, "");
+    if (!existsSync(abs)) {
+      throw new VisualizerError(404, "VIDEO_FILE_MISSING", `The asset's file is missing on disk: ${a.local_path}`);
+    }
+    return { job: startKeyJob(projectId, abs, parsed.data) };
+  });
+
+  app.get("/api/visualizer/video-key/:id", async (req) => ({ job: getKeyJob((req.params as { id: string }).id) }));
+
+  app.post("/api/visualizer/video-key/:id/cancel", async (req) => ({ job: cancelKeyJob((req.params as { id: string }).id) }));
 
   // Open the renders folder (or a specific rendered file selected) in the OS
   // file explorer — basename() keeps the path inside the renders dir.
