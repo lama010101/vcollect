@@ -1023,11 +1023,46 @@ export function Visualizer({
     setPlaying(false);
   }, [duration, playbackT, stopSources]);
 
-  // --- Animation loop ---------------------------------------------------------
   const playingRef = useRef(playing);
   playingRef.current = playing;
   const scrubRef = useRef(scrubT);
   scrubRef.current = scrubT;
+
+  /** Stop = pause + rewind to 0 (the paused preview follows scrubT). */
+  const stopPlayback = useCallback(() => {
+    pausePlayback();
+    setScrubT(0);
+  }, [pausePlayback]);
+
+  // --- Fullscreen transport bar ------------------------------------------------
+  // Revealed by a click or mouse move inside the fullscreen preview; hides
+  // after a few seconds while playing and stays up while paused.
+  const [fsControls, setFsControls] = useState(false);
+  const fsControlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pokeFsControls = useCallback(() => {
+    setFsControls(true);
+    if (fsControlsTimer.current) clearTimeout(fsControlsTimer.current);
+    fsControlsTimer.current = setTimeout(() => {
+      // Keep the bar up while paused — only auto-hide during playback.
+      if (playingRef.current) setFsControls(false);
+    }, 3000);
+  }, []);
+  useEffect(() => {
+    if (!fullscreen) {
+      setFsControls(false);
+      if (fsControlsTimer.current) clearTimeout(fsControlsTimer.current);
+      return;
+    }
+    pokeFsControls(); // show on entry + re-arm whenever play/pause flips
+  }, [fullscreen, playing, pokeFsControls]);
+  useEffect(
+    () => () => {
+      if (fsControlsTimer.current) clearTimeout(fsControlsTimer.current);
+    },
+    [],
+  );
+
+  // --- Animation loop ---------------------------------------------------------
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1783,6 +1818,8 @@ export function Visualizer({
         <div
           ref={previewBoxRef}
           onDoubleClick={toggleFullscreen}
+          onClick={fullscreen ? pokeFsControls : undefined}
+          onMouseMove={fullscreen ? pokeFsControls : undefined}
           className={fullscreen ? "relative w-full h-full bg-black flex items-center justify-center overflow-hidden" : ""}
         >
           <canvas
@@ -1813,6 +1850,46 @@ export function Visualizer({
                     <button type="button" className="text-slate-500 hover:text-slate-200" onClick={() => setLookOpen(false)}>✕</button>
                   </div>
                   {lookContent}
+                </div>
+              )}
+              {fsControls && (
+                <div
+                  className="absolute inset-x-0 bottom-0 z-10 flex justify-center px-4 pb-5"
+                  onDoubleClick={(e) => e.stopPropagation()}
+                >
+                  <div className="flex w-[min(46rem,100%)] items-center gap-3 rounded-xl border border-slate-700 bg-slate-900/85 px-4 py-2.5 shadow-xl backdrop-blur">
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      disabled={resolvedStems.length === 0}
+                      onClick={() => (playing ? pausePlayback() : void startPlayback(scrubT))}
+                      title={playing ? "Pause" : "Play"}
+                    >
+                      {playing ? "⏸" : "▶"}
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={stopPlayback} title="Stop — back to the start">
+                      ⏹
+                    </Button>
+                    <input
+                      type="range"
+                      min={0}
+                      max={Math.max(1, duration)}
+                      step={0.033}
+                      value={Math.min(scrubT, duration)}
+                      className="flex-1"
+                      onChange={(e) => {
+                        const t = Number(e.target.value);
+                        setScrubT(t);
+                        if (playing) void startPlayback(t);
+                      }}
+                    />
+                    <span className="shrink-0 text-xs text-slate-300 tabular-nums">
+                      {mmss(scrubT)} / {mmss(duration)}
+                    </span>
+                    <Button size="sm" variant="ghost" onClick={toggleFullscreen} title="Exit fullscreen">
+                      ✕
+                    </Button>
+                  </div>
                 </div>
               )}
             </>
