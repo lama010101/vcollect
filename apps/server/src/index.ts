@@ -89,6 +89,7 @@ import { applyReview } from "./routes/review.js";
 import { registerMusicEditRoutes } from "./routes/musicEdit.js";
 import { registerUploadRoutes } from "./routes/uploads.js";
 import { registerVisualizerRoutes } from "./routes/visualizer.js";
+import { registerWorldRoutes } from "./routes/world.js";
 import { registerEngineRoutes } from "./routes/engine.js";
 import { assetAbsolutePath, getFolders, revealInExplorer, getProjectRow } from "./routes/folders.js";
 import { generateFootageManifest, generateLicenseManifest } from "./manifests/csv.js";
@@ -165,6 +166,9 @@ export async function buildServer() {
 
   // --- Visualizer (multi-stem waveform renderer) ------------------------------
   await registerVisualizerRoutes(app);
+
+  // --- World Cam (camera-path re-render via remote InSpatio worker) -----------
+  await registerWorldRoutes(app);
 
   // --- Python engine (analysis worker: librosa/numpy/scipy/opencv) ------------
   await registerEngineRoutes(app);

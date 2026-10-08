@@ -10,6 +10,7 @@ import { Projects } from "./pages/Projects.js";
 import { ImportScript } from "./pages/ImportScript.js";
 import { MusicEdit } from "./pages/MusicEdit.js";
 import { Visualizer } from "./pages/Visualizer.js";
+import { WorldCam } from "./pages/WorldCam.js";
 import { TasksPanel } from "./components/TasksPanel.js";
 import { useToast } from "./components/useToast.js";
 
@@ -25,6 +26,7 @@ type View =
   | { name: "import" }
   | { name: "music" }
   | { name: "visualizer" }
+  | { name: "world" }
   | { name: "help" };
 
 const PROJECT_STORAGE_KEY = "twio.activeProjectId";
@@ -38,6 +40,7 @@ const NAV_ITEMS: Array<{ key: View["name"]; label: string; icon: string; desc: s
   { key: "timeline", label: "Timeline", icon: "▬", desc: "Shot schedule" },
   { key: "music", label: "Music Edit", icon: "♫", desc: "Beat-synced music video from a song" },
   { key: "visualizer", label: "Visualizer", icon: "∿", desc: "Multi-stem waveform video renderer" },
+  { key: "world", label: "World Cam", icon: "◎", desc: "Re-render video along a new camera path (remote GPU)" },
   { key: "folders", label: "Folders", icon: "▤", desc: "Browse files" },
   { key: "projects", label: "Projects", icon: "◇", desc: "Manage projects" },
   { key: "help", label: "Help", icon: "?", desc: "How it works" },
@@ -411,6 +414,13 @@ export default function App() {
               <div className="text-center py-20 text-slate-500">
                 <div className="text-4xl mb-3 opacity-40">◇</div>
                 <p>Select a specific project to use the visualizer.</p>
+              </div>
+            )}
+            {view.name === "world" && !isAllProjects && <WorldCam projectId={activeProjectId} onToast={push} />}
+            {view.name === "world" && isAllProjects && (
+              <div className="text-center py-20 text-slate-500">
+                <div className="text-4xl mb-3 opacity-40">◇</div>
+                <p>Select a specific project to use World Cam.</p>
               </div>
             )}
             {view.name === "help" && <Help />}

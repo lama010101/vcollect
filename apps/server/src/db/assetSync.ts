@@ -49,7 +49,7 @@ function walkMedia(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-async function sha256File(file: string): Promise<string> {
+export async function sha256File(file: string): Promise<string> {
   const h = createHash("sha256");
   return new Promise((resolvePromise, reject) => {
     const stream = createReadStream(file);

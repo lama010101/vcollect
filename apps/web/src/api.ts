@@ -1,7 +1,7 @@
 // Thin fetch wrapper for the backend API.
 // Same-origin "/api" in dev (Vite proxy) and when the backend serves the SPA.
 // Set VITE_API_URL to point the deployed frontend at a hosted backend.
-import type { BeatAnalysis, EditPlan, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VizVideoKeyConfig } from "@twio/shared";
+import type { BeatAnalysis, EditPlan, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VizVideoKeyConfig, WorldCamRequest } from "@twio/shared";
 const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
 /** Fired on `window` after local uploads complete so asset lists (Folders,
@@ -615,6 +615,49 @@ export interface EngineStatus {
   detail: string;
 }
 
+// --- World Cam (remote InSpatio-World camera-path re-render) --------------------
+export interface WorldStatusInfo {
+  configured: boolean;
+  endpoint: string;
+  endpointSource: "override" | "env" | null;
+  reachable: boolean;
+  worker: {
+    ok: boolean;
+    gpu?: string;
+    cuda?: string;
+    torch?: string;
+    busy?: boolean;
+    root?: string;
+    checkpoints?: Record<string, boolean>;
+  } | null;
+}
+export interface WorldVideo {
+  assetId: string;
+  title: string;
+  fileUrl: string;
+  thumbUrl: string;
+  durationSeconds: number | null;
+  fps: number | null;
+  width: number | null;
+  height: number | null;
+}
+export interface WorldJob {
+  id: string;
+  projectId: string;
+  status: "preparing" | "uploading" | "running" | "downloading" | "done" | "failed" | "cancelled";
+  remotePhase: string | null;
+  logTail: string;
+  error: { code: string; message: string } | null;
+  request: WorldCamRequest;
+  sourceAssetId: string;
+  remoteJobId: string | null;
+  resultAssetId: string | null;
+  resultUrl: string | null;
+  resultPath: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
 async function postBinary<T>(url: string, body: Blob): Promise<T> {
   const r = await req(url, {
     method: "POST",
@@ -909,4 +952,15 @@ export const api = {
   // --- Python engine ---
   engineStatus: () => getJson<EngineStatus>("/api/engine/status"),
   engineSetup: () => postJson<EngineStatus>("/api/engine/setup"),
+
+  // --- World Cam (remote InSpatio-World camera-path re-render) ---
+  worldStatus: () => getJson<{ status: WorldStatusInfo }>("/api/world/status"),
+  worldSetEndpoint: (endpoint: string) =>
+    putJson<{ ok: boolean; endpoint: string; status: WorldStatusInfo }>("/api/world/endpoint", { endpoint }),
+  worldVideos: (projectId: string) => getJson<{ videos: WorldVideo[] }>(withProject("/api/world/videos", projectId)),
+  worldStartJob: (projectId: string, body: WorldCamRequest) =>
+    postJson<{ job: WorldJob }>(withProject("/api/world/jobs", projectId), body),
+  worldJobs: (projectId: string) => getJson<{ jobs: WorldJob[] }>(withProject("/api/world/jobs", projectId)),
+  worldJob: (id: string) => getJson<{ job: WorldJob }>(`/api/world/jobs/${encodeURIComponent(id)}`),
+  worldCancelJob: (id: string) => postJson<{ job: WorldJob }>(`/api/world/jobs/${encodeURIComponent(id)}/cancel`),
 };

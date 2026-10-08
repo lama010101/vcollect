@@ -50,6 +50,11 @@ export const appConfigSchema = z.object({
   llmApiKey: z.string().default(""),
   llmBaseUrl: z.string().default(""),
   llmModel: z.string().default(""),
+  // World Cam remote worker (scripts/inspatio_worker.py on a GPU host, fronted
+  // by a cloudflared tunnel — see docs/inspatio-kaggle-setup.md). Empty =
+  // World Cam disabled. The token is an optional shared bearer secret.
+  inspatioEndpoint: z.string().default(""),
+  inspatioToken: z.string().default(""),
   port: z.number().int().positive().default(3001),
   host: z.string().default("127.0.0.1"),
   ffmpegBinPath: z.string().default(""),

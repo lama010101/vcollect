@@ -236,6 +236,25 @@
   librosa, soundfile, opencv-python-headless, onnxruntime (MODNet cutout;
   pinned in `requirements.txt`; MoviePy deliberately excluded).
 
+- **World Cam (InSpatio-World camera-path re-render):** `apps/server/src/world/`
+  + `routes/world.ts` (`/api/world/*`); UI: `pages/WorldCam.tsx`. The 1.3B
+  video model CANNOT run on this box (GTX 1050 4 GB) — inference happens on a
+  remote GPU worker: `scripts/inspatio_worker.py` (FastAPI wrapper around the
+  upstream `run_scene_inference.py`, run inside the inspatio conda env) behind
+  a cloudflared tunnel — see `docs/inspatio-kaggle-setup.md` (same Kaggle
+  pattern as `Kaggle_ComfyUI_Wan21_Reproducible_Setup.md`). Endpoint =
+  `INSPATIO_ENDPOINT` (+ optional `INSPATIO_TOKEN` bearer) in `.env.local`, or
+  per-session via `PUT /api/world/endpoint` (override wins — tunnel URLs
+  rotate). Camera trajectories are **pure math in `@twio/shared`
+  (`worldCam.ts`)**: `computeCameraTrajectory(preset,{frames,strength})` emits
+  first-frame-normalized OpenCV world→camera 4×4s (frame 0 = identity);
+  `serializeTrajectoryTxt` writes the target_tcw.txt format; the UI preview
+  and the uploaded file come from the same function. Result `pred.mp4` lands
+  in `OUTPUT_ROOT/<slug>/assets/world/` and registers via `syncProjectAssets`
+  (`provider_id='local'`). In-memory jobs + AbortController like the
+  visualizer; `WorldError` (status + code). Tests:
+  `apps/server/test/world-cam.node.test.ts` + `packages/shared/test/worldCam.test.ts`.
+
 ## Progress tracking (REQUIRED)
 
 - `docs/progress.md` is the development log for the webapp. **Every change to

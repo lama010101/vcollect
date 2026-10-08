@@ -5,8 +5,7 @@ webapp must be recorded here** — see the Changelog section at the bottom.
 
 ## What this is
 
-A stock-footage acquisition & rights-management webapp for the "The World Is
-Ours" YouTube music video. It searches Pexels + Pixabay via official APIs,
+A stock-footage acquisition & rights-management webapp to generate music videos. It searches Pexels + Pixabay via official APIs,
 scores/dedupes candidates, lets a human KEEP/REJECT clips in a review UI,
 emits provenance/license manifests, and can cut a beat-aligned music video
 edit from kept footage.
@@ -80,6 +79,7 @@ apps/web/src/
 | Python engine | ✅ Done (optional) | Managed venv + librosa worker; stem features enrich visualizer — app runs without it |
 | Per-project asset folders | ✅ Done | `OUTPUT_ROOT/<slug>/assets/`; existing files migrated |
 | Drag & drop upload | ✅ Done | Drop videos or images anywhere → `<slug>/assets/uploads/` + asset row |
+| World Cam (InSpatio-World) | ✅ Done | Camera-path video re-render via remote GPU worker (Kaggle + cloudflared); preset trajectories from `@twio/shared`; result lands as project asset |
 | P2 AI vision analysis | ⬜ Not started | Out of scope; schema nullable-ready |
 | Mixkit import / rough-cut export | ⬜ Deferred | P3 |
 
@@ -126,6 +126,41 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
 > tooling) MUST add a dated entry here before the work is considered done.
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
+
+### 2026-10-08 — World Cam tab: InSpatio-World camera-path re-render (remote GPU worker)
+
+- New **World Cam** nav tab (`pages/WorldCam.tsx`, `#/world`): pick a
+  downloaded project video → optional trim (re-encoded, frame-exact) → prompt
+  → camera-move preset (static/dolly/pan/crane/tilt/yaw/orbit L/R) → strength
+  + traj-scale + seed → live top-down SVG path preview → submit → live job
+  card (phase + remote log tail + cancel) → `pred.mp4` player; result is
+  auto-registered as a `local` asset in `<slug>/assets/world/` (Library /
+  Folders / visualizer media layers pick it up).
+- The model (1.3B DiT + Wan2.1 + DA3-giant, needs ~15 GB VRAM) runs on a
+  **remote worker**: new `scripts/inspatio_worker.py` — a single-file FastAPI
+  wrapper around upstream `run_scene_inference.py` (`/health`, multipart
+  `POST /jobs`, `GET /jobs/:id` + `…/result?file=` + cancel, optional
+  `INSPATIO_TOKEN` bearer, one GPU job at a time). Setup guide:
+  `docs/inspatio-kaggle-setup.md` (Kaggle + cloudflared, same pattern as the
+  ComfyUI doc).
+- Server: `src/world/{errors,client,service}.ts` + `routes/world.ts`
+  (`GET /api/world/status|presets|videos`, `PUT /api/world/endpoint` runtime
+  override for rotating tunnel URLs, `POST/GET /api/world/jobs`, cancel).
+  In-memory jobs like the visualizer; transient poll failures don't kill
+  running GPU jobs.
+- Shared: `worldCam.ts` — pure `computeCameraTrajectory` (per-frame OpenCV
+  world→camera 4×4s, frame 0 = identity), `serializeTrajectoryTxt`
+  (target_tcw.txt format), `trajectoryPositions` (preview), presets +
+  `worldCamRequestSchema`. Config keys `inspatioEndpoint`/`inspatioToken`
+  added to `appConfigSchema`; `.env(.example)` document `INSPATIO_ENDPOINT` /
+  `INSPATIO_TOKEN`.
+- Files: packages/shared/src/{worldCam.ts,index.ts,schemas.ts},
+  apps/server/src/{world/*,routes/world.ts,index.ts,config.ts,db/assetSync.ts
+  (sha256File export)}, apps/web/src/{api.ts,App.tsx,pages/WorldCam.tsx},
+  scripts/inspatio_worker.py, docs/inspatio-kaggle-setup.md, tests
+  (shared/test/worldCam.test.ts + apps/server/test/world-cam.node.test.ts).
+- Verified: `npm run typecheck` ✅, vitest 15 ✅, node tests +5 ✅ (full
+  suite). End-to-end GPU run pending a live worker.
 
 ### 2026-10-08 — Visualizer: "3. Media layers" panel in fullscreen preview (and/or with Look)
 - The fullscreen live preview now has TWO independent overlay panels: the

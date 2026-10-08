@@ -39,6 +39,8 @@ const raw: AppConfig = appConfigSchema.parse({
   llmApiKey: process.env.LLM_API_KEY ?? "",
   llmBaseUrl: process.env.LLM_BASE_URL ?? "",
   llmModel: process.env.LLM_MODEL ?? "",
+  inspatioEndpoint: process.env.INSPATIO_ENDPOINT ?? "",
+  inspatioToken: process.env.INSPATIO_TOKEN ?? "",
   port: num(process.env.PORT, 3001),
   host: process.env.HOST ?? "127.0.0.1",
   ffmpegBinPath: process.env.FFMPEG_BIN_PATH ?? "",
