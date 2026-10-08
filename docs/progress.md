@@ -546,6 +546,17 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
   chromaKey/key schema mismatches, not from this change. Test artifacts
   cleaned from the ice_cream project afterwards.
 
+### 2026-10-08 — Visualizer: fullscreen transport controls on click
+- **Fullscreen live preview now shows video controls on click/mouse move**:
+  a bottom pill bar (▶/⏸ play-pause, ⏹ stop = pause + rewind to 0, seek
+  slider, `current / total` time, ✕ exit fullscreen) fades in on activity,
+  auto-hides after 3 s while playing, and stays up while paused. Double-
+  click still toggles fullscreen; the Look panel/button are unchanged.
+- Files: `apps/web/src/pages/Visualizer.tsx` (`stopPlayback`, `fsControls`
+  state + `pokeFsControls` auto-hide timer wired to the preview box's
+  click/mousemove, fullscreen overlay bar markup).
+- Verified: `npm run typecheck` ✅; `npm run build` ✅.
+
 ### 2026-10-07 — Visualizer: new `silk` mode (spectral stacked waveform)
 - **New `silk` mode** (`packages/shared/src/visualizer.ts`): reproduces the
   reference "dual glowing waveform" render — each stem owns a horizontal
