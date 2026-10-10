@@ -72,10 +72,11 @@ export class EngineClient {
       if (this.stderrTail.length > 4000) this.stderrTail = this.stderrTail.slice(-4000);
       for (const line of this.stderrTail.split(/\r?\n/)) if (line.trim()) this.onStderr?.(line);
     });
-    proc.on("error", () => this.teardown(new EngineRpcError("WORKER_SPAWN_FAILED", `engine worker failed to start (${py.exe})`)));
+    proc.on("error", () => this.onProcGone(proc, new EngineRpcError("WORKER_SPAWN_FAILED", `engine worker failed to start (${py.exe})`)));
     proc.on("close", (code) => {
       const tail = this.stderrTail.trim().split(/\r?\n/).slice(-6).join("\n");
-      this.teardown(
+      this.onProcGone(
+        proc,
         new EngineRpcError(
           "WORKER_DIED",
           `engine worker exited unexpectedly (code ${code})${tail ? ` — ${tail.slice(-600)}` : ""}`,
@@ -112,6 +113,15 @@ export class EngineClient {
       if (msg.ok === true) p.resolve(msg.result);
       else p.reject(new EngineRpcError(msg.error?.code ?? "ENGINE_ERROR", msg.error?.message ?? "engine error", msg.error?.trace));
     }
+  }
+
+  /** Teardown only when the dead process is still the CURRENT worker — a
+   *  superseded proc's `close` event (e.g. a SIGKILL landing late, after a
+   *  respawn) must not reject calls that belong to the fresh worker or drop
+   *  the fresh `this.proc` reference. */
+  private onProcGone(proc: ChildProcess, err: Error): void {
+    if (this.proc !== proc) return;
+    this.teardown(err);
   }
 
   /** Reject every pending call and drop the process handle. */

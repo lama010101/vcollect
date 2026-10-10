@@ -61,18 +61,33 @@ def _key_video(params):
     return matting.key_video(params)
 
 
+@method("separate_stems")
+def _separate_stems(params):
+    # Lazy: imports librosa only for this method; torch/demucs only for hq.
+    from . import separate
+    return separate.separate_stems(params)
+
+
+@method("sep_status")
+def _sep_status(params):
+    # Lazy + dependency-light: reports which backends are installed.
+    from . import separate
+    return separate.sep_status(params)
+
+
 def _respond(req_id, ok, **kw):
     sys.stdout.write(json.dumps({"id": req_id, "ok": ok, **kw}) + "\n")
     sys.stdout.flush()
 
 
 def _error_payload(exc):
-    if isinstance(exc, EngineError):
-        code = exc.code
-    elif isinstance(exc, ImportError):
-        code = "MISSING_DEP"
-    else:
-        code = "ENGINE_ERROR"
+    # Duck-type `.code` rather than isinstance(exc, EngineError): this module
+    # runs as __main__, so `from .worker import EngineError` in a method
+    # module resolves to a SECOND EngineError class and isinstance fails —
+    # stable codes must survive either identity.
+    code = getattr(exc, "code", None)
+    if not code:
+        code = "MISSING_DEP" if isinstance(exc, ImportError) else "ENGINE_ERROR"
     return {"code": code,
             "message": str(exc) or repr(exc),
             "trace": traceback.format_exc().splitlines()[-6:]}

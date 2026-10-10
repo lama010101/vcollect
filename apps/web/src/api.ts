@@ -594,6 +594,25 @@ export interface VizRenderedFile {
   sizeBytes: number;
   createdAt: string;
 }
+/** Song → stems separation job. `backend` is "hpss" (fast) or "htdemucs" (hq);
+ *  `stems` lists the stem filenames created once done. */
+export interface VizSplitJob {
+  id: string;
+  projectId: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  quality: "fast" | "hq";
+  progress: { phase: "decode" | "separate" | "verify"; done: number; total: number; detail?: string };
+  error: { code: string; message: string } | null;
+  backend: string | null;
+  stems: string[];
+  startedAt: string;
+  finishedAt: string | null;
+}
+export interface VizSepStatus {
+  installed: boolean;
+  phase: "idle" | "engine" | "torch" | "demucs" | "ready" | "error";
+  detail: string;
+}
 /** Engine-baked keyed-WebM job (AI cutout). `keyId` is the cache hash —
  *  identical (asset, params) produce the same id so stale results are
  *  detectable client-side. */
@@ -898,6 +917,16 @@ export const api = {
   vizRenderJob: (id: string) => getJson<{ job: VizRenderJob }>(`/api/visualizer/render/${encodeURIComponent(id)}`),
   vizCancelRender: (id: string) => postJson<{ job: VizRenderJob }>(`/api/visualizer/render/${encodeURIComponent(id)}/cancel`),
   vizRenders: (projectId: string) => getJson<{ renders: VizRenderedFile[] }>(withProject("/api/visualizer/renders", projectId)),
+  // Upload a full song → engine separates it into stems (job — poll vizSplitJob).
+  vizSplitStems: (projectId: string, file: File, quality: "fast" | "hq") =>
+    postBinary<{ job: VizSplitJob }>(
+      withProject(`/api/visualizer/split-stems?name=${encodeURIComponent(file.name)}&quality=${quality}`, projectId),
+      file,
+    ),
+  vizSplitJob: (id: string) => getJson<{ job: VizSplitJob }>(`/api/visualizer/split-jobs/${encodeURIComponent(id)}`),
+  vizCancelSplit: (id: string) => postJson<{ job: VizSplitJob }>(`/api/visualizer/split-jobs/${encodeURIComponent(id)}/cancel`),
+  vizSepStatus: () => getJson<{ sep: VizSepStatus }>("/api/visualizer/sep-status"),
+  vizSepSetup: () => postJson<{ sep: VizSepStatus }>("/api/visualizer/sep-setup"),
   // Open the renders folder (a rendered file selected when `name` is given)
   // in the OS file explorer.
   vizRevealRender: (projectId: string, name?: string) =>

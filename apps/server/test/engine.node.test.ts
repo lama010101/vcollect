@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EngineClient, engineClient, EngineRpcError } from "../src/python/engineClient.ts";
@@ -102,6 +102,68 @@ describe("python engine — stem features (needs provisioned venv)", () => {
       assert.equal(again.cached, true);
     } finally {
       // The shared engineClient worker would keep this test process alive.
+      engineClient.kill();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("python engine — stem separation (needs provisioned venv)", () => {
+  const venvReady = existsSync(VENV_PYTHON) && existsSync(DEPS_STAMP_PATH);
+
+  it("sep_status reports backend availability", { skip: !venvReady && "venv not provisioned — run POST /api/engine/setup first" }, async () => {
+    try {
+      const r = await engineClient.call<{ fast: boolean; demucs: boolean; torch: boolean }>("sep_status", {}, { timeoutMs: 30000 });
+      assert.equal(r.fast, true); // librosa ships with the base deps
+      assert.equal(typeof r.demucs, "boolean");
+      assert.equal(typeof r.torch, "boolean");
+    } finally {
+      engineClient.kill();
+    }
+  });
+
+  it("separate_stems (fast) splits a 100 Hz sine + clicks into bass/drums/other", { skip: !venvReady && "venv not provisioned — run POST /api/engine/setup first" }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "twio-sep-test-"));
+    try {
+      const sr = 44100;
+      const samples = new Float32Array(Math.round(2 * sr));
+      // 100 Hz sine → bass stem; sparse clicks → drums stem.
+      for (let i = 0; i < samples.length; i++) samples[i] = 0.4 * Math.sin((2 * Math.PI * 100 * i) / sr);
+      for (let k = 0; k < 4; k++) samples[Math.round((0.3 + k * 0.4) * sr)] += 0.5;
+      const wav = join(dir, "song.wav");
+      writeFileSync(wav, wavBuffer(samples, sr));
+      const outDir = join(dir, "out");
+
+      const r = await engineClient.call<{ backend: string; stems: { name: string; path: string }[] }>(
+        "separate_stems",
+        { src_path: wav, out_dir: outDir, quality: "fast" },
+        { timeoutMs: 120000 },
+      );
+      assert.equal(r.backend, "hpss");
+      assert.deepEqual(
+        r.stems.map((s) => s.name).sort(),
+        ["bass", "drums", "other"],
+      );
+      for (const s of r.stems) {
+        assert.ok(existsSync(s.path) && statSync(s.path).size > 1000, `${s.name} written`);
+      }
+      const rms = (p: string) => {
+        // mean |sample| of the 16-bit PCM past the 44-byte WAV header.
+        const b = readFileSync(p);
+        let acc = 0;
+        let n = 0;
+        for (let i = 44; i + 2 <= b.length; i += 2) {
+          acc += Math.abs(b.readInt16LE(i));
+          n++;
+        }
+        return n ? acc / n : 0;
+      };
+      // The 100 Hz sine must land in bass, not drums (clicks are transient so
+      // the averaged drums energy stays small).
+      const bassPath = r.stems.find((s) => s.name === "bass")!.path;
+      const drumsPath = r.stems.find((s) => s.name === "drums")!.path;
+      assert.ok(rms(bassPath) > rms(drumsPath) * 1.5, "the sine belongs in the bass stem");
+    } finally {
       engineClient.kill();
       rmSync(dir, { recursive: true, force: true });
     }

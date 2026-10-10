@@ -5,14 +5,18 @@
 // =============================================================================
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
 import { buildPeakSeries, buildStemSignal, isStemAudible, resolveStem, visualizerRenderSchema, type FrameStem, type VisualizerRenderInput } from "@twio/shared";
 import { IMAGE_FILE_EXTENSIONS, projectPaths, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { getProject } from "../db/projectRepository.js";
 import { getAsset } from "../db/repository.js";
 import { AUDIO_EXTENSIONS, MAX_SONG_BYTES, fileUrl } from "../musicEdit/service.js";
+import { engineClient } from "../python/engineClient.js";
+import { sepStatus } from "../python/pythonService.js";
 import { assetAbsolutePath } from "../routes/folders.js";
+import { ffmpegService } from "../video/ffmpeg.js";
 import { probe, probeAudio } from "../video/ffprobe.js";
 import { decodeStem } from "./decode.js";
 import { VisualizerError } from "./errors.js";
@@ -23,7 +27,7 @@ import { stemSignalPayload } from "./signals.js";
 
 export { MAX_SONG_BYTES };
 
-export function visualizerDir(projectId: string, sub: "stems" | "renders" | "sessions"): string {
+export function visualizerDir(projectId: string, sub: "stems" | "renders" | "sessions" | "uploads"): string {
   const project = getProject(projectId);
   if (!project || project.isVirtual) throw new VisualizerError(404, "PROJECT_NOT_FOUND", `Project not found: ${projectId}`);
   const dir = resolve(projectPaths(project.slug).output, "visualizer", sub);
@@ -319,4 +323,175 @@ export function listRenders(projectId: string): VizRenderedFile[] {
       return { name: f, url: fileUrl(p), configUrl: existsSync(cfg) ? fileUrl(cfg) : null, path: p, sizeBytes: st.size, createdAt: st.mtime.toISOString() };
     })
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+// --- Song → stems split jobs ---------------------------------------------------
+
+export type VizSplitQuality = "fast" | "hq";
+
+export interface VizSplitProgress {
+  phase: "decode" | "separate" | "verify";
+  done: number;
+  total: number;
+  detail?: string;
+}
+
+export interface VizSplitJob {
+  id: string;
+  projectId: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  quality: VizSplitQuality;
+  progress: VizSplitProgress;
+  error: { code: string; message: string } | null;
+  /** Which engine backend produced the stems ("hpss" | "htdemucs"). */
+  backend: string | null;
+  /** Stem filenames created in the stems pool (set when done). */
+  stems: string[];
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+const splitJobs = new Map<string, VizSplitJob & { controller: AbortController }>();
+
+function publicSplitJob(j: VizSplitJob & { controller: AbortController }): VizSplitJob {
+  const { controller: _c, ...rest } = j;
+  return rest;
+}
+
+/** Map engine/separation errors to stable API codes. */
+function splitError(e: unknown): VisualizerError {
+  const err = e as Error & { code?: string };
+  if (err instanceof VisualizerError) return err;
+  if (err.code === "SEP_DEPS_MISSING") {
+    return new VisualizerError(
+      422,
+      "SEP_SETUP_REQUIRED",
+      "High-quality separation needs a one-time setup (~600 MB). Run POST /api/visualizer/sep-setup, then retry.",
+    );
+  }
+  if (err.code === "CORRUPT_AUDIO") return new VisualizerError(422, "CORRUPT_AUDIO", err.message);
+  if (err.code === "WORKER_KILLED" || err.code === "CANCELLED") return new VisualizerError(499, "SPLIT_CANCELLED", "Split cancelled.");
+  return new VisualizerError(500, err.code ?? "SPLIT_FAILED", err.message || "Stem separation failed.");
+}
+
+/** Upload a full song → decode → engine `separate_stems` → the produced WAVs
+ *  land in the stems pool as "<song> <part>.wav" + the normalized song as
+ *  "<song>.wav" (the full mix stays usable as a stem too). Runs one at a
+ *  time — the engine worker serializes long calls anyway. */
+export async function startSplitJob(projectId: string, fileName: string, data: Buffer, quality: VizSplitQuality): Promise<VizSplitJob> {
+  for (const j of splitJobs.values()) {
+    if (j.status === "running") throw new VisualizerError(409, "SPLIT_IN_PROGRESS", "A stem split is already running.");
+  }
+  if (quality === "hq" && !sepStatus().installed) {
+    throw splitError({ code: "SEP_DEPS_MISSING" });
+  }
+  const safe = sanitizeStemName(fileName);
+  const base = (safe.replace(/\.[^.]+$/, "") || "song").trim().slice(0, 80) || "song";
+  const upDir = visualizerDir(projectId, "uploads");
+  const stamp = Date.now();
+  const srcPath = join(upDir, `${stamp}-${base}${extname(safe).toLowerCase()}`);
+  const wavPath = join(upDir, `${stamp}-${base}.wav`);
+  writeFileSync(srcPath, data);
+
+  const job: VizSplitJob & { controller: AbortController } = {
+    id: randomUUID(),
+    projectId,
+    status: "running",
+    quality,
+    progress: { phase: "decode", done: 0, total: 3, detail: "normalizing the upload" },
+    error: null,
+    backend: null,
+    stems: [],
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    controller: new AbortController(),
+  };
+  splitJobs.set(job.id, job);
+
+  (async () => {
+    const d = await ffmpegService.ffmpegExec(
+      ["-v", "error", "-y", "-i", srcPath, "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", "-f", "wav", wavPath],
+      "viz-split-decode",
+      { signal: job.controller.signal },
+    );
+    if (d.exitCode !== 0) {
+      throw new VisualizerError(422, "CORRUPT_AUDIO", `"${safe}" is not a readable audio file: ${d.stderr.trim().slice(-400)}`);
+    }
+
+    const outDir = mkdtempSync(join(tmpdir(), "twio-sep-"));
+    const progressPath = join(outDir, "progress.json");
+    const poll = setInterval(() => {
+      try {
+        if (existsSync(progressPath)) {
+          const p = JSON.parse(readFileSync(progressPath, "utf8")) as { done?: number; total?: number; phase?: string };
+          if (Number.isFinite(p.done)) {
+            job.progress = { phase: "separate", done: p.done ?? 0, total: Math.max(1, p.total ?? 1), detail: p.phase ?? undefined };
+          }
+        }
+      } catch {
+        /* progress file mid-write — skip */
+      }
+    }, 400);
+    try {
+      const res = await engineClient.call<{ backend?: string; stems?: { name: string; path: string }[] }>(
+        "separate_stems",
+        { src_path: wavPath, out_dir: outDir, quality, progress_path: progressPath },
+        { signal: job.controller.signal },
+      );
+      job.progress = { phase: "verify", done: 2, total: 3, detail: "registering stems" };
+      job.backend = res.backend ?? null;
+      const stemDir = visualizerDir(projectId, "stems");
+      // The normalized song itself lands as "<song>.wav" — usable as a mix
+      // stem alongside its parts.
+      const mixName = sanitizeStemName(`${base}.wav`);
+      copyFileSync(wavPath, join(stemDir, mixName));
+      job.stems.push(mixName);
+      for (const s of res.stems ?? []) {
+        const name = sanitizeStemName(`${base} ${s.name}.wav`);
+        copyFileSync(s.path, join(stemDir, name));
+        job.stems.push(name);
+      }
+      job.progress = { phase: "verify", done: 3, total: 3, detail: "done" };
+      job.status = "done";
+    } finally {
+      clearInterval(poll);
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  })().then(
+    () => {
+      job.finishedAt = new Date().toISOString();
+      rmSync(srcPath, { force: true }); // keep the normalized wav; drop the raw upload
+    },
+    (e) => {
+      if (job.controller.signal.aborted) {
+        job.status = "cancelled";
+        job.error = { code: "SPLIT_CANCELLED", message: "Split cancelled." };
+      } else {
+        job.status = "failed";
+        const v = splitError(e);
+        job.error = { code: v.code, message: v.message };
+      }
+      job.finishedAt = new Date().toISOString();
+    },
+  );
+  return publicSplitJob(job);
+}
+
+export function getSplitJob(id: string): VizSplitJob {
+  const j = splitJobs.get(id);
+  if (!j) throw new VisualizerError(404, "SPLIT_NOT_FOUND", `Split job not found: ${id}`);
+  return publicSplitJob(j);
+}
+
+export function cancelSplitJob(id: string): VizSplitJob {
+  const j = splitJobs.get(id);
+  if (!j) throw new VisualizerError(404, "SPLIT_NOT_FOUND", `Split job not found: ${id}`);
+  if (j.status === "running") {
+    try {
+      j.controller.abort();
+    } catch {
+      /* engine teardown marks the job cancelled */
+    }
+  }
+  return publicSplitJob(j);
 }

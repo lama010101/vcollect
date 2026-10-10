@@ -278,3 +278,74 @@ export async function ensureEngine(): Promise<PythonExe> {
 export function kickEngineSetup(): void {
   void ensureEngine().catch(() => {/* surfaced via engineStatus() */});
 }
+
+// --- Separation extras (stem splitting) ----------------------------------------
+// Stem splitting keeps its own install set OUT of the base requirements: torch
+// + demucs are ~600 MB and only needed when a user asks for HQ separation.
+// Install goes into the SAME managed venv, stamped by a hash of the package
+// spec so a spec bump reinstalls exactly once.
+
+export const SEP_STAMP_PATH = join(VENV_DIR, ".sep-deps-sha256");
+const SEP_SPEC = "torch>=2.6,<3|torchaudio>=2.6,<3|demucs>=4.1,<5|cpu";
+
+export type SepSetupPhase = "idle" | "engine" | "torch" | "demucs" | "ready" | "error";
+let sepSetupState: { phase: SepSetupPhase; detail: string } = { phase: "idle", detail: "" };
+let sepSetupPromise: Promise<void> | null = null;
+
+function sepSpecHash(): string {
+  return createHash("sha256").update(SEP_SPEC).digest("hex");
+}
+
+/** Separation status — stamp file present = extras installed (lazy probe; the
+ *  real check runs in the worker via `sep_status` when a job starts). */
+export function sepStatus(): { installed: boolean; phase: SepSetupPhase; detail: string } {
+  const installed = existsSync(SEP_STAMP_PATH) && readFileSync(SEP_STAMP_PATH, "utf8") === sepSpecHash();
+  return {
+    installed,
+    phase: installed && sepSetupState.phase !== "error" ? "ready" : sepSetupState.phase,
+    detail: installed ? "separation extras installed" : sepSetupState.detail,
+  };
+}
+
+async function provisionSeparation(): Promise<void> {
+  sepSetupState = { phase: "engine", detail: "ensuring the engine venv" };
+  const venvExe = await ensureEngine(); // creates + provisions the venv first
+  if (existsSync(SEP_STAMP_PATH) && readFileSync(SEP_STAMP_PATH, "utf8") === sepSpecHash()) {
+    sepSetupState = { phase: "ready", detail: "separation extras installed" };
+    return;
+  }
+  // CPU wheels first — the default PyPI torch on Windows pulls the ~2.4 GB
+  // CUDA build; the pytorch.org CPU index gives ~190 MB. torchaudio must match.
+  sepSetupState = { phase: "torch", detail: "installing torch (CPU wheels, ~190 MB)" };
+  const t = await runPython(venvExe, [
+    "-m", "pip", "install", "--disable-pip-version-check",
+    "--index-url", "https://download.pytorch.org/whl/cpu",
+    "torch>=2.6,<3", "torchaudio>=2.6,<3",
+  ]);
+  if (t.exitCode !== 0) {
+    throw new EngineError(500, "SEP_TORCH_FAILED", `pip install torch (cpu) failed: ${(t.stderr || t.stdout).split("\n").filter(Boolean).slice(-10).join("\n").slice(-1000)}`);
+  }
+  sepSetupState = { phase: "demucs", detail: "installing demucs (~80 MB + deps)" };
+  const d = await runPython(venvExe, ["-m", "pip", "install", "--disable-pip-version-check", "demucs>=4.1,<5"]);
+  if (d.exitCode !== 0) {
+    throw new EngineError(500, "SEP_DEMUCS_FAILED", `pip install demucs failed: ${(d.stderr || d.stdout).split("\n").filter(Boolean).slice(-10).join("\n").slice(-1000)}`);
+  }
+  writeFileSync(SEP_STAMP_PATH, sepSpecHash());
+  sepSetupState = { phase: "ready", detail: "separation extras installed" };
+}
+
+export async function ensureSeparation(): Promise<void> {
+  if (!sepSetupPromise) {
+    sepSetupPromise = provisionSeparation().catch((e) => {
+      sepSetupState = { phase: "error", detail: (e as Error).message };
+      sepSetupPromise = null;
+      throw e;
+    });
+  }
+  return sepSetupPromise;
+}
+
+/** Non-blocking kick — used by POST /api/visualizer/sep-setup. */
+export function kickSeparationSetup(): void {
+  void ensureSeparation().catch(() => {/* surfaced via sepStatus() */});
+}

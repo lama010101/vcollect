@@ -129,6 +129,31 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
 
+### 2026-10-10 — Visualizer: upload a full song → engine stem separation
+
+- **"Split song → stems"** in 1. Stems — upload any audio file; a
+  `split-stems` job normalizes it to WAV (ffmpeg 44.1k stereo), then the
+  engine's `separate_stems` RPC splits it; produced parts land in the stems
+  pool as `<song> <part>.wav` (+ the `<song>.wav` mix) and auto-join the
+  render set. Progress + cancel via `GET/POST /api/visualizer/split-jobs/:id`.
+- **Two backends**: `fast` (default) = librosa HPSS masks + low-band split —
+  seconds, zero extra deps, emits honest `drums`/`bass`/`other` (no fake
+  "vocals"). `hq` ("studio") = Meta `htdemucs` via torch — adds `vocals`,
+  ~realtime on CPU.
+- **Separation extras provisioner** — `pythonService.ensureSeparation()`:
+  torch+torchaudio via the **CPU wheel index** (Windows PyPI would pull the
+  ~2.4 GB CUDA build), then `demucs`, stamped at `.venv/.sep-deps-sha256`.
+  `POST /api/visualizer/sep-setup` + `GET /sep-status`; hq without it →
+  422 `SEP_SETUP_REQUIRED` with a "set it up now" button in the UI.
+- **Engine fixes found on the way**: `_error_payload` duck-types `.code`
+  (worker runs as `__main__`, so method modules' `EngineError` is a second
+  class — isinstance never matched and every stable code degraded to
+  ENGINE_ERROR); `engineClient` `close`/`error` handlers now guard
+  `this.proc === proc` — a late `close` from a killed worker no longer
+  rejects a fresh respawn's pending calls.
+- Verified: `npm run typecheck` ✅; engine suite 7/7 ✅ (`sep_status`,
+  HPSS split on synthetic 100 Hz+clicks → bass lands correctly).
+
 ### 2026-10-10 — Visualizer: per-layer show/hide time windows
 
 - **`visibility` on every stack row** (media AND waveform):

@@ -17,6 +17,12 @@
 //   DELETE sessions/:id?project=     delete a session
 //   POST   sessions/:id/load?project=  restore its media, return the payload
 //   POST   sessions/:id/timeline?project=  build a timeline: one shot per layer/stem
+//   POST   split-stems?project=&name=&quality=  upload a full song (raw body) →
+//                                            engine separates it into stems
+//   GET    split-jobs/:id              split job progress / result
+//   POST   split-jobs/:id/cancel
+//   GET    sep-status                  HQ separation setup state
+//   POST   sep-setup                   install torch-cpu + demucs (~600 MB)
 // =============================================================================
 
 import type { FastifyInstance } from "fastify";
@@ -25,21 +31,26 @@ import { basename, join } from "node:path";
 import { DEFAULT_PROJECT_ID, visualizerRenderSchema, vizSessionSaveSchema, vizSessionUpdateSchema, vizVideoKeySchema } from "@twio/shared";
 import { getAsset } from "../db/repository.js";
 import { VisualizerError } from "../visualizer/errors.js";
+import { kickSeparationSetup, sepStatus } from "../python/pythonService.js";
 import { cancelKeyJob, getKeyJob, startKeyJob } from "../visualizer/keying.js";
 import { deleteSession, getSession, listSessions, loadSession, saveSession, sessionToTimeline, updateSession } from "../visualizer/sessions.js";
 import { stemSignalPayload, stemSignalPhase } from "../visualizer/signals.js";
 import { assetAbsolutePath, revealInExplorer } from "./folders.js";
 import {
   cancelRenderJob,
+  cancelSplitJob,
   deleteStem,
   getRenderJob,
+  getSplitJob,
   listRenders,
   listStems,
   MAX_SONG_BYTES,
   saveStem,
   startRenderJob,
+  startSplitJob,
   stemPath,
   visualizerDir,
+  type VizSplitQuality,
 } from "../visualizer/service.js";
 
 function projectOf(query: unknown): string {
@@ -62,6 +73,18 @@ export async function registerVisualizerRoutes(app: FastifyInstance): Promise<vo
         throw new VisualizerError(400, "MISSING_AUDIO", "Upload the stem as the raw request body (Content-Type: application/octet-stream).");
       }
       return { stem: await saveStem(projectOf(req.query), name, req.body) };
+    });
+
+    // Upload a full song → the engine separates it into stems (lands in the
+    // stems pool as "<song> <part>.wav" + the normalized "<song>.wav" mix).
+    scope.post("/api/visualizer/split-stems", async (req) => {
+      const q = req.query as Record<string, unknown>;
+      const name = String(q.name ?? "");
+      const quality = q.quality === "hq" ? "hq" : "fast";
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        throw new VisualizerError(400, "MISSING_AUDIO", "Upload the song as the raw request body (Content-Type: application/octet-stream).");
+      }
+      return { job: await startSplitJob(projectOf(req.query), name, req.body, quality as VizSplitQuality) };
     });
   });
 
@@ -100,6 +123,20 @@ export async function registerVisualizerRoutes(app: FastifyInstance): Promise<vo
   app.post("/api/visualizer/render/:id/cancel", async (req) => ({ job: cancelRenderJob((req.params as { id: string }).id) }));
 
   app.get("/api/visualizer/renders", async (req) => ({ renders: listRenders(projectOf(req.query)) }));
+
+  // Split-job polling + cancellation (one at a time — the worker serializes).
+  app.get("/api/visualizer/split-jobs/:id", async (req) => ({ job: getSplitJob((req.params as { id: string }).id) }));
+
+  app.post("/api/visualizer/split-jobs/:id/cancel", async (req) => ({ job: cancelSplitJob((req.params as { id: string }).id) }));
+
+  // HQ separation extras — the stamp file says installed; setup installs
+  // torch-cpu + demucs into the engine venv in the background.
+  app.get("/api/visualizer/sep-status", async () => ({ sep: sepStatus() }));
+
+  app.post("/api/visualizer/sep-setup", async () => {
+    kickSeparationSetup();
+    return { sep: sepStatus() };
+  });
 
   // AI cutout ("keyed") WebM generation — idempotent: a cached build for the
   // same (asset, key params) returns a finished job immediately.

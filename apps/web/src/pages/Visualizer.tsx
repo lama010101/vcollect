@@ -48,6 +48,8 @@ import {
   type VizKeyJob,
   type VizRenderJob,
   type VizRenderedFile,
+  type VizSepStatus,
+  type VizSplitJob,
   type VizStem,
 } from "../api.js";
 import { Badge, Button, Card, EmptyState, ProgressBar, Spinner } from "../components/ui.js";
@@ -983,6 +985,11 @@ export function Visualizer({
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  // Song → stems separation (engine-backed job; stems land in the pool).
+  const splitFileRef = useRef<HTMLInputElement>(null);
+  const [splitQuality, setSplitQuality] = useState<"fast" | "hq">("fast");
+  const [splitJob, setSplitJob] = useState<VizSplitJob | null>(null);
+  const [sep, setSep] = useState<VizSepStatus | null>(null);
 
   // Sessions — named server-side snapshots of the whole setup + media.
   const [sessions, setSessions] = useState<VizSessionMeta[]>([]);
@@ -1087,6 +1094,19 @@ export function Visualizer({
     const t = setInterval(refreshEngine, 2000);
     return () => clearInterval(t);
   }, [engine, refreshEngine]);
+
+  // Separation extras status — once on mount, then only while installing.
+  const refreshSep = useCallback(() => {
+    api.vizSepStatus().then((r) => setSep(r.sep)).catch(() => {});
+  }, []);
+  useEffect(() => {
+    refreshSep();
+  }, [refreshSep]);
+  useEffect(() => {
+    if (!sep || sep.installed || sep.phase === "idle" || sep.phase === "error") return;
+    const t = setInterval(refreshSep, 2500);
+    return () => clearInterval(t);
+  }, [sep, refreshSep]);
 
   // Restore session for this project + load stems/renders.
   useEffect(() => {
@@ -1651,6 +1671,48 @@ export function Visualizer({
       if (fileRef.current) fileRef.current.value = "";
     }
   };
+
+  /** Upload a full song → the engine splits it into stems (a split job). */
+  const splitSong = async (f: File | null | undefined) => {
+    if (!f) return;
+    setError(null);
+    try {
+      const r = await api.vizSplitStems(projectId, f, splitQuality);
+      setSplitJob(r.job);
+    } catch (e) {
+      setError((e as Error).message);
+      refreshSep(); // SEP_SETUP_REQUIRED may surface here — re-check install state
+    } finally {
+      if (splitFileRef.current) splitFileRef.current.value = "";
+    }
+  };
+
+  // Poll the running split job — on done the new stems land in the pool and
+  // auto-join the render set (that's the whole point of splitting).
+  useEffect(() => {
+    if (!splitJob || splitJob.status !== "running") return;
+    const t = setInterval(() => {
+      api
+        .vizSplitJob(splitJob.id)
+        .then((r) => {
+          setSplitJob(r.job);
+          if (r.job.status === "done") {
+            onToast(`Separated into ${r.job.stems.length} stem${r.job.stems.length === 1 ? "" : "s"}`, "success");
+            void loadStems().then(() => {
+              setStemInputs((cur) => [
+                ...cur,
+                ...r.job.stems.filter((n) => !cur.some((s) => s.name === n)).map((n) => ({ name: n, muted: false, solo: false }) satisfies VisualizerStemInput),
+              ]);
+              setSignalsReady((n) => n + 1);
+            });
+          } else if (r.job.status === "failed") {
+            onToast(`Split failed: ${r.job.error?.message ?? "unknown error"}`, "error");
+          }
+        })
+        .catch(() => {});
+    }, 700);
+    return () => clearInterval(t);
+  }, [splitJob, loadStems, onToast, refreshSep]);
 
   const patchStem = (name: string, patch: Partial<VisualizerStemInput>) =>
     setStemInputs((cur) => cur.map((s) => (s.name === name ? { ...s, ...patch } : s)));
@@ -2774,9 +2836,85 @@ export function Visualizer({
             <Button size="sm" onClick={() => fileRef.current?.click()} disabled={uploading}>
               {uploading ? "Uploading…" : "Upload stems"}
             </Button>
+            <input
+              ref={splitFileRef}
+              type="file"
+              accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus"
+              className="hidden"
+              onChange={(e) => void splitSong(e.target.files?.[0])}
+            />
+            <span className="flex items-center gap-1">
+              <select
+                className="ui-input !w-auto !px-1.5 !py-1 text-xs"
+                value={splitQuality}
+                onChange={(e) => setSplitQuality(e.target.value as "fast" | "hq")}
+                title="Separation quality — fast: instant spectral split (drums/bass/other); studio: demucs AI model (adds vocals — needs a one-time ~600 MB install)"
+              >
+                <option value="fast">fast</option>
+                <option value="hq">studio</option>
+              </select>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => splitFileRef.current?.click()}
+                disabled={splitJob?.status === "running"}
+                title="Upload a full song — the engine separates it into stems automatically"
+              >
+                Split song → stems
+              </Button>
+            </span>
           </>
         }
       >
+        {splitJob && (
+          <div className="mb-3 rounded-lg border border-slate-700/60 bg-slate-900/50 px-3 py-2 space-y-1.5">
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-slate-300">Separating song</span>
+              <Badge tone={splitJob.quality === "hq" ? "violet" : "info"}>{splitJob.backend ?? splitJob.quality}</Badge>
+              {splitJob.status === "running" && <Spinner className="w-3 h-3" />}
+              <span className="flex-1" />
+              {splitJob.status === "running" ? (
+                <button className="text-slate-400 hover:text-rose-400" onClick={() => void api.vizCancelSplit(splitJob.id).then((r) => setSplitJob(r.job)).catch(() => {})}>
+                  cancel
+                </button>
+              ) : (
+                <button className="text-slate-500 hover:text-slate-300" onClick={() => setSplitJob(null)} title="Dismiss">
+                  ×
+                </button>
+              )}
+            </div>
+            {splitJob.status === "running" && (
+              <>
+                <ProgressBar value={splitJob.progress.done} max={Math.max(1, splitJob.progress.total)} height="h-1" />
+                <div className="text-[11px] text-slate-500">
+                  {splitJob.progress.phase}
+                  {splitJob.progress.detail ? ` — ${splitJob.progress.detail}` : ""} ({splitJob.progress.done}/{splitJob.progress.total})
+                </div>
+              </>
+            )}
+            {splitJob.status === "done" && (
+              <div className="text-[11px] text-emerald-400">
+                ✔ {splitJob.stems.length} stems added ({splitJob.backend}) — they're in the render set
+              </div>
+            )}
+            {splitJob.status === "failed" && (
+              <div className="text-[11px] text-rose-400">
+                ✖ {splitJob.error?.message}
+                {splitJob.error?.code === "SEP_SETUP_REQUIRED" && !sep?.installed && (
+                  <button className="ml-2 underline hover:text-rose-300" onClick={() => void api.vizSepSetup().then((r) => setSep(r.sep)).catch(() => {})}>
+                    set it up now (~600 MB)
+                  </button>
+                )}
+              </div>
+            )}
+            {splitJob.status === "cancelled" && <div className="text-[11px] text-slate-500">cancelled</div>}
+          </div>
+        )}
+        {sep && !sep.installed && sep.phase !== "idle" && sep.phase !== "error" && (
+          <div className="mb-3 rounded border border-sky-800/50 bg-sky-950/30 px-3 py-1.5 text-[11px] text-sky-300">
+            Installing studio separation — {sep.detail}…
+          </div>
+        )}
         <div className="grid md:grid-cols-2 gap-4">
           <div className="space-y-1">
             <div className="flex items-center justify-between text-xs text-slate-400 pb-1">

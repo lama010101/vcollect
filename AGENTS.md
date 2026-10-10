@@ -302,6 +302,17 @@
   primary beat engine — librosa only enriches. Deps: numpy, scipy,
   librosa, soundfile, opencv-python-headless, onnxruntime (MODNet cutout;
   pinned in `requirements.txt`; MoviePy deliberately excluded).
+  **Stem separation** (`twio_engine/separate.py`, `separate_stems` RPC):
+  `fast` = librosa HPSS+low-band → drums/bass/other (no fake vocals);
+  `hq` = demucs `htdemucs` (torch CPU) → +vocals. The demucs/torch extras
+  install on demand via `ensureSeparation()` (torch from the pytorch.org
+  **CPU** index — PyPI Windows wheels are the ~2.4 GB CUDA build), stamped
+  `.venv/.sep-deps-sha256`; routes `POST /api/visualizer/split-stems`
+  (raw-body upload → job → stems pool), `GET/POST .../split-jobs/:id`,
+  `GET/POST .../sep-status|sep-setup`. Worker error codes are duck-typed
+  via `.code` (the worker runs as `__main__` so method modules' EngineError
+  is a separate class — never isinstance-check it); `engineClient` teardown
+  ignores `close`/`error` from superseded processes.
 
 - **World Cam (InSpatio-World camera-path re-render):** `apps/server/src/world/`
   + `routes/world.ts` (`/api/world/*`); UI: `pages/WorldCam.tsx`. The 1.3B
