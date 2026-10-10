@@ -6,7 +6,7 @@
 // Emit order: mode visuals (rings/bars/particles/mirrors/blocks/ribbons) → dancer → star.
 // =============================================================================
 
-import type { VizFrameState } from "@twio/shared";
+import { visualsForRow, type VizFrameState, type VizModeVisuals } from "@twio/shared";
 
 const f = (n: number): string => (Math.round(n * 10) / 10).toString();
 
@@ -97,13 +97,14 @@ function layerImageTag(href: string, opacity: number, scale: number, width: numb
   return `<image href="${href}" xlink:href="${href}" x="${f(x)}" y="${f(y)}" width="${f(dw)}" height="${f(dh)}" preserveAspectRatio="none" opacity="${f(opacity)}"/>`;
 }
 
-/** Every mode visual (ribbons/rings/bars/particles/mirrors/blocks/eqbars/
- *  eqradial/stereos/silk) pushed into `parts` — extracted from frameSvg so the
- *  visuals can sit at any row of the layer stack (wrapped in the row's
- *  opacity/scale <g>). */
-function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
+/** One waveform layer's primitives (ribbons/rings/bars/particles/mirrors/
+ *  blocks/eqbars/eqradial/stereos/silk) pushed into `parts` — extracted from
+ *  frameSvg so each visuals row can draw its OWN mode geometry at its stack
+ *  position (wrapped in the row's opacity/scale <g>). `gradPrefix` namespaces
+ *  the silk gradient ids so several silk layers don't collide in one doc. */
+function modeVisualsSvg(vis: VizModeVisuals, parts: string[], gradPrefix: string): void {
   // --- ribbons mode --------------------------------------------------------------
-  for (const s of state.stems) {
+  for (const s of vis.stems) {
     if (s.glowWidth > 0 && s.glowAlpha > 0.01) {
       const d = linePath(s.centerline);
       if (d) {
@@ -123,7 +124,7 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
   }
 
   // --- circular mode ----------------------------------------------------------------
-  for (const r of state.rings) {
+  for (const r of vis.rings) {
     const d = polyPath(r.points);
     if (!d) continue;
     if (r.glowWidth > 0 && r.glowAlpha > 0.01) {
@@ -133,7 +134,7 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
   }
 
   // --- spectrum mode ------------------------------------------------------------------
-  for (const g of state.bars) {
+  for (const g of vis.bars) {
     const d = rectsPath(g.bars);
     if (!d) continue;
     if (g.glowAlpha > 0.01) {
@@ -143,13 +144,13 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
   }
 
   // --- particles mode -------------------------------------------------------------------
-  for (const g of state.particles) {
+  for (const g of vis.particles) {
     const d = circlesPath(g.points);
     if (d) parts.push(`<path d="${d}" fill="${g.color}" opacity="${f(g.alpha)}"/>`);
   }
 
   // --- mirror mode (mirrored waveforms on the center axis) -------------------------------
-  for (const m of state.mirrors) {
+  for (const m of vis.mirrors) {
     const d = polyPath(m.fill);
     if (d) {
       if (m.glowWidth > 0 && m.glowAlpha > 0.01) {
@@ -167,7 +168,7 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
   }
 
   // --- blocks mode (segmented mirrored columns, x-slice per stem) -------------------------
-  for (const g of state.blocks) {
+  for (const g of vis.blocks) {
     const d = rectsPath(g.rects);
     if (d) {
       if (g.glowAlpha > 0.01) {
@@ -181,7 +182,7 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
 
   // --- eqbars mode (segmented mirrored LED columns, glowing tips + sparks) -------
   const EQ_BUCKETS = 5;
-  for (const g of state.eqbars) {
+  for (const g of vis.eqbars) {
     // Segments carry a per-seg brightness (stride 5) — bucket them into one
     // path per brightness level so the column ramp renders with few nodes.
     const buckets: number[][] = Array.from({ length: EQ_BUCKETS }, () => []);
@@ -210,7 +211,7 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
   }
 
   // --- eqradial mode (radial LED columns around the center, tips + sparks) --
-  for (const g of state.eqradial) {
+  for (const g of vis.eqradial) {
     // Stride-9 segments (quad + brightness) — bucket into one path per
     // brightness level like the linear eqbars columns.
     const buckets: number[][] = Array.from({ length: EQ_BUCKETS }, () => []);
@@ -242,7 +243,7 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
   }
 
   // --- stereo mode (channel waveforms meeting along the vertical center line) --
-  for (const s of state.stereos) {
+  for (const s of vis.stereos) {
     for (const fill of [s.leftFill, s.rightFill]) {
       const d = polyPath(fill);
       if (!d) continue;
@@ -261,12 +262,12 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
   // --- silk mode (nested mirrored waveform strands, spectral x-gradient) ------
   // Each stem's strand pack strokes through a userSpace linear gradient: the
   // violet→cyan / amber→magenta sweep, hot toward the convergence point.
-  if (state.silks.length > 0) {
+  if (vis.silks.length > 0) {
     const defs: string[] = [];
-    for (let si = 0; si < state.silks.length; si++) {
-      const s = state.silks[si]!;
+    for (let si = 0; si < vis.silks.length; si++) {
+      const s = vis.silks[si]!;
       defs.push(
-        `<linearGradient id="silk${si}" gradientUnits="userSpaceOnUse" x1="${f(s.gradX0)}" y1="0" x2="${f(s.gradX1)}" y2="0">` +
+        `<linearGradient id="${gradPrefix}silk${si}" gradientUnits="userSpaceOnUse" x1="${f(s.gradX0)}" y1="0" x2="${f(s.gradX1)}" y2="0">` +
           `<stop offset="0%" stop-color="${s.grad0}"/>` +
           `<stop offset="${f(s.gradMid * 100)}%" stop-color="${s.grad1}"/>` +
           `<stop offset="100%" stop-color="${s.grad2}"/>` +
@@ -274,9 +275,9 @@ function modeVisualsSvg(state: VizFrameState, parts: string[]): void {
       );
     }
     parts.push(`<defs>${defs.join("")}</defs>`);
-    for (let si = 0; si < state.silks.length; si++) {
-      const s = state.silks[si]!;
-      const stroke = `url(#silk${si})`;
+    for (let si = 0; si < vis.silks.length; si++) {
+      const s = vis.silks[si]!;
+      const stroke = `url(#${gradPrefix}silk${si})`;
       const d = strandsPath(s.up, s.strandCount, s.strandN) + strandsPath(s.down, s.strandCount, s.strandN);
       if (d) {
         if (s.glowWidth > 0 && s.glowAlpha > 0.01) {
@@ -311,15 +312,15 @@ export function frameSvg(state: VizFrameState, width: number, height: number, ba
   ];
 
   // The layer stack — row order is the z-order, composited over the
-  // background. Media rows embed their decoded frame; a visuals row draws the
-  // whole mode-visual set at that position (wrapped in the row's opacity/scale
-  // <g>). With no visuals row the waveforms don't render at all. The dancer +
-  // convergence star always ride on top of the stack.
+  // background. Media rows embed their decoded frame; a visuals row draws ITS
+  // OWN mode geometry (that row's channel) at that position (wrapped in the
+  // row's opacity/scale <g>). With no visuals row the waveforms don't render
+  // at all. The dancer + convergence star always ride on top of the stack.
   state.videoLayers.forEach((v, i) => {
-    if (v.hidden || v.opacity <= 0) return;
+    if (v.hidden || v.visible === false || v.opacity <= 0) return;
     if (v.kind === "visuals") {
       const inner: string[] = [];
-      modeVisualsSvg(state, inner);
+      modeVisualsSvg(visualsForRow(state, i), inner, `l${i}_`);
       if (inner.length === 0) return;
       // Scale about the row's own center — which x/y move off the frame
       // center (translate-to-center → scale → translate-back).

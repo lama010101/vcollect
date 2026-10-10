@@ -151,13 +151,26 @@
   `[u32 metaLen][meta JSON][peaks][env][bands][featEnv][onsetEnv]` payload
   the preview decodes into `StemSignal`. Errors are `VisualizerError`.
   Tests: `apps/server/test/visualizer.node.test.ts`.
+  `renderSettings.draft` (optional) switches `encodeArgs` to
+  `-preset ultrafast -crf 30` and tags the output `viz-draft-…` — the UI's
+  "⚡ Draft" button pairs it with ~480px dims + 12 fps for a fast first
+  look. `VizRenderProgress.detail` carries human-readable job info (stem
+  name / layer N / encode fps) that the UI writes into a rolling log;
+  phases weight one shared progress bar client-side
+  (`RENDER_PHASE_SPAN`).
 
   **Layer stack (compositing):** `globalVisuals.video.layers` is a
   bottom→top stack of up to `VIZ_MAX_VIDEO_LAYERS` (10)
   `VizMediaLayerConfig`s — a discriminated union: media rows
   `{kind:"media", assetId, hidden, x, y, opacity, scale, key}` for downloaded videos AND
-  images, plus the visuals row `{kind:"visuals", hidden, x, y, opacity, scale}` which
-  draws the whole "2. Look" mode-visual set at its stack position. **Row
+  images, plus visuals rows `{kind:"visuals", hidden, x, y, opacity, scale, visuals?}`.
+  **Several visuals rows may coexist** — each draws its own mode geometry at
+  its stack position: `row.visuals` is a complete `VizWaveParams`
+  (`vizWaveParamsSchema`: mode + waveformLengthSec + globalAmplitude +
+  glowIntensity/autoGlow + autoCenter + innerRadius + layout +
+  centerConvergence — i.e. the whole "2. Look" control set minus
+  background/video/dancer); absent `visuals`, the row inherits the global
+  look (what old configs and the default row do). **Row
   order is the only z-order** (row N-1 sits under row N) and **only listed
   rows draw** — no `kind:"visuals"` row means no waveforms at all. The UI
   lists the stack **top-first** (row 1 = top layer, like a Layers panel)
@@ -172,7 +185,22 @@
   point — the raster is still cover-cropped to frame aspect, so <1 =
   inset, >1 = zoom clipped by the viewBox (visuals rows get a
   `translate(cx cy) scale(s) translate(-w/2 -h/2)` `<g transform>` /
-  offscreen-canvas equivalent).
+  offscreen-canvas equivalent). Media rows also carry `zoomPan`
+  (`vizZoomPanSchema`: zoom 1–16 + panX/panY 0–1) — WHICH PART of the
+  source fills the tile: `zoomPanRect` shrinks the cover-fit window by
+  zoom and slides it across the free slack, so defaults reproduce the
+  old centered cover-fit and pan no-ops where nothing is hidden. The
+  video decoder crops the rect in native space
+  (`fps,crop=w:h:x:y,scale`) using probed ORIENTED dims
+  (`probe().rotation` swaps w/h on 90|270); images use
+  `sharp().rotate().extract().resize()`; keyed WebMs keep source dims.
+  Without dims the decoder falls back to `scale=increase,crop`.
+  Every row also carries `visibility` (`vizVisibilitySchema`:
+  `{show: [{start,end}], hide: [{start,end}]}` seconds windows) —
+  `visibleAt()` evaluates them per t into `state.videoLayers[].visible`;
+  show restricts, hide subtracts, both empty = always visible. A row
+  draws iff `!hidden && visible`; windowed media keeps decoding (its
+  show windows need frames), only manual `hidden` skips the decoder.
   Backwards compatibility on schema parse: a missing `layers` key
   defaults to a lone visuals row (old configs kept waveforms); the legacy
   flat `{assetId, layer, opacity, key/chromaKey}` config folds to
@@ -184,6 +212,18 @@
   decoder pipe per video row (`sharp` one-shot decode for images; visuals
   rows are aligned no-op placeholders) — both draw the same
   `state.videoLayers` ordering via `modeVisualsSvg`/`drawVisuals`.
+  **Per-row channels:** `computeFrame` emits `visualChannels` — one
+  `VizModeVisuals` per visuals row (`rowIndex` into `videoLayers`), each
+  computed with that row's `visuals ?? globals` params, its own beat center
+  (autoCenter is per-row) and its own autoGlow roll (channel-index-salted
+  hash, channel 0 = the historic value). The flat `state.stems/rings/…`
+  arrays remain = the FIRST row's channel (single-row callers unchanged);
+  renderers resolve each row via `visualsForRow(state, i)`. Silk gradient
+  ids are namespaced per row (`l<i>_silk<n>`) so stacked silk layers don't
+  collide. `VisualizerGlobals` = `vizWaveParamsSchema` + background/video/
+  dancer — a superset that drops into any `VizWaveParams` slot
+  (`waveParamsFromGlobals` clones it for stamping new rows). The
+  ENGINE_REQUIRED gate counts any row whose effective mode is `spectrum`.
 
   **Layer background removal:** each layer's `key`
   (`VizVideoKeyConfig`) replaces the deprecated `chromaKey` field — old
@@ -217,6 +257,33 @@
   `globalVisuals.dancer`; styles `neon` (glow strokes) / `silhouette`
   (fills only). The dancer stands at the convergence point and is drawn by
   the same frame state in both Canvas preview and SVG export.
+
+- **Sessions (`visualizer/sessions.ts`):** named, restorable snapshots of
+  the whole page state — `visualizerSessionPayloadSchema` (render schema
+  minus the ≥1-stem rule) stored as `session.json` under
+  `OUTPUT_ROOT/<slug>/visualizer/sessions/<id>/` alongside `stems/` (real
+  copies — stem uploads overwrite in place, links would share mutations)
+  and `media/` (hardlink→copy snapshots; asset files are immutable).
+  `POST /api/visualizer/sessions/:id/load` restores media BEFORE returning
+  the payload: differing/missing stems are copied back into the shared
+  pool, and deleted layer-asset files are restored under
+  `assets/visualizer-sessions/` + re-registered via `syncProjectAssets`
+  (layer `assetId`s remap to the content-addressed
+  `LOCAL_<project>_<sha16>` id — a restored LOCAL_ asset gets its original
+  id back). Unrestorable layers keep their row + return warnings. CRUD:
+  `GET/POST sessions`, `GET/PUT/DELETE sessions/:id`. UI: the "Sessions"
+  section at the top of `Visualizer.tsx`; load reuses `normalizePersisted`
+  (same layer-migration path as the localStorage autosave). Tests:
+  `apps/server/test/visualizer-sessions.node.test.ts`.
+  `POST sessions/:id/timeline` (`sessionToTimeline`) materializes the
+  session as a real timeline + shots (used by the Timeline page's
+  "Visualizer session" picker): one shot per layer-stack row under
+  `VIZ_STACK` (top layer first), one per stem under `STEMS`, all spanning
+  t=0→duration (layers take the probed mix length, stems their own
+  duration; fallback = longest media asset then 10 s). Media shots link
+  their asset via `shot_assets` (selected + on_rail + `reference_image_url`
+  thumb) so the rail/filmstrip shows the right clip; missing assets just
+  skip the link — session load (not this route) is what restores media.
 
 - **Python engine (optional, managed):** `apps/server/python/twio_engine/`
   is a persistent NDJSON-RPC worker (stdin/stdout) spawned by

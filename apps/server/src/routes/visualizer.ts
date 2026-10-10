@@ -10,15 +10,23 @@
 //   POST   video-key?project=        { assetId, key } → engine-baked keyed WebM
 //   GET    video-key/:id             keying job progress / result
 //   POST   video-key/:id/cancel
+//   GET    sessions?project=         list saved sessions (metadata)
+//   POST   sessions?project=         { name, payload } → create + snapshot media
+//   GET    sessions/:id?project=     read one session (with payload)
+//   PUT    sessions/:id?project=     { name?, payload? } rename / overwrite
+//   DELETE sessions/:id?project=     delete a session
+//   POST   sessions/:id/load?project=  restore its media, return the payload
+//   POST   sessions/:id/timeline?project=  build a timeline: one shot per layer/stem
 // =============================================================================
 
 import type { FastifyInstance } from "fastify";
 import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
-import { DEFAULT_PROJECT_ID, visualizerRenderSchema, vizVideoKeySchema } from "@twio/shared";
+import { DEFAULT_PROJECT_ID, visualizerRenderSchema, vizSessionSaveSchema, vizSessionUpdateSchema, vizVideoKeySchema } from "@twio/shared";
 import { getAsset } from "../db/repository.js";
 import { VisualizerError } from "../visualizer/errors.js";
 import { cancelKeyJob, getKeyJob, startKeyJob } from "../visualizer/keying.js";
+import { deleteSession, getSession, listSessions, loadSession, saveSession, sessionToTimeline, updateSession } from "../visualizer/sessions.js";
 import { stemSignalPayload, stemSignalPhase } from "../visualizer/signals.js";
 import { assetAbsolutePath, revealInExplorer } from "./folders.js";
 import {
@@ -130,4 +138,43 @@ export async function registerVisualizerRoutes(app: FastifyInstance): Promise<vo
     const dir = visualizerDir(projectOf(req.query), "renders");
     return revealInExplorer(name ? join(dir, basename(name)) : dir);
   });
+
+  // --- Sessions (named setups — save/restore settings AND media) ---------------
+  app.get("/api/visualizer/sessions", async (req) => ({ sessions: listSessions(projectOf(req.query)) }));
+
+  app.post("/api/visualizer/sessions", async (req) => {
+    const r = vizSessionSaveSchema.safeParse(req.body);
+    if (!r.success) throw new VisualizerError(400, "INVALID_REQUEST", r.error.message);
+    return { session: await saveSession(projectOf(req.query), r.data.name, r.data.payload) };
+  });
+
+  app.get("/api/visualizer/sessions/:id", async (req) => ({
+    session: getSession(projectOf(req.query), (req.params as { id: string }).id),
+  }));
+
+  app.put("/api/visualizer/sessions/:id", async (req) => {
+    const r = vizSessionUpdateSchema.safeParse(req.body);
+    if (!r.success) throw new VisualizerError(400, "INVALID_REQUEST", r.error.message);
+    return { session: await updateSession(projectOf(req.query), (req.params as { id: string }).id, r.data) };
+  });
+
+  app.delete("/api/visualizer/sessions/:id", async (req) => {
+    const id = (req.params as { id: string }).id;
+    deleteSession(projectOf(req.query), id);
+    return { ok: true, id };
+  });
+
+  // Restores the session's media (stems copied back into the pool, deleted
+  // layer files re-registered as local assets) and returns the payload for
+  // the client to apply.
+  app.post("/api/visualizer/sessions/:id/load", async (req) =>
+    loadSession(projectOf(req.query), (req.params as { id: string }).id),
+  );
+
+  // Builds a real timeline from the session — one shot per layer-stack row
+  // (top→bottom) plus one per stem — so the setup appears on the Timeline
+  // page. Media shots get their asset linked onto the shot rail.
+  app.post("/api/visualizer/sessions/:id/timeline", async (req) =>
+    sessionToTimeline(projectOf(req.query), (req.params as { id: string }).id),
+  );
 }

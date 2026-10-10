@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
+import type { VizSessionMeta } from "@twio/shared";
 import { api, type Shot, type TaskStatus, type Timeline, type TimelineCandidate, type TimelineFetchProgress } from "../api.js";
 import { Button, Badge, EmptyState, Tray, Modal } from "../components/ui.js";
 
@@ -54,6 +55,11 @@ export function TimelinePage({ onOpenShot, projectId }: { onOpenShot: (id: strin
   const [playIndex, setPlayIndex] = useState(0);
   // Download-task status per candidate asset id (kept clips downloading).
   const [dlTasks, setDlTasks] = useState<Map<string, TaskStatus>>(new Map());
+  // "Load Visualizer session" — builds a timeline whose shots are the
+  // session's layer stack + stems.
+  const [vizSessions, setVizSessions] = useState<VizSessionMeta[]>([]);
+  const [vizSel, setVizSel] = useState("");
+  const [vizLoading, setVizLoading] = useState(false);
   const fetchPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const taskPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const shotsRef = useRef<Shot[]>([]);
@@ -82,6 +88,8 @@ export function TimelinePage({ onOpenShot, projectId }: { onOpenShot: (id: strin
     setSelectedId(null);
     setFirstSelected(new Map());
     setSelShotId(null);
+    setVizSessions([]);
+    setVizSel("");
   }
 
   const loadTimelines = useCallback(async () => {
@@ -107,6 +115,38 @@ export function TimelinePage({ onOpenShot, projectId }: { onOpenShot: (id: strin
   useEffect(() => {
     if (selectedId) localStorage.setItem(`twio.selectedTimeline.${projectId}`, selectedId);
   }, [selectedId, projectId]);
+
+  // The visualizer-session picker — refetch on mount + project switch.
+  useEffect(() => {
+    let live = true;
+    api
+      .vizSessions(projectId)
+      .then((r) => {
+        if (!live) return;
+        setVizSessions(r.sessions);
+        setVizSel((cur) => (r.sessions.some((s) => s.id === cur) ? cur : (r.sessions[0]?.id ?? "")));
+      })
+      .catch(() => {}); // sessions are optional — keep the picker empty
+    return () => {
+      live = false;
+    };
+  }, [projectId]);
+
+  /** Builds a real timeline from the chosen visualizer session — one shot
+   *  per layer-stack row (top→bottom) plus one per stem — then selects it. */
+  async function loadVizSession() {
+    if (!vizSel) return;
+    setVizLoading(true);
+    try {
+      const r = await api.vizSessionToTimeline(projectId, vizSel);
+      await loadTimelines();
+      setSelectedId(r.timelineId);
+    } catch (e) {
+      setError(`Visualizer session failed: ${(e as Error).message}`);
+    } finally {
+      setVizLoading(false);
+    }
+  }
 
   const loadShots = useCallback(async () => {
     if (!selectedId) { setShots([]); return; }
@@ -351,6 +391,31 @@ export function TimelinePage({ onOpenShot, projectId }: { onOpenShot: (id: strin
             className="ui-input flex-1 text-sm"
           />
           <Button variant="primary" size="sm" onClick={createTimeline}>Add</Button>
+        </div>
+        {/* Import a saved visualizer setup — each layer-stack row + stem
+            becomes a shot on a new "Viz — <name>" timeline. */}
+        <div className="mt-3 pt-3 border-t border-slate-800 space-y-1.5">
+          <label className="block text-[10px] font-semibold uppercase tracking-wide text-slate-500">Visualizer session</label>
+          {vizSessions.length === 0 ? (
+            <p className="text-[11px] text-slate-600">No sessions — save one on the Visualizer page.</p>
+          ) : (
+            <div className="flex gap-2">
+              <select value={vizSel} onChange={(e) => setVizSel(e.target.value)} className="ui-input flex-1 text-xs min-w-0">
+                {vizSessions.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={!vizSel || vizLoading}
+                onClick={() => void loadVizSession()}
+                title="Build a timeline whose shots are this session's layers + stems"
+              >
+                {vizLoading ? "…" : "Load"}
+              </Button>
+            </div>
+          )}
         </div>
         {unassignedCount > 0 && (
           <p className="text-xs text-slate-500 mt-3">{unassignedCount} shot(s) not assigned to any timeline.</p>

@@ -176,6 +176,132 @@ function foldChromaKey<T extends { chromaKey?: VizChromaKeyConfig; key: VizVideo
   return { ...rest, key };
 }
 
+/** The per-visual parameter set — mode + its knobs. `VisualizerGlobals`
+ *  embeds these fields as the base look; a `kind:"visuals"` layer row may
+ *  also carry its own complete copy (`visuals`), so several waveform layers
+ *  can stack with different modes and settings. */
+export const vizWaveParamsSchema = z.object({
+  mode: vizModeSchema.default("ribbons"),
+  waveformLengthSec: z.number().min(0.1).max(2).default(0.5),
+  globalAmplitude: z.number().min(0.1).max(3).default(1),
+  glowIntensity: z.number().min(0).max(40).default(14),
+  /** Beat-randomized glow: when enabled, `glowIntensity` is overridden per
+   *  beat cell by a deterministic hash → random value in [min,max]. */
+  autoGlow: z
+    .object({
+      enabled: z.boolean().default(false),
+      min: z.number().min(0).max(40).default(4),
+      max: z.number().min(0).max(40).default(24),
+    })
+    .default({}),
+  /** Beat-synced wandering center: when enabled, `centerConvergence.x/y`
+   *  are overridden by a deterministic per-beat position that eases toward
+   *  a new spot at every beat. */
+  autoCenter: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Max deviation from the frame midpoint, fraction of the axis (0..0.35). */
+      range: z.number().min(0).max(0.35).default(0.18),
+    })
+    .default({}),
+  /** `eqradial` hub radius as a fraction of min(w,h); 0 = bars start at
+   *  the exact center point. */
+  innerRadius: z.number().min(0).max(0.5).default(0.12),
+  layout: vizLayoutSchema.default("radial"),
+  centerConvergence: z
+    .object({
+      x: z.number().min(0).max(1).default(0.5),
+      y: z.number().min(0).max(1).default(0.5),
+      pulseSensitivity: z.number().min(0).max(2).default(0.8),
+    })
+    .default({}),
+});
+export type VizWaveParams = z.infer<typeof vizWaveParamsSchema>;
+
+/** A wave-params object's own standalone copy — used to stamp a waveform
+ *  layer with the current settings so it can be tweaked independently.
+ *  `VisualizerGlobals` is a superset and drops in directly. */
+export function waveParamsFromGlobals(g: VizWaveParams): VizWaveParams {
+  return {
+    mode: g.mode,
+    waveformLengthSec: g.waveformLengthSec,
+    globalAmplitude: g.globalAmplitude,
+    glowIntensity: g.glowIntensity,
+    autoGlow: { ...g.autoGlow },
+    autoCenter: { ...g.autoCenter },
+    innerRadius: g.innerRadius,
+    layout: g.layout,
+    centerConvergence: { ...g.centerConvergence },
+  };
+}
+
+/** A [start,end) window in seconds over the mix timeline — several per layer. */
+export const vizTimeWindowSchema = z
+  .object({
+    /** Seconds from mix start (≥0). */
+    start: z.number().min(0),
+    /** Seconds — must be > start. */
+    end: z.number().min(0),
+  })
+  .refine((w) => w.end > w.start, { message: "end must be > start" });
+export type VizTimeWindow = z.infer<typeof vizTimeWindowSchema>;
+
+/** When a row draws: `show` non-empty restricts it to those windows; `hide`
+ *  windows always subtract time. Both empty = always visible (default). */
+export const vizVisibilitySchema = z.object({
+  show: z.array(vizTimeWindowSchema).max(32).default([]),
+  hide: z.array(vizTimeWindowSchema).max(32).default([]),
+});
+export type VizVisibilityConfig = z.infer<typeof vizVisibilitySchema>;
+
+/** Whether a row draws at time t — inside a `show` window when the list is
+ *  non-empty, and never inside a `hide` window. */
+export function visibleAt(v: VizVisibilityConfig | undefined, t: number): boolean {
+  if (!v) return true;
+  if (v.hide.some((w) => t >= w.start && t < w.end)) return false;
+  return v.show.length === 0 || v.show.some((w) => t >= w.start && t < w.end);
+}
+
+/** Per-layer zoom/pan — WHICH PART of the source media fills the layer's
+ *  frame-rect (independent of the row's `scale`/`x`/`y`, which move the whole
+ *  tile). The crop window is the cover-fit window shrunk by `zoom` (≥1) and
+ *  slid to the `pan` focus point inside the media: pan only travels where
+ *  there is hidden source (aspect slack at zoom 1, everywhere when zoomed). */
+export const vizZoomPanSchema = z.object({
+  /** Magnification into the source — 1 = cover-fit (default), 2 = half the
+   *  window (8× zoom range for extreme crops). */
+  zoom: z.number().min(1).max(16).default(1),
+  /** Focus point the crop window tracks — 0 = far edge, 0.5 = centered
+   *  (default), 1 = near edge; clamped so the window stays inside the media. */
+  panX: z.number().min(0).max(1).default(0.5),
+  panY: z.number().min(0).max(1).default(0.5),
+});
+export type VizZoomPanConfig = z.infer<typeof vizZoomPanSchema>;
+
+/** Source subrect for a media layer's zoom/pan — the cover-fit window shrunk
+ *  by `zoom` around its center, then slid so its center sits at `pan` of the
+ *  FREE slack (0 = left/top edge, 0.5 = centered → identical to coverCrop,
+ *  1 = right/bottom edge). Windows with no slack in a dimension clamp to the
+ *  media edge — pan is a no-op exactly where there's nothing hidden. */
+export function zoomPanRect(
+  mediaW: number,
+  mediaH: number,
+  frameW: number,
+  frameH: number,
+  zp: Pick<VizZoomPanConfig, "zoom" | "panX" | "panY">,
+): { sx: number; sy: number; sw: number; sh: number } {
+  const [, , cw0, ch0] = coverCrop(mediaW, mediaH, frameW, frameH);
+  const z = Math.max(1, zp.zoom);
+  const sw = Math.min(mediaW, cw0 / z);
+  const sh = Math.min(mediaH, ch0 / z);
+  return {
+    sx: zp.panX * Math.max(0, mediaW - sw),
+    sy: zp.panY * Math.max(0, mediaH - sh),
+    sw,
+    sh,
+  };
+}
+
 /** One media layer: a downloaded project asset (video or image) composited
  *  into every frame at its row position — row N-1 renders under row N (row
  *  order is the only z-order). Video sources loop when shorter than the mix
@@ -207,12 +333,19 @@ const vizMediaAssetLayerSchema = z
      *  render configs; folded into `key` during parse. */
     chromaKey: vizChromaKeySchema.optional(),
     key: vizVideoKeySchema.default({}),
+    /** Source-crop zoom/pan — which part of the media fills the tile. */
+    zoomPan: vizZoomPanSchema.default({}),
+    /** Time windows when the row draws — empty show+hide = always visible. */
+    visibility: vizVisibilitySchema.default({}),
   })
   .transform(foldChromaKey);
 
 /** The mode visuals ("2. Look") as a stack row — the waveforms draw at this
  *  row's position; a stack without a visuals row renders no mode visuals at
- *  all. Carries opacity/scale like media rows (no asset, no keying). */
+ *  all. Carries opacity/scale like media rows (no asset, no keying). Several
+ *  visuals rows may coexist: `visuals` holds the row's own complete look
+ *  (mode + params); absent it draws with the global "2. Look" values —
+ *  which is also what old configs (and the default row) do. */
 const vizVisualsLayerSchema = z.object({
   kind: z.literal("visuals"),
   hidden: z.boolean().default(false),
@@ -220,6 +353,11 @@ const vizVisualsLayerSchema = z.object({
   y: z.number().min(0).max(1).default(0.5),
   opacity: z.number().min(0).max(1).default(1),
   scale: z.number().min(0.1).max(2).default(1),
+  /** Own waveform look for this row — when set it renders with these params
+   *  instead of `globalVisuals`' wave fields. */
+  visuals: vizWaveParamsSchema.optional(),
+  /** Time windows when the row draws — empty show+hide = always visible. */
+  visibility: vizVisibilitySchema.default({}),
 });
 
 export const vizMediaLayerSchema = z.union([vizMediaAssetLayerSchema, vizVisualsLayerSchema]);
@@ -228,8 +366,18 @@ export type VizMediaLayerConfig = z.infer<typeof vizMediaLayerSchema>;
 export const VIZ_MAX_VIDEO_LAYERS = 10;
 
 /** The visuals stack row added by default and inserted when migrating
- *  band-model configs. */
-export const vizVisualsLayer = (): VizMediaLayerConfig => ({ kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1 });
+ *  band-model configs. `visuals` gives the row its own look (leave unset to
+ *  inherit the global "2. Look"). */
+export const vizVisualsLayer = (visuals?: VizWaveParams): VizMediaLayerConfig => ({
+  kind: "visuals",
+  hidden: false,
+  x: 0.5,
+  y: 0.5,
+  opacity: 1,
+  scale: 1,
+  visibility: { show: [], hide: [] },
+  ...(visuals ? { visuals } : {}),
+});
 
 /** Stacked layers composited into every frame. `layers` is the ordered row
  *  list (index 0 = bottom); a `kind:"visuals"` row marks where the mode
@@ -267,6 +415,8 @@ export const vizVideoSchema = z
         scale: legacy.scale,
         chromaKey: legacy.chromaKey,
         key: legacy.key,
+        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 },
+        visibility: { show: [], hide: [] },
       });
       return { layers: legacy.layer === "over" ? [vizVisualsLayer(), media] : [media, vizVisualsLayer()] };
     }
@@ -285,6 +435,8 @@ export const vizVideoSchema = z
         scale: legacy.scale,
         chromaKey: legacy.chromaKey,
         key: legacy.key,
+        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 },
+        visibility: { show: [], hide: [] },
       });
       const vi = out.findIndex((l) => l.kind === "visuals");
       if (vi >= 0) out.splice(legacy.layer === "under" ? vi : vi + 1, 0, media);
@@ -322,45 +474,14 @@ export const visualizerRenderSchema = z.object({
     // 3840 on both axes so portrait 4K (2160×3840) is valid too.
     height: z.number().int().min(240).max(3840),
     fps: z.number().int().min(12).max(60),
+    /** Draft pass — ultrafast encode preset + high CRF for a fast, low-quality
+     *  first look (the output file name carries a `draft` marker). */
+    draft: z.boolean().optional(),
   }),
-  globalVisuals: z.object({
-    mode: vizModeSchema.default("ribbons"),
-    waveformLengthSec: z.number().min(0.1).max(2).default(0.5),
-    globalAmplitude: z.number().min(0.1).max(3).default(1),
-    glowIntensity: z.number().min(0).max(40).default(14),
-    /** Beat-randomized glow: when enabled, `glowIntensity` is overridden per
-     *  beat cell by a deterministic hash → random value in [min,max]. */
-    autoGlow: z
-      .object({
-        enabled: z.boolean().default(false),
-        min: z.number().min(0).max(40).default(4),
-        max: z.number().min(0).max(40).default(24),
-      })
-      .default({}),
-    /** Beat-synced wandering center: when enabled, `centerConvergence.x/y`
-     *  are overridden by a deterministic per-beat position that eases toward
-     *  a new spot at every beat. */
-    autoCenter: z
-      .object({
-        enabled: z.boolean().default(false),
-        /** Max deviation from the frame midpoint, fraction of the axis (0..0.35). */
-        range: z.number().min(0).max(0.35).default(0.18),
-      })
-      .default({}),
+  globalVisuals: vizWaveParamsSchema.extend({
     backgroundColor: hexColorSchema.default("#050508"),
-    /** `eqradial` hub radius as a fraction of min(w,h); 0 = bars start at
-     *  the exact center point. */
-    innerRadius: z.number().min(0).max(0.5).default(0.12),
-    layout: vizLayoutSchema.default("radial"),
     video: vizVideoSchema.default({}),
     dancer: dancerConfigSchema.default({}),
-    centerConvergence: z
-      .object({
-        x: z.number().min(0).max(1).default(0.5),
-        y: z.number().min(0).max(1).default(0.5),
-        pulseSensitivity: z.number().min(0).max(2).default(0.8),
-      })
-      .default({}),
   }),
   stems: z.array(visualizerStemSchema).min(1).max(20),
 });
@@ -368,6 +489,49 @@ export type VisualizerRenderInput = z.infer<typeof visualizerRenderSchema>;
 /** Pre-defaults request shape (what the client actually sends). */
 export type VisualizerRenderRequest = z.input<typeof visualizerRenderSchema>;
 export type VisualizerGlobals = VisualizerRenderInput["globalVisuals"];
+
+// --- Sessions (named, restorable visualizer setups) ----------------------------
+
+/** A saved visualizer setup — everything needed to bring the page back to the
+ *  exact working state: the stem selection (with per-stem tweaks), every
+ *  "Look"/layers/dancer setting and the render settings. Unlike a render,
+ *  a session may be saved with zero stems selected. */
+export const visualizerSessionPayloadSchema = visualizerRenderSchema.extend({
+  stems: z.array(visualizerStemSchema).max(20),
+});
+export type VisualizerSessionPayload = z.infer<typeof visualizerSessionPayloadSchema>;
+
+export const vizSessionNameSchema = z.string().trim().min(1).max(80);
+
+/** POST /api/visualizer/sessions body. */
+export const vizSessionSaveSchema = z.object({
+  name: vizSessionNameSchema,
+  payload: visualizerSessionPayloadSchema,
+});
+
+/** PUT /api/visualizer/sessions/:id body — rename and/or overwrite the setup. */
+export const vizSessionUpdateSchema = z
+  .object({
+    name: vizSessionNameSchema.optional(),
+    payload: visualizerSessionPayloadSchema.optional(),
+  })
+  .refine((d) => d.name !== undefined || d.payload !== undefined, { message: "name or payload is required" });
+
+/** Metadata-only view of a session (for lists — payload omitted). */
+export interface VizSessionMeta {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  /** Stem filenames the session references. */
+  stems: string[];
+  /** Number of media (video/image) rows in the layer stack. */
+  mediaLayers: number;
+}
+
+export interface VizSession extends VizSessionMeta {
+  payload: VisualizerSessionPayload;
+}
 
 /** Resolution presets offered by the UI — aspect × quality (explicit w/h are
  *  also accepted). */
@@ -914,16 +1078,55 @@ export interface VizDancer {
   glowWidth: number;
 }
 
+/** One visuals row's computed geometry — the mode dispatch fills exactly the
+ *  array matching `mode`. A stack may carry several `kind:"visuals"` rows,
+ *  each rendered with its own params (`VizFrameState.visualChannels`). */
+export interface VizModeVisuals {
+  mode: VizMode;
+  stems: VizFrameStem[];
+  rings: VizRing[];
+  bars: VizBarGroup[];
+  mirrors: VizMirrorStem[];
+  blocks: VizBlockGroup[];
+  eqbars: VizEqGroup[];
+  eqradial: VizEqRadialGroup[];
+  stereos: VizStereoStem[];
+  silks: VizSilkStem[];
+  particles: VizParticleGroup[];
+}
+
 export interface VizFrameState {
+  /** Mode of the first visuals row (`globals.mode` when the stack has none). */
   mode: VizMode;
   /** The ordered layer stack — one entry per configured row, same order as
    *  `globals.video.layers` (empty when none). `kind:"media"` rows carry an
    *  injected image (Canvas element / embedded SVG <image>); `kind:"visuals"`
-   *  rows draw the mode visuals at that stack position — no visuals row means
-   *  no waveforms at all. `hidden` rows keep their slot but draw nothing.
+   *  rows draw their own mode visuals at that stack position — no visuals row
+   *  means no waveforms at all. `hidden` rows keep their slot but draw nothing.
    *  Row order is the only z-order; the dancer + star
    *  still draw on top of the whole stack. */
-  videoLayers: Array<{ kind: "media" | "visuals"; hidden: boolean; x: number; y: number; opacity: number; scale: number; key: VizVideoKeyConfig | null }>;
+  videoLayers: Array<{
+    kind: "media" | "visuals";
+    hidden: boolean;
+    x: number;
+    y: number;
+    opacity: number;
+    scale: number;
+    key: VizVideoKeyConfig | null;
+    /** Media rows only — source-crop zoom/pan (absent on visuals rows). */
+    zoomPan?: VizZoomPanConfig;
+    /** Time-window evaluation for this frame — a row draws iff
+     *  `!hidden && visible` (hidden is the manual eye toggle). */
+    visible: boolean;
+  }>;
+  /** One entry per `kind:"visuals"` row — `rowIndex` is its index into
+   *  `videoLayers`. Each channel was computed with that row's own `visuals`
+   *  params (or the globals when the row carries none), so stacked waveform
+   *  layers can differ in mode and every setting. */
+  visualChannels: Array<{ rowIndex: number; visuals: VizModeVisuals }>;
+  /** Geometry of the FIRST visuals row — kept flat at the top level for
+   *  single-visuals-row callers; renderers iterate `visualChannels` instead.
+   *  Empty when the stack has no visuals row. */
   stems: VizFrameStem[];
   rings: VizRing[];
   bars: VizBarGroup[];
@@ -937,6 +1140,27 @@ export interface VizFrameState {
   dancer: VizDancer | null;
   star: { x: number; y: number; r: number; alpha: number };
   t: number;
+}
+
+/** The mode geometry a given visuals row draws — its channel from
+ *  `visualChannels`, or the state's flat (first-row) arrays when channels
+ *  were never populated (hand-built states). */
+export function visualsForRow(state: VizFrameState, rowIndex: number): VizModeVisuals {
+  const ch = state.visualChannels?.find((c) => c.rowIndex === rowIndex);
+  if (ch) return ch.visuals;
+  return {
+    mode: state.mode,
+    stems: state.stems,
+    rings: state.rings,
+    bars: state.bars,
+    mirrors: state.mirrors,
+    blocks: state.blocks,
+    eqbars: state.eqbars,
+    eqradial: state.eqradial,
+    stereos: state.stereos,
+    silks: state.silks,
+    particles: state.particles,
+  };
 }
 
 export interface FrameStem {
@@ -1052,7 +1276,7 @@ function beatCellIndex(stems: FrameStem[], t: number): number {
  *  first ~60% of the cell, then holds until the next beat. Pure function of t
  *  → preview and MP4 export land on the same pixels. The dancer and star
  *  anchor to this same point. */
-export function frameCenter(stems: FrameStem[], globals: VisualizerGlobals, width: number, height: number, t: number): Vec2 {
+export function frameCenter(stems: FrameStem[], globals: VizWaveParams, width: number, height: number, t: number): Vec2 {
   const base = globals.centerConvergence;
   const ac = globals.autoCenter;
   if (!ac.enabled) return { x: width * base.x, y: height * base.y };
@@ -1327,7 +1551,7 @@ export function mixHex(a: string, b: string, k: number): string {
 
 function computeRibbons(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -1395,7 +1619,7 @@ const RING_POINTS = 240;
 /** Circular mode — concentric ring waveforms, inner→outer per stem. */
 function computeRings(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -1439,7 +1663,7 @@ const SPECTRUM_BARS = 6;
 /** Spectrum mode — per-stem band bars laid out in lanes left→right. */
 function computeBars(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -1483,7 +1707,7 @@ const PARTICLES_PER_STEM = 48;
 /** Particles mode — deterministic orbiting field, onset kicks push outward. */
 function computeParticles(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -1525,7 +1749,7 @@ const MIRROR_ECHO_SCALES = [0.72, 0.45];
  *  center axis; all stems overlaid with translucency like stacked traces. */
 function computeMirrors(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -1602,7 +1826,7 @@ function computeMirrors(
  *  (stacked glowing blocks, LED-equalizer style). */
 function computeBlocks(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -1705,7 +1929,7 @@ function eqColumnLevels(stemIndex: number, signal: StemSignal, cols: number, t: 
  *  deterministic per-column shimmer and a gentle edge taper. */
 function computeEqBars(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -1807,7 +2031,7 @@ function computeEqBars(
  *  `eqbars` math — only the placement changes. */
 function computeEqRadial(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -1931,7 +2155,7 @@ const STEREO_ECHO = 0.55;
  *  becomes an exact mirror line (never a single meeting point). */
 function computeStereo(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -2020,7 +2244,7 @@ function silkSpectral(x: number, centerX: number, halfSpan: number, tint: string
  *  → the center gap and outer frame margins go quiet like in the image. */
 function computeSilk(
   stems: FrameStem[],
-  globals: VisualizerGlobals,
+  globals: VizWaveParams,
   width: number,
   height: number,
   t: number,
@@ -2116,6 +2340,43 @@ function computeSilk(
   return out;
 }
 
+/** Mode dispatch for ONE waveform layer — fills exactly the array matching
+ *  `params.mode`. Params are the row's own `visuals` or the globals. */
+function computeModeVisuals(
+  stems: FrameStem[],
+  params: VizWaveParams,
+  width: number,
+  height: number,
+  t: number,
+  center: Vec2,
+  solo: boolean,
+): VizModeVisuals {
+  const v: VizModeVisuals = {
+    mode: params.mode,
+    stems: [],
+    rings: [],
+    bars: [],
+    mirrors: [],
+    blocks: [],
+    eqbars: [],
+    eqradial: [],
+    stereos: [],
+    silks: [],
+    particles: [],
+  };
+  if (params.mode === "ribbons") v.stems = computeRibbons(stems, params, width, height, t, center, solo);
+  else if (params.mode === "circular") v.rings = computeRings(stems, params, width, height, t, center, solo);
+  else if (params.mode === "spectrum") v.bars = computeBars(stems, params, width, height, t, solo);
+  else if (params.mode === "particles") v.particles = computeParticles(stems, params, width, height, t, center, solo);
+  else if (params.mode === "mirror") v.mirrors = computeMirrors(stems, params, width, height, t, center, solo);
+  else if (params.mode === "blocks") v.blocks = computeBlocks(stems, params, width, height, t, center, solo);
+  else if (params.mode === "eqbars") v.eqbars = computeEqBars(stems, params, width, height, t, center, solo);
+  else if (params.mode === "eqradial") v.eqradial = computeEqRadial(stems, params, width, height, t, center, solo);
+  else if (params.mode === "stereo") v.stereos = computeStereo(stems, params, width, height, t, center, solo);
+  else if (params.mode === "silk") v.silks = computeSilk(stems, params, width, height, t, center, solo);
+  return v;
+}
+
 export function computeFrame(
   stems: FrameStem[],
   globals: VisualizerGlobals,
@@ -2125,17 +2386,7 @@ export function computeFrame(
 ): VizFrameState {
   const center: Vec2 = frameCenter(stems, globals, width, height, t);
   const solo = anySolo(stems.map((s) => s.cfg));
-  const mode = globals.mode;
-
-  // Auto glow: a deterministic random intensity in [min,max] per beat cell —
-  // hashes the beat index (never the wall clock), so preview and MP4 export
-  // pick the same value for the same frame.
-  const effGlobals = globals.autoGlow.enabled
-    ? {
-        ...globals,
-        glowIntensity: globals.autoGlow.min + (globals.autoGlow.max - globals.autoGlow.min) * hash01(beatCellIndex(stems, t), 77),
-      }
-    : globals;
+  const cell = beatCellIndex(stems, t);
 
   // Master envelope — drives the convergence star in every mode.
   let master = 0;
@@ -2151,8 +2402,24 @@ export function computeFrame(
   const minDim = Math.min(width, height);
   const starR = minDim * 0.022 + masterRms * globals.centerConvergence.pulseSensitivity * minDim * 0.09;
 
+  // One channel per visuals row: each draws with its own `visuals` params
+  // (falling back to the global look), its own beat center and its own
+  // auto-glow roll — hashed with the channel index so stacked layers don't
+  // jump identically (index 0 reproduces the historic single-row value).
+  const visualChannels: VizFrameState["visualChannels"] = [];
+  globals.video.layers.forEach((l, i) => {
+    if (l.kind !== "visuals") return;
+    const p = l.visuals ?? globals;
+    const eff = p.autoGlow.enabled
+      ? { ...p, glowIntensity: p.autoGlow.min + (p.autoGlow.max - p.autoGlow.min) * hash01(cell, 77, visualChannels.length) }
+      : p;
+    const c = frameCenter(stems, p, width, height, t);
+    visualChannels.push({ rowIndex: i, visuals: computeModeVisuals(stems, eff, width, height, t, c, solo) });
+  });
+  const primary = visualChannels[0]?.visuals;
+
   const state: VizFrameState = {
-    mode,
+    mode: primary?.mode ?? globals.mode,
     videoLayers: globals.video.layers.map((l) => ({
       kind: l.kind,
       hidden: l.hidden,
@@ -2161,32 +2428,24 @@ export function computeFrame(
       opacity: l.opacity,
       scale: l.scale,
       key: l.kind === "media" && l.key.method !== "none" ? l.key : null,
+      visible: visibleAt(l.visibility, t),
+      ...(l.kind === "media" ? { zoomPan: l.zoomPan } : {}),
     })),
-    stems: [],
-    rings: [],
-    bars: [],
-    mirrors: [],
-    blocks: [],
-    eqbars: [],
-    eqradial: [],
-    stereos: [],
-    silks: [],
-    particles: [],
+    visualChannels,
+    stems: primary?.stems ?? [],
+    rings: primary?.rings ?? [],
+    bars: primary?.bars ?? [],
+    mirrors: primary?.mirrors ?? [],
+    blocks: primary?.blocks ?? [],
+    eqbars: primary?.eqbars ?? [],
+    eqradial: primary?.eqradial ?? [],
+    stereos: primary?.stereos ?? [],
+    silks: primary?.silks ?? [],
+    particles: primary?.particles ?? [],
     dancer: null,
     star: { x: center.x, y: center.y, r: starR, alpha: Math.min(1, 0.55 + masterRms * 2.5) * envActivity(masterRms) },
     t,
   };
-
-  if (mode === "ribbons") state.stems = computeRibbons(stems, effGlobals, width, height, t, center, solo);
-  else if (mode === "circular") state.rings = computeRings(stems, effGlobals, width, height, t, center, solo);
-  else if (mode === "spectrum") state.bars = computeBars(stems, effGlobals, width, height, t, solo);
-  else if (mode === "particles") state.particles = computeParticles(stems, effGlobals, width, height, t, center, solo);
-  else if (mode === "mirror") state.mirrors = computeMirrors(stems, effGlobals, width, height, t, center, solo);
-  else if (mode === "blocks") state.blocks = computeBlocks(stems, effGlobals, width, height, t, center, solo);
-  else if (mode === "eqbars") state.eqbars = computeEqBars(stems, effGlobals, width, height, t, center, solo);
-  else if (mode === "eqradial") state.eqradial = computeEqRadial(stems, effGlobals, width, height, t, center, solo);
-  else if (mode === "stereo") state.stereos = computeStereo(stems, effGlobals, width, height, t, center, solo);
-  else if (mode === "silk") state.silks = computeSilk(stems, effGlobals, width, height, t, center, solo);
 
   return state;
 }

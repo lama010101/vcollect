@@ -4,6 +4,12 @@
 
 import { ffmpegService } from "./ffmpeg.js";
 
+export interface ProbeSideData {
+  side_data_type?: string;
+  rotation?: number;
+  displaymatrix?: string;
+}
+
 export interface ProbeStream {
   codec_type?: string;
   codec_name?: string;
@@ -14,6 +20,8 @@ export interface ProbeStream {
   r_frame_rate?: string; // e.g. "30000/1001"
   avg_frame_rate?: string;
   duration?: string;
+  side_data_list?: ProbeSideData[];
+  tags?: Record<string, string>;
 }
 
 export interface ProbeFormat {
@@ -30,6 +38,9 @@ export interface ProbeResult {
   video: ProbeStream | null;
   width: number | null;
   height: number | null;
+  /** Display rotation (0/90/180/270) — ffmpeg autorotates decoded frames, so
+   *  filters see the ORIENTED size: swap width/height when this is 90|270. */
+  rotation: number;
   durationSeconds: number | null;
   fps: number | null;
   codec: string | null;
@@ -79,12 +90,16 @@ export async function probe(file: string): Promise<ProbeResult> {
   }
   const duration =
     num(video.duration) ?? num(format.duration);
+  const sdRot = video.side_data_list?.find((s) => s.rotation !== undefined)?.rotation;
+  const rawRot = sdRot ?? num(video.tags?.rotate) ?? 0;
+  const rotation = ((Math.round(rawRot / 90) * 90) % 360 + 360) % 360;
   return {
     streams,
     format,
     video,
     width: video.width ?? null,
     height: video.height ?? null,
+    rotation,
     durationSeconds: duration,
     fps: parseFps(video.r_frame_rate) ?? parseFps(video.avg_frame_rate),
     codec: video.codec_name ?? null,

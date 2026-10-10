@@ -268,6 +268,7 @@ export function rankCandidates(
       video: { width: c.width, height: c.height, duration: String(c.durationSeconds), r_frame_rate: c.fps ? `${c.fps}/1` : undefined },
       width: c.width,
       height: c.height,
+      rotation: 0,
       durationSeconds: c.durationSeconds,
       fps: c.fps,
       codec: null,

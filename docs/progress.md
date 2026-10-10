@@ -75,11 +75,13 @@ apps/web/src/
 | Visualizer modes | ✅ Done | ribbons / circular / particles / mirror / blocks / eqbars / eqradial / stereo / silk (engine-free) + spectrum (engine band features) |
 | Procedural dancer | ✅ Done | 15-joint FK skeleton, deterministic f(t) from stem envelopes/onsets; neon/silhouette |
 | Visualizer video layer | ✅ Done | Downloaded project asset composited under/over the visuals; looped + cover-cropped, deterministic t=k/fps timing; bg removal via colorkey/chromakey/hsv keyers (shared TS, preview=export) or AI cutout (MediaPipe/MODNet → cached VP9-alpha WebM) |
+| Stacked waveform layers | ✅ Done | Several ◈ visuals rows in the layer stack — each can carry its own complete look (mode + all "2. Look" params) or inherit the base look |
 | Beat-synced Look auto modes | ✅ Done | autoGlow (per-beat random glow in range) + autoCenter (center glides to a hashed spot per beat) |
 | Python engine | ✅ Done (optional) | Managed venv + librosa worker; stem features enrich visualizer — app runs without it |
 | Per-project asset folders | ✅ Done | `OUTPUT_ROOT/<slug>/assets/`; existing files migrated |
 | Drag & drop upload | ✅ Done | Drop videos or images anywhere → `<slug>/assets/uploads/` + asset row |
 | World Cam (InSpatio-World) | ✅ Done | Camera-path video re-render via remote GPU worker (Kaggle + cloudflared); preset trajectories from `@twio/shared`; result lands as project asset |
+| Visualizer sessions | ✅ Done | Named save/load of the whole setup — settings + stem/media snapshots; loading restores deleted media (stems copied back, layer files re-registered as `local` assets) |
 | P2 AI vision analysis | ⬜ Not started | Out of scope; schema nullable-ready |
 | Mixkit import / rough-cut export | ⬜ Deferred | P3 |
 
@@ -126,6 +128,159 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
 > tooling) MUST add a dated entry here before the work is considered done.
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
+
+### 2026-10-10 — Visualizer: per-layer show/hide time windows
+
+- **`visibility` on every stack row** (media AND waveform):
+  `{show: [{start,end}], hide: [{start,end}]}` — seconds windows over the
+  mix timeline. `show` non-empty restricts the row to those ranges;
+  `hide` windows always subtract. Both empty = always visible (default —
+  old configs/sessions unchanged). Multiple windows per list = the
+  "several show/hide per layer" ask.
+- `visibleAt()` + a `visible` flag on each `state.videoLayers` row —
+  `computeFrame` evaluates windows per t; Canvas preview and SVG export
+  skip windowed-out rows via the same check (`!hidden && visible`). Manual
+  `hidden` still skips decode entirely; windowed media keeps decoding so
+  show windows display instantly.
+- **UI** — a "Show / hide" card on every row: a mini mix-timeline bar
+  (sky = shown, rose = hidden segments), +shown/+hidden buttons, and
+  per-window start/end seconds inputs with × removal. Rows with windows
+  get a ⏱ badge. Persists via localStorage + sessions.
+- Verified: `npm run typecheck` ✅; visualizer suite 57/57 ✅ (new
+  show/hide describe: `visibleAt` semantics, schema, per-t `visible`
+  flag, frameSvg skipping).
+
+### 2026-10-10 — Visualizer: per-layer zoom/pan (source crop)
+
+- **New `zoomPan` per media layer** — `{zoom (1–16), panX, panY (0–1)}` selects
+  WHICH PART of the source fills the tile, independent of the row's
+  scale/x/y (which move the whole tile). Math: `zoomPanRect` = cover-fit
+  window shrunk by `zoom`, slid to `pan` of the free slack — defaults
+  {1, .5, .5} reproduce the old centered cover-fit pixel-for-pixel; pan is
+  a no-op exactly where nothing is hidden (e.g. panY on a same-aspect fit).
+- **UI** — a "Zoom / pan" card on every media row (Z/X/Y sliders + ⌖ reset);
+  preview, sessions, localStorage + legacy folds all carry the field.
+- **Export** — videos: the decoder's vf is now `fps,crop=sw:sh:sx:sy,scale`
+  in native space (identical numbers at defaults), driven by the probed
+  media dims — `probe()` gained `rotation` (displaymatrix/side-data) and the
+  crop uses ORIENTED dims so 90° phone footage crops correctly. Images:
+  `sharp().rotate().extract(rect).resize` (EXIF-aware). Keyed/cutout WebMs
+  keep source dims → same rect. Without dims the decoder falls back to the
+  legacy `scale=increase,crop` chain.
+- Verified: `npm run typecheck` ✅; visualizer suite 54/54 ✅ (new
+  "layer zoom/pan" describe: rect math, slack/no-op, schema default,
+  decoder crop args).
+
+### 2026-10-10 — Visualizer render: progress log + fast draft pass
+
+- **Overall progress bar** — the "5. Render" job card now weights each phase
+  (decode 0–6%, keying 6–12%, frames 12–97%, mux→verify 97–100%) so the fill
+  is monotone instead of restarting per phase, plus a human label
+  ("Rendering frames"), live elapsed + ETA, and the server's `detail`
+  (stem name / layer N / encode fps).
+- **Rolling log** — a monospace log box under the bar appends phase
+  transitions, ~10% checkpoints within a phase, and detail changes
+  (capped 200 lines, auto-scroll). `VizRenderProgress` gained
+  `detail?: string`; service emits the stem being decoded and the layer
+  being keyed, render.ts emits live encode fps.
+- **Draft render** — new "⚡ Draft" button: aspect-preserved ~480px dims,
+  12 fps, and `renderSettings.draft` (new optional schema field) →
+  `encodeArgs` picks `-preset ultrafast -crf 30` (vs `fast`/`18`). Output
+  lands in renders/ named `viz-draft-…` so drafts are easy to spot.
+- Verified: `npm run typecheck` ✅; visualizer suite 49/49 ✅ (new test
+  covers encodeArgs draft args + schema).
+
+### 2026-10-10 — Timeline: load a visualizer session as shots
+
+- The Timeline page's sidebar now has a **"Visualizer session"** picker:
+  pick a saved session → Load → a new `Viz — <name>` timeline is created and
+  selected. `POST /api/visualizer/sessions/:id/timeline` →
+  `sessions.ts#sessionToTimeline` materializes it in one transaction.
+- Shot mapping: every layer-stack row becomes a shot in `VIZ_STACK`,
+  top layer first (matching the visualizer's list order) — `◈ Waveform —
+  <mode> (own settings)/(2. Look)` for visuals rows, `▦ Media — <title>`
+  for media rows. Every stem becomes a `STEMS` shot (`♫ Stem — <name>
+  (kind)`). All shots span `t=0 → duration`: stack layers take the mix
+  length (visualizer loops media), stems take their own probed duration
+  (`probeAudio` on the session's stem snapshots — pool copies may be gone).
+  Mix length = longest probeable stem, else longest media asset, else 10 s.
+- Media shots get their layer's asset linked onto the shot rail
+  (`addAssetToShot` + `selected` + `on_rail`) and `reference_image_url` =
+  the asset thumb, so the filmstrip tile and rail show the layer's own
+  clip. Loading a session does NOT restore media — missing assets just
+  skip the link; use the Visualizer's Load for full restore.
+- Verified: `npm run typecheck` ✅; sessions suite 9/9 ✅ (new test covers
+  shot order, durations, and the asset rail link).
+
+### 2026-10-10 — Visualizer: stacked waveform layers with per-row settings
+
+- Several `kind:"visuals"` rows can now live in the layer stack — each draws
+  its **own mode geometry** at its own stack position. A row's `visuals`
+  field holds a complete `VizWaveParams` (new `vizWaveParamsSchema`: mode,
+  waveform window, amplitude, glow + autoGlow, autoCenter, innerRadius,
+  layout, centerConvergence — everything in "2. Look" except background/
+  dancer, which stay global). Rows without `visuals` inherit the global look
+  — that's what old configs and the default row do, so nothing changes for
+  existing setups.
+- `computeFrame` now emits `visualChannels` — one `VizModeVisuals` per
+  visuals row (rowIndex into `videoLayers`), each computed with its own
+  params, own beat center (autoCenter per row) and own autoGlow roll
+  (channel-index-salted hash so stacked layers don't jump identically;
+  channel 0 keeps the historic value). The flat `state.stems/rings/…`
+  arrays stay = the first row's channel, so single-row callers are
+  unchanged; both renderers (`frameSvg`, Canvas `drawState`) draw each row
+  via `visualsForRow`. Silk gradient ids are namespaced per row
+  (`l<i>_silk<n>`). The mode compute fns' `globals` param was retyped to
+  `VizWaveParams` — `VisualizerGlobals` is a structural superset and drops
+  in directly.
+- UI: the add-layer picker offers "Waveform layer" (adds a row stamped with
+  a copy of 2. Look, unlimited rows); each ◈ row shows its mode in the
+  title/badge and gets a "Waveform" card with the full Look controls bound
+  to the row (`WaveLookControls` — the same component now drives both the
+  section and per-row editors). "Customize" gives an inheriting row its own
+  copy; "↺ use 2. Look" reverts it. Persisted state + sessions carry
+  `visuals` through `normalizePersisted` (schema-validated).
+- Export: `ENGINE_REQUIRED` now fires if ANY waveform layer's effective
+  mode is spectrum (was: only the global mode).
+- Files: packages/shared/src/visualizer.ts, apps/server/src/visualizer/
+  {svg.ts,service.ts}, apps/web/src/pages/Visualizer.tsx, +6 tests in
+  visualizer.node.test.ts.
+- Verified: `npm run typecheck` ✅ all workspaces; visualizer suite 48/48 ✅.
+
+### 2026-10-10 — Visualizer sessions: named save/load with media restore
+
+- New **Sessions** section at the top of the Visualizer page: name the current
+  setup → save → it snapshots EVERYTHING — stem selection + per-stem tweaks,
+  all look/layer/dancer settings, render settings AND the media itself. Rows
+  support **Load / Save (overwrite) / rename (inline) / delete**; the active
+  session is badged and remembered in the localStorage autosave.
+- **Media comes back on load.** Sessions live on disk under
+  `OUTPUT_ROOT/<slug>/visualizer/sessions/<id>/` (`session.json` + `stems/` +
+  `media/`). Stems are copied (re-uploads overwrite in place, links would
+  share the mutation); layer files are hardlink→copy snapshotted (asset files
+  are immutable). `POST /api/visualizer/sessions/:id/load` copies differing/
+  missing stems back into the shared pool and, for deleted media-layer
+  assets, restores the snapshot file under `assets/visualizer-sessions/` and
+  re-registers it via `syncProjectAssets` — the layer's `assetId` remaps to
+  the content-addressed `LOCAL_<project>_<sha16>` id (a restored LOCAL_ asset
+  gets its original id back). Unrestorable layers keep their row + emit a
+  warning.
+- Server: new `src/visualizer/sessions.ts`; routes added to
+  `routes/visualizer.ts` — `GET/POST /api/visualizer/sessions`,
+  `GET/PUT/DELETE .../sessions/:id`, `POST .../sessions/:id/load`.
+  `visualizerDir` accepts `"sessions"`.
+- Shared: `visualizerSessionPayloadSchema` (render schema minus the ≥1 stem
+  requirement), `vizSessionSaveSchema`/`vizSessionUpdateSchema`,
+  `VizSessionMeta`/`VizSession` types.
+- Web: `api.ts` session methods; `Visualizer.tsx` Sessions section +
+  `normalizePersisted` refactor (the same layer-migration code now serves
+  both the localStorage autosave and loaded session payloads).
+- Files: packages/shared/src/visualizer.ts,
+  apps/server/src/visualizer/{service.ts,sessions.ts}, routes/visualizer.ts,
+  apps/web/src/{api.ts,pages/Visualizer.tsx},
+  test/visualizer-sessions.node.test.ts (new, 8 tests incl. real-mp4 media
+  restore through `syncProjectAssets`).
+- Verified: `npm run typecheck` ✅ all workspaces; new test file 8/8 ✅.
 
 ### 2026-10-08 — World Cam tab: InSpatio-World camera-path re-render (remote GPU worker)
 

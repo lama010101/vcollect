@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as R
 import {
   computeDancer,
   computeFrame,
-  coverCrop,
   frameCenter,
   detectStemKind,
   isStemAudible,
@@ -11,12 +10,19 @@ import {
   STEM_KINDS,
   VIZ_CUTOUT_MODELS,
   VIZ_MAX_VIDEO_LAYERS,
+  visualsForRow,
   vizVisualsLayer,
+  vizVisibilitySchema,
+  vizWaveParamsSchema,
+  vizZoomPanSchema,
+  waveParamsFromGlobals,
+  zoomPanRect,
   type DancerConfig,
   type FrameStem,
   type StemKind,
   type StemSignal,
   type VisualizerRenderInput,
+  type VisualizerSessionPayload,
   type VizChromaKeyConfig,
   type VizCutoutModel,
   type VizFrameState,
@@ -24,7 +30,13 @@ import {
   type VizLayout,
   type VizMediaLayerConfig,
   type VizMode,
+  type VizModeVisuals,
+  type VizSessionMeta,
+  type VizTimeWindow,
   type VizVideoKeyConfig,
+  type VizVisibilityConfig,
+  type VizWaveParams,
+  type VizZoomPanConfig,
   type VisualizerStemInput,
 } from "@twio/shared";
 import {
@@ -54,6 +66,8 @@ interface PersistedViz {
   globals: VisualizerGlobals;
   render: { width: number; height: number; fps: number };
   jobId: string | null;
+  /** Last saved/loaded server-side session, when any. */
+  sessionId?: string | null;
 }
 
 type VisualizerGlobals = VisualizerRenderInput["globalVisuals"];
@@ -115,11 +129,10 @@ const CUTOUT_MODEL_LABELS: Record<VizCutoutModel, string> = {
 const LAYER_CARD = "rounded-md border border-slate-700/50 bg-slate-900/50 px-2.5 py-1.5 space-y-1 text-[11px] text-slate-400";
 const LAYER_CARD_LABEL = "block text-[9px] font-semibold uppercase tracking-wider text-slate-500";
 
-function loadPersisted(projectId: string): PersistedViz | null {
-  try {
-    const raw = localStorage.getItem(storageKey(projectId));
-    if (!raw) return null;
-    const p = JSON.parse(raw) as Partial<PersistedViz>;
+/** Merge a partial persisted/session shape into a complete PersistedViz,
+ *  migrating any legacy video-layer formats along the way. Used for both the
+ *  localStorage autosave and server-side session payloads. */
+function normalizePersisted(p: Partial<PersistedViz>): PersistedViz {
     // Migrate persisted video configs to the layers stack: rows are either
     // media assets or the `kind:"visuals"` row marking where the mode visuals
     // draw. Old saves (band-model `layer` hints, the flat single-video shape,
@@ -137,6 +150,9 @@ function loadPersisted(projectId: string): PersistedViz | null {
       y?: unknown;
       key?: Partial<VizVideoKeyConfig>;
       chromaKey?: VizChromaKeyConfig;
+      visuals?: unknown;
+      zoomPan?: unknown;
+      visibility?: unknown;
     };
     const num = (x: unknown, d: number) => (typeof x === "number" && Number.isFinite(x) ? x : d);
     const foldKey = (raw: RawLayer): VizVideoKeyConfig => {
@@ -153,13 +169,40 @@ function loadPersisted(projectId: string): PersistedViz | null {
     };
     const toLayer = (raw: RawLayer | null | undefined): VizMediaLayerConfig | null => {
       if (!raw || typeof raw !== "object") return null;
-      if (raw.kind === "visuals") return { kind: "visuals", hidden: raw.hidden === true, x: num(raw.x, 0.5), y: num(raw.y, 0.5), opacity: num(raw.opacity, 1), scale: num(raw.scale, 1) };
+      if (raw.kind === "visuals") {
+        // Per-row look — validated; invalid/missing → inherits 2. Look.
+        const pv2 = vizWaveParamsSchema.safeParse(raw.visuals);
+        const pvis = vizVisibilitySchema.safeParse(raw.visibility);
+        return {
+          kind: "visuals",
+          hidden: raw.hidden === true,
+          x: num(raw.x, 0.5),
+          y: num(raw.y, 0.5),
+          opacity: num(raw.opacity, 1),
+          scale: num(raw.scale, 1),
+          visibility: pvis.success ? pvis.data : { show: [], hide: [] },
+          ...(pv2.success ? { visuals: pv2.data } : {}),
+        };
+      }
       // NB: the deprecated `layer` hint is deliberately NOT carried over — it
       // only steers the visuals-row insertion below (from `raws`). Persisting
       // it would let the server-side fold resurrect a visuals row the user
       // explicitly removed.
+      const pzp = vizZoomPanSchema.safeParse(raw.zoomPan);
+      const pvis = vizVisibilitySchema.safeParse(raw.visibility);
       return typeof raw.assetId === "string" && raw.assetId
-        ? { kind: "media", assetId: raw.assetId, hidden: raw.hidden === true, x: num(raw.x, 0.5), y: num(raw.y, 0.5), opacity: num(raw.opacity, 1), scale: num(raw.scale, 1), key: foldKey(raw) }
+        ? {
+            kind: "media",
+            assetId: raw.assetId,
+            hidden: raw.hidden === true,
+            x: num(raw.x, 0.5),
+            y: num(raw.y, 0.5),
+            opacity: num(raw.opacity, 1),
+            scale: num(raw.scale, 1),
+            key: foldKey(raw),
+            zoomPan: pzp.success ? pzp.data : { zoom: 1, panX: 0.5, panY: 0.5 },
+            visibility: pvis.success ? pvis.data : { show: [], hide: [] },
+          }
         : null;
     };
     const pv = (p.globals?.video ?? null) as (RawLayer & { layers?: RawLayer[] }) | null;
@@ -194,7 +237,15 @@ function loadPersisted(projectId: string): PersistedViz | null {
       globals: { ...DEFAULT_GLOBALS, ...(p.globals ?? {}), dancer: { ...DEFAULT_GLOBALS.dancer, ...(p.globals?.dancer ?? {}) }, autoGlow: { ...DEFAULT_GLOBALS.autoGlow, ...(p.globals?.autoGlow ?? {}) }, video: { layers: layers.slice(0, VIZ_MAX_VIDEO_LAYERS) }, autoCenter: { ...DEFAULT_GLOBALS.autoCenter, ...(p.globals?.autoCenter ?? {}) }, centerConvergence: { ...DEFAULT_GLOBALS.centerConvergence, ...(p.globals?.centerConvergence ?? {}) } },
       render: { ...DEFAULT_RENDER, ...(p.render ?? {}) },
       jobId: typeof p.jobId === "string" ? p.jobId : null,
+      sessionId: typeof p.sessionId === "string" ? p.sessionId : null,
     };
+}
+
+function loadPersisted(projectId: string): PersistedViz | null {
+  try {
+    const raw = localStorage.getItem(storageKey(projectId));
+    if (!raw) return null;
+    return normalizePersisted(JSON.parse(raw) as Partial<PersistedViz>);
   } catch {
     return null;
   }
@@ -323,6 +374,33 @@ function StemWave({ signal, color }: { signal: StemSignal; color: string }) {
 
 const PHASE_PCT: Record<string, number> = { "decoding audio": 25, "analyzing features": 65, assembling: 90 };
 
+/** Render phases → human labels for the status line + log. */
+const RENDER_PHASE_LABELS: Record<string, string> = {
+  decode: "Decoding stems",
+  keying: "Background removal",
+  frames: "Rendering frames",
+  mux: "Muxing audio",
+  verify: "Verifying output",
+};
+/** Render phases → share of the overall progress bar (frames dominates). */
+const RENDER_PHASE_SPAN: Record<string, [number, number]> = {
+  decode: [0, 6],
+  keying: [6, 12],
+  frames: [12, 97],
+  mux: [97, 99.5],
+  verify: [99.5, 100],
+};
+/** Overall render progress 0–100, weighting each phase by its share. */
+function renderOverallPct(p: { phase: string; done: number; total: number }): number {
+  const [a, b] = RENDER_PHASE_SPAN[p.phase] ?? [0, 100];
+  return Math.min(100, a + (b - a) * (p.total > 0 ? Math.min(1, p.done / p.total) : 0));
+}
+/** "1m 23s" / "4s" — for the render elapsed/ETA readout. */
+function fmtDur(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+}
+
 /** Per-stem analysis bar — fill advances with the real server-side build
  *  phase (decoding → features → assembling); queued stems show a nub. */
 function AnalysisBar({ phase, queued }: { phase: string | null; queued: boolean }) {
@@ -406,10 +484,105 @@ function EyeIcon({ off, className = "" }: { off?: boolean; className?: string })
   );
 }
 
+/** The waveform "Look" control set — bound to ANY `VizWaveParams` object: the
+ *  global "2. Look" params (base look) or a waveform layer's own `visuals`.
+ *  `onChange` gets a partial patch the caller merges into its state. */
+function WaveLookControls({ p, onChange, engine }: { p: VizWaveParams; onChange: (patch: Partial<VizWaveParams>) => void; engine: EngineStatus | null }) {
+  return (
+    <div className="grid md:grid-cols-3 gap-4 text-sm">
+      <div className="space-y-2">
+        <label className="block text-xs text-slate-400">Mode</label>
+        <select className="ui-input w-full" value={p.mode} onChange={(e) => onChange({ mode: e.target.value as VizMode })}>
+          {MODES.map((m) => (
+            <option key={m.value} value={m.value}>{m.label}{m.needsEngine ? " (engine)" : ""}</option>
+          ))}
+        </select>
+        {p.mode === "spectrum" && !engine?.ok && (
+          <p className="text-[11px] text-amber-400">Spectrum needs engine features — set up the Python engine above first.</p>
+        )}
+        {p.mode === "ribbons" && (
+          <>
+            <label className="block text-xs text-slate-400 pt-2">Layout</label>
+            <select className="ui-input w-full" value={p.layout} onChange={(e) => onChange({ layout: e.target.value as VizLayout })}>
+              {LAYOUTS.map((l) => (
+                <option key={l.value} value={l.value}>{l.label}</option>
+              ))}
+            </select>
+          </>
+        )}
+        {p.mode === "eqradial" && (
+          <>
+            <label className="block text-xs text-slate-400 pt-2">Inner radius: {Math.round(p.innerRadius * 100)}%</label>
+            <input type="range" min={0} max={0.5} step={0.01} value={p.innerRadius} className="w-full" onChange={(e) => onChange({ innerRadius: Number(e.target.value) })} />
+          </>
+        )}
+      </div>
+      <div className="space-y-2">
+        <label className="block text-xs text-slate-400">Waveform window: {p.waveformLengthSec.toFixed(2)} s</label>
+        <input type="range" min={0.1} max={2} step={0.05} value={p.waveformLengthSec} className="w-full" onChange={(e) => onChange({ waveformLengthSec: Number(e.target.value) })} />
+        <label className="block text-xs text-slate-400">Global amplitude: {p.globalAmplitude.toFixed(2)}×</label>
+        <input type="range" min={0.1} max={3} step={0.05} value={p.globalAmplitude} className="w-full" onChange={(e) => onChange({ globalAmplitude: Number(e.target.value) })} />
+        <label className={`block text-xs ${p.autoGlow.enabled ? "text-slate-600" : "text-slate-400"}`}>Glow: {p.glowIntensity.toFixed(0)}</label>
+        <input type="range" min={0} max={40} step={1} value={p.glowIntensity} disabled={p.autoGlow.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ glowIntensity: Number(e.target.value) })} />
+        <div className="pt-1 space-y-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <label className="text-xs text-slate-400">Glow range: {p.autoGlow.min.toFixed(0)}–{p.autoGlow.max.toFixed(0)}</label>
+            <Button
+              size="sm"
+              variant={p.autoGlow.enabled ? "primary" : "ghost"}
+              onClick={() => onChange({ autoGlow: { ...p.autoGlow, enabled: !p.autoGlow.enabled } })}
+              title="Pick a random glow inside the range on every beat"
+            >
+              Auto
+            </Button>
+          </div>
+          <DualRange
+            min={0}
+            max={40}
+            step={1}
+            lo={p.autoGlow.min}
+            hi={p.autoGlow.max}
+            onChange={(lo, hi) => onChange({ autoGlow: { ...p.autoGlow, min: lo, max: hi } })}
+          />
+          {p.autoGlow.enabled && (
+            <p className="text-[10px] text-slate-500">Auto is on — glow jumps to a random value in this range on every beat (overrides the slider above).</p>
+          )}
+        </div>
+      </div>
+      <div className="space-y-2">
+        <div className="rounded-lg border border-slate-700/60 bg-slate-800/40 p-3 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">Center</span>
+            <Button
+              size="sm"
+              variant={p.autoCenter.enabled ? "primary" : "ghost"}
+              onClick={() => onChange({ autoCenter: { ...p.autoCenter, enabled: !p.autoCenter.enabled } })}
+              title="Move the center to a new spot on every beat"
+            >
+              Auto
+            </Button>
+          </div>
+          <label className={`block text-xs ${p.autoCenter.enabled ? "text-slate-600" : "text-slate-400"}`}>Center X: {p.centerConvergence.x.toFixed(2)}</label>
+          <input type="range" min={0} max={1} step={0.01} value={p.centerConvergence.x} disabled={p.autoCenter.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ centerConvergence: { ...p.centerConvergence, x: Number(e.target.value) } })} />
+          <label className={`block text-xs ${p.autoCenter.enabled ? "text-slate-600" : "text-slate-400"}`}>Center Y: {p.centerConvergence.y.toFixed(2)}</label>
+          <input type="range" min={0} max={1} step={0.01} value={p.centerConvergence.y} disabled={p.autoCenter.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ centerConvergence: { ...p.centerConvergence, y: Number(e.target.value) } })} />
+          {p.autoCenter.enabled && (
+            <>
+              <label className="block text-xs text-slate-400 pt-1">Motion range: {Math.round(p.autoCenter.range * 100)}%</label>
+              <input type="range" min={0} max={0.35} step={0.01} value={p.autoCenter.range} className="w-full" onChange={(e) => onChange({ autoCenter: { ...p.autoCenter, range: Number(e.target.value) } })} />
+              <p className="text-[10px] text-slate-500">Auto is on — the center glides to a new spot on every beat (overrides the X/Y sliders).</p>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** All "2. Look" mode visuals — mirrors svg.ts's modeVisualsSvg so the
  *  visuals layer emits identical shapes wherever it sits in the stack. */
-function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void {
-  for (const s of state.stems) {
+function drawVisuals(ctx: CanvasRenderingContext2D, vis: VizModeVisuals): void {
+  for (const s of vis.stems) {
     if (s.glowWidth > 0 && s.glowAlpha > 0.01) {
       const p = pathOf(s.centerline);
       ctx.globalAlpha = Math.min(1, s.glowAlpha * 0.55);
@@ -429,7 +602,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
     }
   }
 
-  for (const r of state.rings) {
+  for (const r of vis.rings) {
     const p = pathOf(r.points, true);
     if (r.glowWidth > 0 && r.glowAlpha > 0.01) {
       ctx.globalAlpha = r.glowAlpha * 0.5;
@@ -446,7 +619,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
     ctx.fill(p);
   }
 
-  for (const g of state.bars) {
+  for (const g of vis.bars) {
     ctx.globalAlpha = g.alpha;
     ctx.fillStyle = g.color;
     for (let i = 0; i + 3 < g.bars.length; i += 4) {
@@ -454,7 +627,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
     }
   }
 
-  for (const g of state.particles) {
+  for (const g of vis.particles) {
     ctx.globalAlpha = g.alpha;
     ctx.fillStyle = g.color;
     for (let i = 0; i + 2 < g.points.length; i += 3) {
@@ -464,7 +637,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
     }
   }
 
-  for (const m of state.mirrors) {
+  for (const m of vis.mirrors) {
     const fp = pathOf(m.fill, true);
     if (m.glowWidth > 0 && m.glowAlpha > 0.01) {
       ctx.globalAlpha = m.glowAlpha * 0.5;
@@ -491,7 +664,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
     }
   }
 
-  for (const g of state.blocks) {
+  for (const g of vis.blocks) {
     if (g.glowAlpha > 0.01) {
       ctx.globalAlpha = g.glowAlpha * 0.35;
       ctx.fillStyle = g.color;
@@ -518,7 +691,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
     const b = Math.min(EQ_BUCKETS - 1, Math.floor(bright * EQ_BUCKETS));
     return (b + 0.5) / EQ_BUCKETS;
   };
-  for (const g of state.eqbars) {
+  for (const g of vis.eqbars) {
     if (g.glowAlpha > 0.01) {
       ctx.globalAlpha = g.glowAlpha * 0.3;
       ctx.fillStyle = g.color;
@@ -555,7 +728,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
   }
 
   // EQ radial — same brightness→alpha quantization as the SVG emitter.
-  for (const g of state.eqradial) {
+  for (const g of vis.eqradial) {
     if (g.glowAlpha > 0.01) {
       ctx.globalAlpha = g.glowAlpha * 0.3;
       ctx.fillStyle = g.color;
@@ -591,7 +764,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
     }
   }
 
-  for (const s of state.stereos) {
+  for (const s of vis.stereos) {
     for (const fill of [s.leftFill, s.rightFill]) {
       const fp = pathOf(fill, true);
       if (s.glowWidth > 0 && s.glowAlpha > 0.01) {
@@ -618,7 +791,7 @@ function drawVisuals(ctx: CanvasRenderingContext2D, state: VizFrameState): void 
   // Silk — the strand pack (up+down subpaths in one Path2D) stroked with the
   // spectral gradient, the scale-1 edge re-stroked brighter, gradient axis
   // strip + white core, then dust. Same emit order as svg.ts.
-  for (const s of state.silks) {
+  for (const s of vis.silks) {
     const grad = ctx.createLinearGradient(s.gradX0, 0, s.gradX1, 0);
     grad.addColorStop(0, s.grad0);
     grad.addColorStop(Math.min(0.98, Math.max(0.02, s.gradMid)), s.grad1);
@@ -687,14 +860,15 @@ function drawState(
   // frame center; a visuals row draws the whole mode-visual set at that
   // position (absent → no waveforms at all). Dancer + star stay on top.
   state.videoLayers.forEach((v, i) => {
-    if (v.hidden || v.opacity <= 0) return;
+    if (v.hidden || v.visible === false || v.opacity <= 0) return;
     const dw = w * v.scale;
     const dh = h * v.scale;
     const dx = v.x * w - dw / 2;
     const dy = v.y * h - dh / 2;
     if (v.kind === "visuals") {
+      const vis = visualsForRow(state, i); // this row's own mode geometry
       if (v.opacity >= 0.999 && v.scale === 1 && v.x === 0.5 && v.y === 0.5) {
-        drawVisuals(ctx, state);
+        drawVisuals(ctx, vis);
         return;
       }
       if (!visualsCanvas) {
@@ -705,7 +879,7 @@ function drawState(
       if (visualsCanvas.width !== w) visualsCanvas.width = w;
       if (visualsCanvas.height !== h) visualsCanvas.height = h;
       visualsCtx.clearRect(0, 0, w, h);
-      drawVisuals(visualsCtx, state);
+      drawVisuals(visualsCtx, vis);
       ctx.globalAlpha = v.opacity;
       ctx.drawImage(visualsCanvas, dx, dy, dw, dh);
       ctx.globalAlpha = 1;
@@ -718,7 +892,10 @@ function drawState(
     const srcH = isVid ? el.videoHeight : el.naturalHeight;
     const ready = isVid ? el.readyState >= 2 : el.complete;
     if (!ready || srcW === 0 || srcH === 0) return;
-    const [sx, sy, sw, sh] = coverCrop(srcW, srcH, w, h);
+    // Source-crop window — the layer's zoom/pan selects which part of the
+    // media fills the tile (defaults reproduce the centered cover-fit).
+    const r = zoomPanRect(srcW, srcH, w, h, v.zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5 });
+    const { sx, sy, sw, sh } = r;
     ctx.globalAlpha = v.opacity;
     // Color methods key the drawn pixels via the shared pass; `cutout` draws
     // the keyed WebM directly (its alpha is baked into the frames).
@@ -798,9 +975,23 @@ export function Visualizer({
   const [renderSettings, setRenderSettings] = useState(initial?.render ?? DEFAULT_RENDER);
   const [job, setJob] = useState<VizRenderJob | null>(null);
   const [renders, setRenders] = useState<VizRenderedFile[]>([]);
+  // Render log — appended per phase transition / ~10% checkpoint / detail
+  // change while polling a running job; reset when a new render starts.
+  const [renderLog, setRenderLog] = useState<string[]>([]);
+  const lastLogMarkRef = useRef<{ phase: string; mark: number; detail: string }>({ phase: "", mark: -1, detail: "" });
+  const renderLogRef = useRef<HTMLPreElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // Sessions — named server-side snapshots of the whole setup + media.
+  const [sessions, setSessions] = useState<VizSessionMeta[]>([]);
+  const [sessionName, setSessionName] = useState("");
+  /** The session the current state was last loaded from / saved to. */
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(initial?.sessionId ?? null);
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameText, setRenameText] = useState("");
 
   // Preview state
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -879,6 +1070,11 @@ export function Visualizer({
     setRenders(r.renders);
   }, [projectId]);
 
+  const loadSessions = useCallback(async () => {
+    const r = await api.vizSessions(projectId);
+    setSessions(r.sessions);
+  }, [projectId]);
+
   // Engine status: poll once on mount, then only while provisioning runs.
   const refreshEngine = useCallback(() => {
     api.engineStatus().then(setEngine).catch(() => setEngine(null));
@@ -899,6 +1095,10 @@ export function Visualizer({
     setGlobals(saved?.globals ?? DEFAULT_GLOBALS);
     setRenderSettings(saved?.render ?? DEFAULT_RENDER);
     setJob(null);
+    setActiveSessionId(saved?.sessionId ?? null);
+    setSessionName("");
+    setSessions([]);
+    setRenamingId(null);
     signalsRef.current.clear();
     if (saved?.jobId) {
       api.vizRenderJob(saved.jobId).then((r) => setJob(r.job)).catch(() => {});
@@ -911,14 +1111,15 @@ export function Visualizer({
       })
       .catch((e) => setError((e as Error).message));
     loadRenders().catch(() => {});
-  }, [projectId, loadStems, loadRenders]);
+    loadSessions().catch(() => {});
+  }, [projectId, loadStems, loadRenders, loadSessions]);
 
   // Persist session.
   useEffect(() => {
     try {
-      localStorage.setItem(storageKey(projectId), JSON.stringify({ stems: stemInputs, globals, render: renderSettings, jobId: job?.id ?? null } satisfies PersistedViz));
+      localStorage.setItem(storageKey(projectId), JSON.stringify({ stems: stemInputs, globals, render: renderSettings, jobId: job?.id ?? null, sessionId: activeSessionId } satisfies PersistedViz));
     } catch { /* best-effort */ }
-  }, [projectId, stemInputs, globals, renderSettings, job?.id]);
+  }, [projectId, stemInputs, globals, renderSettings, job?.id, activeSessionId]);
 
   // Fetch signals for preview whenever the stem selection changes.
   const [decodingName, setDecodingName] = useState<string | null>(null);
@@ -968,7 +1169,11 @@ export function Visualizer({
     return () => clearInterval(t);
   }, [projectId, decodingName]);
 
-  // Poll active render.
+  const pushRenderLog = (line: string) =>
+    setRenderLog((ls) => [...ls.slice(-199), `${new Date().toLocaleTimeString()}  ${line}`]);
+
+  // Poll active render — also append log lines on phase transitions,
+  // ~10% checkpoints within a phase, and detail changes (non-frames phases).
   useEffect(() => {
     if (!job || job.status !== "running") return;
     const t = setInterval(() => {
@@ -976,17 +1181,43 @@ export function Visualizer({
         .vizRenderJob(job.id)
         .then((r) => {
           setJob(r.job);
+          const p = r.job.progress;
+          const mark = lastLogMarkRef.current;
+          const label = RENDER_PHASE_LABELS[p.phase] ?? p.phase;
+          if (p.phase !== mark.phase) {
+            pushRenderLog(`▸ ${label}`);
+            mark.phase = p.phase;
+            mark.mark = -1;
+            mark.detail = "";
+          }
+          const pct10 = p.total > 0 ? Math.floor((p.done / p.total) * 10) : -1;
+          if (p.detail && p.detail !== mark.detail && p.phase !== "frames") {
+            mark.detail = p.detail;
+            pushRenderLog(`${label} — ${p.detail}${p.total ? ` (${p.done}/${p.total})` : ""}`);
+          } else if (pct10 > mark.mark) {
+            mark.mark = pct10;
+            pushRenderLog(`${label} — ${p.done}/${p.total}`);
+          }
           if (r.job.status === "done") {
+            pushRenderLog(`✔ done — ${r.job.frameCount} frames`);
             onToast("Visualizer rendered", "success");
             loadRenders().catch(() => {});
           } else if (r.job.status === "failed") {
+            pushRenderLog(`✖ failed — ${r.job.error?.message ?? "unknown error"}`);
             onToast(`Render failed: ${r.job.error?.message ?? "unknown error"}`, "error");
+          } else if (r.job.status === "cancelled") {
+            pushRenderLog("■ cancelled");
           }
         })
         .catch(() => {});
     }, 1000);
     return () => clearInterval(t);
   }, [job, onToast, loadRenders]);
+
+  // Keep the render log scrolled to its newest line.
+  useEffect(() => {
+    renderLogRef.current?.scrollTo(0, renderLogRef.current.scrollHeight);
+  }, [renderLog]);
 
   // --- AI cutout (keyed WebM) ---------------------------------------------------
   // The engine bakes a transparent WebM of a layer's video; the preview's
@@ -1457,6 +1688,105 @@ export function Visualizer({
     }
   };
 
+  // --- Sessions ---------------------------------------------------------------
+  // A session captures EVERYTHING on this page: the stem selection + tweaks,
+  // all look/layer/dancer settings, render settings — and the media itself
+  // (the server snapshots the files). Loading restores both.
+
+  const currentPayload = useCallback((): VisualizerSessionPayload => ({ renderSettings, globalVisuals: globals, stems: stemInputs }), [renderSettings, globals, stemInputs]);
+
+  const saveNewSession = async () => {
+    const name = sessionName.trim() || `Session ${new Date().toLocaleString()}`;
+    setSessionBusy(true);
+    setError(null);
+    try {
+      const r = await api.vizSaveSession(projectId, name, currentPayload());
+      setActiveSessionId(r.session.id);
+      setSessionName(r.session.name);
+      await loadSessions();
+      onToast(`Session "${r.session.name}" saved`, "success");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  /** Overwrite an existing session with the current setup. */
+  const overwriteSession = async (id: string) => {
+    setSessionBusy(true);
+    setError(null);
+    try {
+      const r = await api.vizUpdateSession(projectId, id, { payload: currentPayload() });
+      setActiveSessionId(id);
+      await loadSessions();
+      onToast(`Session "${r.session.name}" updated`, "success");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const loadSessionById = async (id: string) => {
+    setSessionBusy(true);
+    setError(null);
+    try {
+      const r = await api.vizLoadSession(projectId, id);
+      const norm = normalizePersisted({ stems: r.payload.stems, globals: r.payload.globalVisuals, render: r.payload.renderSettings });
+      if (playing) pausePlayback();
+      stopAudition();
+      // Stem files may have been restored with different bytes — refetch
+      // every decoded signal instead of drawing from a stale cache.
+      signalsRef.current.clear();
+      failedSignals.current.clear();
+      setStemInputs(norm.stems);
+      setGlobals(norm.globals);
+      setRenderSettings(norm.render);
+      setActiveSessionId(r.session.id);
+      setSessionName(r.session.name);
+      await loadStems();
+      // A deleted layer asset may have been re-registered — refresh pickers.
+      if (r.restoredMedia > 0) window.dispatchEvent(new Event(ASSETS_CHANGED_EVENT));
+      onToast(`Session "${r.session.name}" loaded`, "success");
+      for (const w of r.warnings) onToast(w, "error");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const removeSession = async (s: VizSessionMeta) => {
+    if (!window.confirm(`Delete session "${s.name}"? Its saved snapshot (settings + media copies) is removed.`)) return;
+    setSessionBusy(true);
+    setError(null);
+    try {
+      await api.vizDeleteSession(projectId, s.id);
+      if (activeSessionId === s.id) setActiveSessionId(null);
+      await loadSessions();
+      onToast("Session deleted", "success");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const commitRename = async (id: string) => {
+    const name = renameText.trim();
+    setRenamingId(null);
+    setRenameText("");
+    if (!name) return;
+    try {
+      const r = await api.vizUpdateSession(projectId, id, { name });
+      if (activeSessionId === id) setSessionName(r.session.name);
+      await loadSessions();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
   /** Filename of a /files/… render URL (for the reveal endpoint). */
   const renderFileName = (url: string) => decodeURIComponent(url.split("/").pop() ?? "render.mp4");
 
@@ -1491,11 +1821,22 @@ export function Visualizer({
   // Remove from the visual only — the stem file stays in the library.
   const removeFromRender = (name: string) => setStemInputs((cur) => cur.filter((s) => s.name !== name));
 
-  const render = async () => {
+  const render = async (draft: boolean) => {
     setError(null);
+    lastLogMarkRef.current = { phase: "", mark: -1, detail: "" };
+    setRenderLog([]);
+    pushRenderLog(draft ? "▸ Draft render queued" : "▸ Render queued");
     try {
+      // Draft pass: shrink to ~480px (aspect preserved), 12 fps + the
+      // ultrafast encoder preset — a fast, low-quality first look.
+      const scale = draft ? Math.min(1, 480 / Math.max(renderSettings.width, renderSettings.height)) : 1;
       const req: VisualizerRenderInput = {
-        renderSettings: { width: renderSettings.width, height: renderSettings.height, fps: renderSettings.fps },
+        renderSettings: {
+          width: Math.max(240, Math.round(renderSettings.width * scale)),
+          height: Math.max(240, Math.round(renderSettings.height * scale)),
+          fps: draft ? 12 : renderSettings.fps,
+          draft,
+        },
         globalVisuals: globals,
         stems: stemInputs,
       };
@@ -1513,13 +1854,40 @@ export function Visualizer({
   const setLayers = (fn: (ls: VizMediaLayerConfig[]) => VizMediaLayerConfig[]) =>
     setGlobals((g) => ({ ...g, video: { layers: fn(g.video.layers) } }));
   const addLayer = (assetId: string) =>
-    setLayers((ls) => (ls.length >= VIZ_MAX_VIDEO_LAYERS || !assetId ? ls : [...ls, { kind: "media", assetId, hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: { ...DEFAULT_VIDEO_KEY } }]));
+    setLayers((ls) =>
+      ls.length >= VIZ_MAX_VIDEO_LAYERS || !assetId
+        ? ls
+        : [
+            ...ls,
+            {
+              kind: "media",
+              assetId,
+              hidden: false,
+              x: 0.5,
+              y: 0.5,
+              opacity: 1,
+              scale: 1,
+              key: { ...DEFAULT_VIDEO_KEY },
+              zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 },
+              visibility: { show: [], hide: [] },
+            },
+          ],
+    );
+  /** Add a waveform layer stamped with a copy of the current 2. Look — from
+   *  then on its settings are its own, edited on the row (mode included). */
   const addVisualsLayer = () =>
-    setLayers((ls) => (ls.length >= VIZ_MAX_VIDEO_LAYERS || ls.some((l) => l.kind === "visuals") ? ls : [...ls, vizVisualsLayer()]));
+    setLayers((ls) => (ls.length >= VIZ_MAX_VIDEO_LAYERS ? ls : [...ls, vizVisualsLayer(waveParamsFromGlobals(globals))]));
   const patchLayer = (i: number, patch: Partial<VizMediaLayerConfig>) =>
     setLayers((ls) => ls.map((l, j) => (j === i ? ({ ...l, ...patch } as VizMediaLayerConfig) : l)));
   const setLayerKey = (i: number, patch: Partial<VizVideoKeyConfig>) =>
     setLayers((ls) => ls.map((l, j) => (j === i && l.kind === "media" ? { ...l, key: { ...l.key, ...patch } } : l)));
+  const setLayerZoomPan = (i: number, patch: Partial<VizZoomPanConfig>) =>
+    setLayers((ls) => ls.map((l, j) => (j === i && l.kind === "media" ? { ...l, zoomPan: { ...l.zoomPan, ...patch } } : l)));
+  const setLayerVis = (i: number, patch: Partial<VizVisibilityConfig>) =>
+    setLayers((ls) => ls.map((l, j) => (j === i ? ({ ...l, visibility: { ...l.visibility, ...patch } } as VizMediaLayerConfig) : l)));
+  /** Mix length in seconds — longest stem signal (1s floor so the windows
+   *  timeline has a sane scale before signals arrive). */
+  const mixDurSec = Math.max(1, duration);
   const removeLayer = (i: number) => {
     layerElsRef.current.delete(i);
     setLayers((ls) => ls.filter((_, j) => j !== i));
@@ -1552,7 +1920,6 @@ export function Visualizer({
     patchLayer(i, { key: { ...layer.key, color: `#${((1 << 24) | (d[0]! << 16) | (d[1]! << 8) | d[2]!).toString(16).slice(1).toUpperCase()}` } });
   };
 
-  const spectrumNeedsEngine = globals.mode === "spectrum";
   const hasVisualsLayer = globals.video.layers.some((l) => l.kind === "visuals");
   const pickerResults = useMemo(() => {
     const q = pickerQ.trim().toLowerCase();
@@ -1606,99 +1973,20 @@ export function Visualizer({
   }, [fullscreen, canvasH, renderSettings.width, renderSettings.height]);
 
   // The "2. Look" controls — shared between the settings section and the
-  // fullscreen preview overlay, so edits apply live in both places.
+  // fullscreen preview overlay, so edits apply live in both places. These are
+  // the BASE look: waveform layer rows can carry their own copy and override
+  // them entirely (same control set, bound to the row's `visuals`).
   const lookContent = (
     <>
-      <div className="grid md:grid-cols-3 gap-4 text-sm">
-        <div className="space-y-2">
-          <label className="block text-xs text-slate-400">Mode</label>
-          <select className="ui-input w-full" value={globals.mode} onChange={(e) => setG("mode", e.target.value as VizMode)}>
-            {MODES.map((m) => (
-              <option key={m.value} value={m.value}>{m.label}{m.needsEngine ? " (engine)" : ""}</option>
-            ))}
-          </select>
-          {spectrumNeedsEngine && !engine?.ok && (
-            <p className="text-[11px] text-amber-400">Spectrum needs engine features — set up the Python engine above first.</p>
-          )}
-          {globals.mode === "ribbons" && (
-            <>
-              <label className="block text-xs text-slate-400 pt-2">Layout</label>
-              <select className="ui-input w-full" value={globals.layout} onChange={(e) => setG("layout", e.target.value as VizLayout)}>
-                {LAYOUTS.map((l) => (
-                  <option key={l.value} value={l.value}>{l.label}</option>
-                ))}
-              </select>
-            </>
-          )}
-          {globals.mode === "eqradial" && (
-            <>
-              <label className="block text-xs text-slate-400 pt-2">Inner radius: {Math.round(globals.innerRadius * 100)}%</label>
-              <input type="range" min={0} max={0.5} step={0.01} value={globals.innerRadius} className="w-full" onChange={(e) => setG("innerRadius", Number(e.target.value))} />
-            </>
-          )}
-        </div>
-        <div className="space-y-2">
-          <label className="block text-xs text-slate-400">Waveform window: {globals.waveformLengthSec.toFixed(2)} s</label>
-          <input type="range" min={0.1} max={2} step={0.05} value={globals.waveformLengthSec} className="w-full" onChange={(e) => setG("waveformLengthSec", Number(e.target.value))} />
-          <label className="block text-xs text-slate-400">Global amplitude: {globals.globalAmplitude.toFixed(2)}×</label>
-          <input type="range" min={0.1} max={3} step={0.05} value={globals.globalAmplitude} className="w-full" onChange={(e) => setG("globalAmplitude", Number(e.target.value))} />
-          <label className={`block text-xs ${globals.autoGlow.enabled ? "text-slate-600" : "text-slate-400"}`}>Glow: {globals.glowIntensity.toFixed(0)}</label>
-          <input type="range" min={0} max={40} step={1} value={globals.glowIntensity} disabled={globals.autoGlow.enabled} className="w-full disabled:opacity-40" onChange={(e) => setG("glowIntensity", Number(e.target.value))} />
-          <div className="pt-1 space-y-1.5">
-            <div className="flex items-center justify-between gap-2">
-              <label className="text-xs text-slate-400">Glow range: {globals.autoGlow.min.toFixed(0)}–{globals.autoGlow.max.toFixed(0)}</label>
-              <Button
-                size="sm"
-                variant={globals.autoGlow.enabled ? "primary" : "ghost"}
-                onClick={() => setG("autoGlow", { ...globals.autoGlow, enabled: !globals.autoGlow.enabled })}
-                title="Pick a random glow inside the range on every beat"
-              >
-                Auto
-              </Button>
-            </div>
-            <DualRange
-              min={0}
-              max={40}
-              step={1}
-              lo={globals.autoGlow.min}
-              hi={globals.autoGlow.max}
-              onChange={(lo, hi) => setG("autoGlow", { ...globals.autoGlow, min: lo, max: hi })}
-            />
-            {globals.autoGlow.enabled && (
-              <p className="text-[10px] text-slate-500">Auto is on — glow jumps to a random value in this range on every beat (overrides the slider above).</p>
-            )}
-          </div>
-        </div>
-        <div className="space-y-2">
-          <label className="flex items-center gap-2 text-xs text-slate-400">
-            Background
-            <input type="color" value={globals.backgroundColor} onChange={(e) => setG("backgroundColor", e.target.value)} className="w-8 h-6 rounded border border-slate-600" />
-          </label>
-          <div className="rounded-lg border border-slate-700/60 bg-slate-800/40 p-3 space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">Center</span>
-              <Button
-                size="sm"
-                variant={globals.autoCenter.enabled ? "primary" : "ghost"}
-                onClick={() => setG("autoCenter", { ...globals.autoCenter, enabled: !globals.autoCenter.enabled })}
-                title="Move the center to a new spot on every beat"
-              >
-                Auto
-              </Button>
-            </div>
-            <label className={`block text-xs ${globals.autoCenter.enabled ? "text-slate-600" : "text-slate-400"}`}>Center X: {globals.centerConvergence.x.toFixed(2)}</label>
-            <input type="range" min={0} max={1} step={0.01} value={globals.centerConvergence.x} disabled={globals.autoCenter.enabled} className="w-full disabled:opacity-40" onChange={(e) => setG("centerConvergence", { ...globals.centerConvergence, x: Number(e.target.value) })} />
-            <label className={`block text-xs ${globals.autoCenter.enabled ? "text-slate-600" : "text-slate-400"}`}>Center Y: {globals.centerConvergence.y.toFixed(2)}</label>
-            <input type="range" min={0} max={1} step={0.01} value={globals.centerConvergence.y} disabled={globals.autoCenter.enabled} className="w-full disabled:opacity-40" onChange={(e) => setG("centerConvergence", { ...globals.centerConvergence, y: Number(e.target.value) })} />
-            {globals.autoCenter.enabled && (
-              <>
-                <label className="block text-xs text-slate-400 pt-1">Motion range: {Math.round(globals.autoCenter.range * 100)}%</label>
-                <input type="range" min={0} max={0.35} step={0.01} value={globals.autoCenter.range} className="w-full" onChange={(e) => setG("autoCenter", { ...globals.autoCenter, range: Number(e.target.value) })} />
-                <p className="text-[10px] text-slate-500">Auto is on — the center glides to a new spot on every beat (overrides the X/Y sliders).</p>
-              </>
-            )}
-          </div>
-        </div>
+      <WaveLookControls p={globals} onChange={(patch) => setGlobals((g) => ({ ...g, ...patch }))} engine={engine} />
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 pt-1">
+        <label className="flex items-center gap-2 text-xs text-slate-400">
+          Background
+          <input type="color" value={globals.backgroundColor} onChange={(e) => setG("backgroundColor", e.target.value)} className="w-8 h-6 rounded border border-slate-600" />
+        </label>
+        <span className="text-[11px] text-slate-500">
+          Base look — ◈ waveform layers without their own settings draw with these. Add more waveform layers in "3. Media layers" to stack different looks.
+        </span>
       </div>
 
       {/* Dancer */}
@@ -1774,18 +2062,17 @@ export function Visualizer({
                 >
                   <button
                     type="button"
-                    disabled={hasVisualsLayer}
                     onClick={() => {
                       addVisualsLayer();
                       setPickerOpen(false);
                     }}
                     className="w-full flex items-center gap-2 px-2 py-2 text-left text-xs text-slate-200 hover:bg-slate-800/60 disabled:opacity-40 border-b border-slate-800"
-                    title="Add the 2. Look visuals as a layer at the top of the stack"
+                    title="Add a waveform layer at the top of the stack — starts as a copy of the 2. Look settings, editable on the row"
                   >
                     <span className="w-12 h-8 rounded border border-violet-600/50 bg-violet-950/50 flex items-center justify-center text-violet-300 shrink-0">◈</span>
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate">Waveform visuals</span>
-                      <span className="text-[10px] text-slate-500">2. Look · {globals.mode}{hasVisualsLayer ? " — already in the stack" : ""}</span>
+                      <span className="block truncate">Waveform layer</span>
+                      <span className="text-[10px] text-slate-500">own settings · starts as a copy of 2. Look · stack as many as you like</span>
                     </span>
                   </button>
                   <div className="flex items-center gap-1.5 px-2 py-1.5 border-b border-slate-800">
@@ -1862,7 +2149,7 @@ export function Visualizer({
             )}
           </div>
           {hasVisualsLayer && (
-            <p className="text-[11px] text-slate-500">◈ row = the 2. Look visuals — remove it and they won't render.</p>
+            <p className="text-[11px] text-slate-500">◈ rows = waveform layers — each can carry its own settings (or inherit 2. Look). No ◈ row → no waveforms.</p>
           )}
           {videoAssets.length === 0 && (
             <p className="text-[11px] text-slate-500">
@@ -1981,14 +2268,16 @@ export function Visualizer({
                       />
                     ) : null}
                     <div className={`min-w-0 flex-1 ${l.hidden ? "opacity-40" : ""}`}>
-                      <div className="truncate text-xs text-slate-200" title={isVis ? "Waveform visuals — section 2. Look" : asset?.title ?? (l.kind === "media" ? l.assetId : "")}>
-                        {isVis ? "Waveform visuals" : asset?.title ?? (l.kind === "media" ? l.assetId : "")}
+                      <div className="truncate text-xs text-slate-200" title={isVis ? (l.visuals ? `Waveform layer — ${l.visuals.mode}` : "Waveform visuals — inherited from 2. Look") : asset?.title ?? (l.kind === "media" ? l.assetId : "")}>
+                        {isVis ? (l.visuals ? `Waveform · ${l.visuals.mode}` : "Waveform visuals") : asset?.title ?? (l.kind === "media" ? l.assetId : "")}
                       </div>
                       <div className="flex items-center gap-1.5">
                         {isVis ? (
                           <>
                             <Badge tone="violet">visuals</Badge>
-                            <span className="text-[10px] text-slate-500">2. Look · {globals.mode}</span>
+                            <span className="text-[10px] text-slate-500">
+                              {l.visuals ? `${l.visuals.mode} · own settings` : `${globals.mode} · inherits 2. Look`}
+                            </span>
                           </>
                         ) : (
                           <>
@@ -1997,6 +2286,11 @@ export function Visualizer({
                               <span className="text-[10px] text-amber-400">not in this project anymore</span>
                             )}
                           </>
+                        )}
+                        {l.visibility.show.length + l.visibility.hide.length > 0 && (
+                          <span className="text-[10px] text-slate-500" title="Scheduled — the layer shows/hides inside its windows">
+                            ⏱
+                          </span>
                         )}
                       </div>
                     </div>
@@ -2053,6 +2347,108 @@ export function Visualizer({
                         <input type="range" min={0.1} max={2} step={0.05} value={l.scale} className="w-20" onChange={(e) => patchLayer(i, { scale: Number(e.target.value) })} />
                         <span className="w-9 text-right">{Math.round(l.scale * 100)}%</span>
                       </label>
+                    </div>
+                    {l.kind === "media" && (
+                    <div className={LAYER_CARD}>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className={LAYER_CARD_LABEL}>Zoom / pan</span>
+                        <button
+                          type="button"
+                          className="text-slate-500 hover:text-slate-200 disabled:opacity-30"
+                          disabled={l.zoomPan.zoom === 1 && l.zoomPan.panX === 0.5 && l.zoomPan.panY === 0.5}
+                          onClick={() => patchLayer(i, { zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 } })}
+                          title="Back to the cover-fit view"
+                        >
+                          ⌖
+                        </button>
+                      </div>
+                      <label className="flex items-center gap-1" title="Zoom into the source — 100% is the normal cover-fit crop">
+                        <span className="w-3 text-slate-500">Z</span>
+                        <input type="range" min={1} max={8} step={0.05} value={l.zoomPan.zoom} className="w-20" onChange={(e) => setLayerZoomPan(i, { zoom: Number(e.target.value) })} />
+                        <span className="w-8 text-right">{Math.round(l.zoomPan.zoom * 100)}%</span>
+                      </label>
+                      <label className="flex items-center gap-1" title="Pan inside the source — which part of the media the crop window looks at">
+                        <span className="w-3 text-slate-500">X</span>
+                        <input type="range" min={0} max={1} step={0.01} value={l.zoomPan.panX} className="w-20" onChange={(e) => setLayerZoomPan(i, { panX: Number(e.target.value) })} />
+                        <span className="w-8 text-right">{Math.round(l.zoomPan.panX * 100)}%</span>
+                      </label>
+                      <label className="flex items-center gap-1" title="Pan inside the source — which part of the media the crop window looks at">
+                        <span className="w-3 text-slate-500">Y</span>
+                        <input type="range" min={0} max={1} step={0.01} value={l.zoomPan.panY} className="w-20" onChange={(e) => setLayerZoomPan(i, { panY: Number(e.target.value) })} />
+                        <span className="w-8 text-right">{Math.round(l.zoomPan.panY * 100)}%</span>
+                      </label>
+                    </div>
+                    )}
+                    <div className={`${LAYER_CARD} min-w-[230px]`}>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className={LAYER_CARD_LABEL}>Show / hide</span>
+                        <span className="flex gap-2">
+                          <button
+                            type="button"
+                            className="text-[10px] text-sky-400 hover:text-sky-300"
+                            onClick={() => setLayerVis(i, { show: [...l.visibility.show, { start: 0, end: Math.min(5, mixDurSec) }] })}
+                            title="Add a window when the layer is shown (otherwise it's always visible)"
+                          >
+                            + shown
+                          </button>
+                          <button
+                            type="button"
+                            className="text-[10px] text-rose-400 hover:text-rose-300"
+                            onClick={() => setLayerVis(i, { hide: [...l.visibility.hide, { start: 0, end: Math.min(2, mixDurSec) }] })}
+                            title="Add a window when the layer is hidden (subtracts from the shown time)"
+                          >
+                            + hidden
+                          </button>
+                        </span>
+                      </div>
+                      {/* Windows over the mix timeline — sky = shown, rose = hidden. */}
+                      <div className="relative h-1.5 w-full rounded bg-slate-800/80 overflow-hidden" title={`${mixDurSec.toFixed(1)}s mix`}>
+                        {l.visibility.show.map((w, k) => (
+                          <div
+                            key={`s${k}`}
+                            className="absolute inset-y-0 bg-sky-500/80"
+                            style={{ left: `${Math.min(100, (w.start / mixDurSec) * 100)}%`, width: `${Math.max(0.5, Math.min(100, ((w.end - w.start) / mixDurSec) * 100))}%` }}
+                          />
+                        ))}
+                        {l.visibility.hide.map((w, k) => (
+                          <div
+                            key={`h${k}`}
+                            className="absolute inset-y-0 bg-rose-500/80"
+                            style={{ left: `${Math.min(100, (w.start / mixDurSec) * 100)}%`, width: `${Math.max(0.5, Math.min(100, ((w.end - w.start) / mixDurSec) * 100))}%` }}
+                          />
+                        ))}
+                      </div>
+                      {l.visibility.show.length + l.visibility.hide.length === 0 && <span className="text-[10px] text-slate-500">always visible</span>}
+                      {(["show", "hide"] as const).flatMap((kind) =>
+                        l.visibility[kind].map((w, k) => (
+                          <span key={`${kind}${k}`} className="flex items-center gap-1">
+                            <span className={`w-9 text-[9px] uppercase tracking-wide ${kind === "show" ? "text-sky-400" : "text-rose-400"}`}>{kind === "show" ? "shown" : "hidden"}</span>
+                            <input
+                              type="number"
+                              min={0}
+                              step={0.1}
+                              value={w.start}
+                              onChange={(e) => setLayerVis(i, { [kind]: l.visibility[kind].map((x, j) => (j === k ? { ...x, start: Math.max(0, Number(e.target.value)) } : x)) })}
+                              className="ui-input w-14 !px-1 !py-0 text-[10px]"
+                              title="Start (seconds)"
+                            />
+                            <span className="text-slate-600">–</span>
+                            <input
+                              type="number"
+                              min={0}
+                              step={0.1}
+                              value={w.end}
+                              onChange={(e) => setLayerVis(i, { [kind]: l.visibility[kind].map((x, j) => (j === k ? { ...x, end: Math.max(0, Number(e.target.value)) } : x)) })}
+                              className="ui-input w-14 !px-1 !py-0 text-[10px]"
+                              title="End (seconds)"
+                            />
+                            <span className="text-slate-600">s</span>
+                            <button type="button" className="text-slate-500 hover:text-rose-400" onClick={() => setLayerVis(i, { [kind]: l.visibility[kind].filter((_, j) => j !== k) })} title="Remove window">
+                              ×
+                            </button>
+                          </span>
+                        )),
+                      )}
                     </div>
                     {l.kind === "media" && (
                     <div className={`${LAYER_CARD} flex-1 min-w-[280px]`}>
@@ -2214,6 +2610,37 @@ export function Visualizer({
                       )}
                     </div>
                     )}
+                    {isVis && (
+                      <div className={`${LAYER_CARD} flex-1 min-w-[320px]`}>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className={LAYER_CARD_LABEL}>Waveform</span>
+                          {l.visuals ? (
+                            <button
+                              type="button"
+                              className="text-slate-500 hover:text-slate-200"
+                              onClick={() => patchLayer(i, { visuals: undefined })}
+                              title="Drop this row's own settings — draw with the shared 2. Look again"
+                            >
+                              ↺ use 2. Look
+                            </button>
+                          ) : (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => patchLayer(i, { visuals: waveParamsFromGlobals(globals) })}
+                              title="Give this waveform layer its own settings — copied from 2. Look"
+                            >
+                              Customize
+                            </Button>
+                          )}
+                        </div>
+                        {l.visuals ? (
+                          <WaveLookControls p={l.visuals} engine={engine} onChange={(patch) => patchLayer(i, { visuals: { ...l.visuals!, ...patch } })} />
+                        ) : (
+                          <p className="text-[10px] text-slate-500">Draws with the shared 2. Look — hit Customize to tweak this layer alone (mode, amp, glow, center…).</p>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </li>
               );
@@ -2268,6 +2695,67 @@ export function Visualizer({
           </div>
         </Card>
       )}
+
+      {/* Sessions — save/restore the whole setup (settings + media) */}
+      <Section icon="▤" title="Sessions" action={<span className="text-xs text-slate-500">every setting + the media itself</span>}>
+        <div className="flex items-center gap-2">
+          <input
+            value={sessionName}
+            onChange={(e) => setSessionName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void saveNewSession();
+            }}
+            placeholder="Session name…"
+            className="ui-input !py-1 flex-1 text-xs"
+          />
+          <Button size="sm" onClick={() => void saveNewSession()} disabled={sessionBusy} title="Snapshot the current setup — stems, look, layers and render settings + the media files">
+            {sessionBusy ? "Working…" : "Save session"}
+          </Button>
+        </div>
+        {sessions.length === 0 ? (
+          <p className="text-sm text-slate-500">
+            No saved sessions yet — name one above to snapshot the current setup. Loading a session restores every setting AND its media (stems and layer files come back even if deleted).
+          </p>
+        ) : (
+          <div className="space-y-1">
+            {sessions.map((s) => (
+              <div key={s.id} className={`flex items-center gap-2 rounded px-2 py-1.5 text-sm ${s.id === activeSessionId ? "bg-sky-950/40 border border-sky-800/50" : "bg-slate-800/40"}`}>
+                {renamingId === s.id ? (
+                  <input
+                    autoFocus
+                    value={renameText}
+                    onChange={(e) => setRenameText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void commitRename(s.id);
+                      else if (e.key === "Escape") setRenamingId(null);
+                    }}
+                    onBlur={() => void commitRename(s.id)}
+                    className="ui-input !py-0.5 flex-1 text-xs"
+                  />
+                ) : (
+                  <span className="flex-1 truncate" title={s.name}>{s.name}</span>
+                )}
+                <span className="text-[11px] text-slate-500 shrink-0" title={`${s.stems.length} stem(s) · ${s.mediaLayers} media layer(s) · saved ${new Date(s.updatedAt).toLocaleString()}`}>
+                  {s.stems.length}♪ · {s.mediaLayers}▦ · {new Date(s.updatedAt).toLocaleDateString()}
+                </span>
+                {s.id === activeSessionId && <Badge tone="info">loaded</Badge>}
+                <Button size="sm" variant="ghost" onClick={() => void loadSessionById(s.id)} disabled={sessionBusy} title="Restore this session — settings, stems and media">
+                  Load
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => void overwriteSession(s.id)} disabled={sessionBusy} title="Overwrite this session with the current setup">
+                  Save
+                </Button>
+                <button className="text-slate-500 hover:text-slate-200 text-xs shrink-0" onClick={() => { setRenamingId(s.id); setRenameText(s.name); }} title="Rename session">
+                  ✎
+                </button>
+                <button className="text-slate-500 hover:text-rose-400 text-xs shrink-0" onClick={() => void removeSession(s)} title="Delete session">
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Section>
 
       {/* 1. Stems */}
       <Section
@@ -2678,8 +3166,16 @@ export function Visualizer({
             <option value={30}>30 fps</option>
             <option value={60}>60 fps</option>
           </select>
-          <Button variant="primary" onClick={render} disabled={stemInputs.length === 0 || rendering}>
+          <Button variant="primary" onClick={() => void render(false)} disabled={stemInputs.length === 0 || rendering}>
             {rendering ? "Rendering…" : "Render MP4"}
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => void render(true)}
+            disabled={stemInputs.length === 0 || rendering}
+            title="Fast, low-quality first draft — ~480px, 12 fps, ultrafast encode"
+          >
+            ⚡ Draft
           </Button>
           <Button variant="ghost" onClick={() => revealRender()} title="Open the renders folder in the file explorer (created on demand if empty)">
             📁 Open folder
@@ -2691,15 +3187,34 @@ export function Visualizer({
             <div className="flex items-center gap-3 text-sm">
               <Badge tone={job.status === "done" ? "good" : job.status === "failed" ? "bad" : "info"}>{job.status}</Badge>
               <span className="text-slate-400 text-xs">
-                {job.progress.phase} · {job.progress.done}/{job.progress.total}
+                {RENDER_PHASE_LABELS[job.progress.phase] ?? job.progress.phase} · {job.progress.done}/{job.progress.total}
+                {job.progress.detail ? ` · ${job.progress.detail}` : ""}
               </span>
               {job.status === "running" && (
-                <Button size="sm" variant="ghost" onClick={() => void api.vizCancelRender(job.id).then((r) => setJob(r.job)).catch(() => {})}>
-                  Cancel
-                </Button>
+                <>
+                  <span className="text-slate-500 text-xs tabular-nums">
+                    {fmtDur((Date.now() - Date.parse(job.startedAt)) / 1000)} elapsed
+                    {renderOverallPct(job.progress) > 3 &&
+                      ` · ~${fmtDur(((Date.now() - Date.parse(job.startedAt)) / 1000) * (100 - renderOverallPct(job.progress)) / renderOverallPct(job.progress))} left`}
+                  </span>
+                  <Button size="sm" variant="ghost" onClick={() => void api.vizCancelRender(job.id).then((r) => setJob(r.job)).catch(() => {})}>
+                    Cancel
+                  </Button>
+                </>
               )}
             </div>
-            <ProgressBar value={job.progress.done} max={Math.max(1, job.progress.total)} />
+            {/* Overall progress — each phase takes a share of the bar (frames
+                dominates), so the fill doesn't jump between phases. */}
+            <ProgressBar value={renderOverallPct(job.progress)} />
+            {/* Rolling render log — phase transitions + ~10% checkpoints. */}
+            {renderLog.length > 0 && (
+              <pre
+                ref={renderLogRef}
+                className="max-h-24 overflow-y-auto rounded bg-slate-950/70 border border-slate-800/60 px-2.5 py-1.5 text-[10px] font-mono text-slate-400 whitespace-pre-wrap"
+              >
+                {renderLog.join("\n")}
+              </pre>
+            )}
             {job.error && <p className="text-xs text-rose-400">{job.error.message}</p>}
             {job.status === "done" && job.outputUrl && (
               <div className="space-y-1.5">

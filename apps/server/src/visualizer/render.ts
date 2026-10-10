@@ -13,7 +13,7 @@ import type { Readable, Writable } from "node:stream";
 import { mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import sharp from "sharp";
-import { computeDancer, computeFrame, frameCenter, keyVideoFrame, VIZ_JS_KEY_METHODS, type FrameStem, type VisualizerRenderInput, type VizVideoKeyConfig } from "@twio/shared";
+import { computeDancer, computeFrame, frameCenter, keyVideoFrame, VIZ_JS_KEY_METHODS, zoomPanRect, type FrameStem, type VisualizerRenderInput, type VizVideoKeyConfig, type VizZoomPanConfig } from "@twio/shared";
 import { ffmpegService } from "../video/ffmpeg.js";
 import { probe, probeAudio } from "../video/ffprobe.js";
 import { VisualizerError } from "./errors.js";
@@ -23,6 +23,8 @@ export interface VizRenderProgress {
   phase: "decode" | "keying" | "frames" | "mux" | "verify";
   done: number;
   total: number;
+  /** Optional human-readable detail for the UI log (stem name, layer N, fps…). */
+  detail?: string;
 }
 
 /** A resolved stack row — aligned by index with `globalVisuals.video.layers`
@@ -38,6 +40,12 @@ export type VizRenderLayer =
       /** Static image layer — decoded once instead of streamed per frame. */
       isImage: boolean;
       key: VizVideoKeyConfig;
+      /** Source-crop zoom/pan (which part of the media fills the tile). */
+      zoomPan?: VizZoomPanConfig;
+      /** Source media dims — probed in service.ts (videos) so the decoder can
+       *  build the zoom/pan crop filter; images use sharp metadata instead. */
+      mediaW?: number;
+      mediaH?: number;
       /** Engine-baked VP9-alpha WebM used for `key.method = "cutout"` (videos
        *  only); when set the decoder reads it instead of `path` and the alpha
        *  arrives baked into the rgba frames (no in-process key pass). */
@@ -156,7 +164,10 @@ class FrameReader {
  *  color methods get a bare `format=rgba` and the shared `keyVideoFrame` does
  *  the keying in-process (pixel-identical to the preview's Canvas pass), while
  *  `cutout` reads the engine-baked VP9-alpha WebM (`keyedPath`, decoded with
- *  the libvpx decoder — the native vp9 decoder drops the alpha stream). */
+ *  the libvpx decoder — the native vp9 decoder drops the alpha stream).
+ *  Zoom/pan: when source dims are known the vf crops the `zoomPanRect` window
+ *  in NATIVE space, then scales it to WxH — at defaults that window IS the
+ *  cover-fit rect (identical pixels to the legacy scale+crop chain). */
 export function videoDecoderArgs(
   srcPath: string,
   width: number,
@@ -164,9 +175,22 @@ export function videoDecoderArgs(
   fps: number,
   key: VizVideoKeyConfig | null,
   keyedPath?: string,
+  zoomPan?: VizZoomPanConfig,
+  mediaW?: number,
+  mediaH?: number,
 ): { args: string[]; channels: 3 | 4; keyed: boolean } {
   const keyed = !!keyedPath || (!!key && key.method !== "none");
-  let vf = `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`;
+  let vf = `fps=${fps}`;
+  if (mediaW && mediaH) {
+    const r = zoomPanRect(mediaW, mediaH, width, height, zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5 });
+    const cw = Math.max(1, Math.round(r.sw));
+    const ch = Math.max(1, Math.round(r.sh));
+    const cx = Math.min(Math.max(0, Math.round(r.sx)), mediaW - cw);
+    const cy = Math.min(Math.max(0, Math.round(r.sy)), mediaH - ch);
+    vf += `,crop=${cw}:${ch}:${cx}:${cy},scale=${width}:${height}`;
+  } else {
+    vf += `,scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`;
+  }
   if (keyed) vf += ",format=rgba";
   const channels = keyed ? 4 : 3;
   const input: string[] = keyedPath
@@ -214,6 +238,23 @@ export function muxArgs(videoPath: string, audiblePaths: string[], duration: num
   return args;
 }
 
+/** Encoder args for the rawvideo→mp4 child — `draft` swaps in the ultrafast
+ *  preset + high CRF (rougher but several times faster). */
+export function encodeArgs(width: number, height: number, fps: number, draft: boolean, videoPath: string): string[] {
+  return [
+    "-v", "error", "-y",
+    "-f", "rawvideo",
+    "-pix_fmt", "rgb24",
+    "-s", `${width}x${height}`,
+    "-r", String(fps),
+    "-i", "pipe:0",
+    "-an", "-sn", "-dn",
+    "-c:v", "libx264", "-preset", draft ? "ultrafast" : "fast", "-crf", draft ? "30" : "18",
+    "-pix_fmt", "yuv420p",
+    videoPath,
+  ];
+}
+
 export async function renderVisualizer(
   input: VisualizerRenderInput,
   stems: FrameStem[],
@@ -232,22 +273,11 @@ export async function renderVisualizer(
   mkdirSync(workDir, { recursive: true });
   const videoPath = join(workDir, "video.mp4");
 
+  // Draft pass — ultrafast preset + high CRF for a fast, low-quality first
+  // look (the UI also sends a shrunken w/h + fps on top of this).
+  const draft = input.renderSettings.draft === true;
   opts.onProgress?.({ phase: "frames", done: 0, total: totalFrames });
-  const child = await ffmpegService.ffmpegSpawn(
-    [
-      "-v", "error", "-y",
-      "-f", "rawvideo",
-      "-pix_fmt", "rgb24",
-      "-s", `${width}x${height}`,
-      "-r", String(fps),
-      "-i", "pipe:0",
-      "-an", "-sn", "-dn",
-      "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-      "-pix_fmt", "yuv420p",
-      videoPath,
-    ],
-    { signal: opts.signal },
-  );
+  const child = await ffmpegService.ffmpegSpawn(encodeArgs(width, height, fps, draft, videoPath), { signal: opts.signal });
   let stderr = "";
   child.stderr?.on("data", (d) => {
     stderr += d.toString();
@@ -303,7 +333,23 @@ export async function renderVisualizer(
         throw new VisualizerError(422, "LAYER_IMAGE_UNREADABLE", `Media layer ${i + 1} is not a readable image: ${l.path}`);
       }
       const wantAlpha = !!jsKey || !!meta.hasAlpha;
-      const img = sharp(l.path).rotate().resize(width, height, { fit: "cover" });
+      // EXIF orientation 5–8 swaps w/h — the zoom/pan window is computed in
+      // the ROTATED pixel space sharp will actually decode to.
+      const rw = meta.orientation && meta.orientation >= 5 ? meta.height! : meta.width;
+      const rh = meta.orientation && meta.orientation >= 5 ? meta.width : meta.height!;
+      const zp = l.zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5 };
+      const r = zoomPanRect(rw, rh, width, height, zp);
+      const cw = Math.max(1, Math.round(r.sw));
+      const ch = Math.max(1, Math.round(r.sh));
+      const img = sharp(l.path)
+        .rotate()
+        .extract({
+          left: Math.min(Math.max(0, Math.round(r.sx)), rw - cw),
+          top: Math.min(Math.max(0, Math.round(r.sy)), rh - ch),
+          width: cw,
+          height: ch,
+        })
+        .resize(width, height, { fit: "fill" });
       const channels = wantAlpha ? 4 : 3;
       const raw = await (wantAlpha ? img.ensureAlpha() : img.removeAlpha()).raw().toBuffer();
       if (jsKey) keyVideoFrame(raw, width, height, jsKey);
@@ -330,6 +376,7 @@ export async function renderVisualizer(
     layerPipes.push(pipe);
   }
 
+  const framesT0 = Date.now();
   try {
     for (let k = 0; k < totalFrames; k++) {
       if (aborted(opts.signal)) throw new VisualizerError(499, "RENDER_CANCELLED", "Render cancelled.");
@@ -373,7 +420,10 @@ export async function renderVisualizer(
         .raw()
         .toBuffer({ resolveWithObject: true });
       await writeFrame(child.stdin!, data);
-      if ((k & 7) === 0) opts.onProgress?.({ phase: "frames", done: k, total: totalFrames });
+      if ((k & 7) === 0) {
+        const rate = ((k + 1) / Math.max(0.001, (Date.now() - framesT0) / 1000)).toFixed(1);
+        opts.onProgress?.({ phase: "frames", done: k, total: totalFrames, detail: `${rate} fps` });
+      }
     }
     opts.onProgress?.({ phase: "frames", done: totalFrames, total: totalFrames });
     child.stdin!.end();
@@ -383,7 +433,7 @@ export async function renderVisualizer(
       throw new VisualizerError(500, "FFMPEG_FAILED", `FFmpeg video encode failed (exit ${code}): ${stderr.trim().slice(-600)}`);
     }
 
-    opts.onProgress?.({ phase: "mux", done: totalFrames, total: totalFrames });
+    opts.onProgress?.({ phase: "mux", done: totalFrames, total: totalFrames, detail: `${opts.audiblePaths.length} stem(s)` });
     const mux = await ffmpegService.ffmpegExec(muxArgs(videoPath, opts.audiblePaths, duration, outPath), "viz-mux", {
       signal: opts.signal,
     });

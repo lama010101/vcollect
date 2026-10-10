@@ -23,7 +23,7 @@ import { stemSignalPayload } from "./signals.js";
 
 export { MAX_SONG_BYTES };
 
-export function visualizerDir(projectId: string, sub: "stems" | "renders"): string {
+export function visualizerDir(projectId: string, sub: "stems" | "renders" | "sessions"): string {
   const project = getProject(projectId);
   if (!project || project.isVirtual) throw new VisualizerError(404, "PROJECT_NOT_FOUND", `Project not found: ${projectId}`);
   const dir = resolve(projectPaths(project.slug).output, "visualizer", sub);
@@ -163,12 +163,15 @@ export function startRenderJob(projectId: string, raw: VisualizerRenderInput): V
     if (isImage && l.key.method === "cutout") {
       throw new VisualizerError(422, "LAYER_CUTOUT_NEEDS_VIDEO", `Layer ${i + 1}: AI cutout applies to videos — image layers already carry their own alpha.`);
     }
-    videoLayers.push({ kind: "media", path: abs, isImage, key: l.key });
+    videoLayers.push({ kind: "media", path: abs, isImage, key: l.key, zoomPan: l.zoomPan });
   });
 
   const dir = visualizerDir(projectId, "renders");
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const outPath = join(dir, `viz-${cfg.renderSettings.width}x${cfg.renderSettings.height}-${cfg.renderSettings.fps}fps-${stamp}.mp4`);
+  // Draft renders get a marker so the fast low-quality pass is easy to spot
+  // in the renders list (and won't be mistaken for the final MP4).
+  const draftTag = cfg.renderSettings.draft ? "draft-" : "";
+  const outPath = join(dir, `viz-${draftTag}${cfg.renderSettings.width}x${cfg.renderSettings.height}-${cfg.renderSettings.fps}fps-${stamp}.mp4`);
   const cfgPath = join(dir, `${basename(outPath, ".mp4")}.viz.json`);
   writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
 
@@ -196,6 +199,7 @@ export function startRenderJob(projectId: string, raw: VisualizerRenderInput): V
     for (let i = 0; i < resolved.length; i++) {
       const s = resolved[i]!;
       const path = stemPath(projectId, s.name);
+      job.progress = { phase: "decode", done: i, total: resolved.length, detail: s.name };
       const d = await decodeStem(path);
       const signal = buildStemSignal(d.pcm, d.sr);
       if (d.stereo) {
@@ -212,7 +216,14 @@ export function startRenderJob(projectId: string, raw: VisualizerRenderInput): V
     for (const [i, l] of videoLayers.entries()) {
       if (l.kind !== "media" || l.isImage) continue;
       try {
-        await probe(l.path); // throws when there is no decodable video stream
+        const pv = await probe(l.path); // throws when there is no decodable video stream
+        // Source dims → the decoder's zoom/pan crop filter. ffmpeg autorotates
+        // before the filter graph, so use the ORIENTED dims (swap on 90|270);
+        // keyed WebMs keep the source dims, so the same rect applies to
+        // keyedPath too.
+        const swap = pv.rotation === 90 || pv.rotation === 270;
+        l.mediaW = (swap ? pv.height : pv.width) ?? undefined;
+        l.mediaH = (swap ? pv.width : pv.height) ?? undefined;
       } catch (e) {
         throw new VisualizerError(422, "VIDEO_NOT_PLAYABLE", `Layer ${i + 1}: the selected video is not playable: ${(e as Error).message}`);
       }
@@ -220,17 +231,21 @@ export function startRenderJob(projectId: string, raw: VisualizerRenderInput): V
       // generated here when the UI didn't already produce one (cache hits are
       // instant, so a prepared preview costs the render nothing).
       if (l.key.method === "cutout") {
-        job.progress = { phase: "keying", done: 0, total: 0 };
+        job.progress = { phase: "keying", done: 0, total: 0, detail: `layer ${i + 1}` };
         const keyed = await ensureKeyedVideo(projectId, l.path, l.key, {
           signal: job.controller.signal,
-          onProgress: (p) => (job.progress = { phase: "keying", done: p.done, total: p.total }),
+          onProgress: (p) => (job.progress = { phase: "keying", done: p.done, total: p.total, detail: `layer ${i + 1}` }),
         });
         l.keyedPath = keyed.path;
       }
     }
     // "spectrum" draws real band envelopes — without engine features there is
-    // nothing to show, so fail fast instead of rendering flat bars.
-    if (cfg.globalVisuals.mode === "spectrum" && !stems.some((s) => s.signal.features)) {
+    // nothing to show, so fail fast instead of rendering flat bars. Every
+    // waveform layer counts: a row with its own `visuals` may be set to
+    // spectrum even when the global mode isn't.
+    const needsSpectrum =
+      cfg.globalVisuals.video.layers.some((l) => l.kind === "visuals" && (l.visuals?.mode ?? cfg.globalVisuals.mode) === "spectrum");
+    if (needsSpectrum && !stems.some((s) => s.signal.features)) {
       throw new VisualizerError(
         422,
         "ENGINE_REQUIRED",

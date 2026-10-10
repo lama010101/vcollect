@@ -1,7 +1,7 @@
 // Thin fetch wrapper for the backend API.
 // Same-origin "/api" in dev (Vite proxy) and when the backend serves the SPA.
 // Set VITE_API_URL to point the deployed frontend at a hosted backend.
-import type { BeatAnalysis, EditPlan, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VizVideoKeyConfig, WorldCamRequest } from "@twio/shared";
+import type { BeatAnalysis, EditPlan, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VisualizerSessionPayload, VizSession, VizSessionMeta, VizVideoKeyConfig, WorldCamRequest } from "@twio/shared";
 const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
 /** Fired on `window` after local uploads complete so asset lists (Folders,
@@ -166,6 +166,13 @@ export interface Timeline {
   script_text?: string | null; // original script text (script-imported timelines)
 }
 /** shot_assets link row — returned by GET /api/shots/:id as `shotAssets`. */
+export interface VizSessionTimeline {
+  timelineId: string;
+  name: string;
+  shotsCreated: number;
+  durationSeconds: number;
+}
+
 export interface ShotAssetLink {
   shot_id: string;
   asset_id: string;
@@ -567,7 +574,7 @@ export interface VizRenderJob {
   id: string;
   projectId: string;
   status: "running" | "done" | "failed" | "cancelled";
-  progress: { phase: "decode" | "frames" | "mux" | "verify"; done: number; total: number };
+  progress: { phase: "decode" | "keying" | "frames" | "mux" | "verify"; done: number; total: number; detail?: string };
   error: { code: string; message: string } | null;
   outputUrl: string | null;
   /** Absolute filesystem path of the MP4 — shown as an "open folder" link. */
@@ -949,6 +956,22 @@ export const api = {
     postJson<{ job: VizKeyJob }>(withProject("/api/visualizer/video-key", projectId), { assetId, key }),
   vizVideoKeyJob: (id: string) => getJson<{ job: VizKeyJob }>(`/api/visualizer/video-key/${encodeURIComponent(id)}`),
   vizCancelVideoKey: (id: string) => postJson<{ job: VizKeyJob }>(`/api/visualizer/video-key/${encodeURIComponent(id)}/cancel`),
+  // Sessions — named setups saved server-side (settings + stem/media snapshots).
+  vizSessions: (projectId: string) => getJson<{ sessions: VizSessionMeta[] }>(withProject("/api/visualizer/sessions", projectId)),
+  vizSaveSession: (projectId: string, name: string, payload: VisualizerSessionPayload) =>
+    postJson<{ session: VizSession }>(withProject("/api/visualizer/sessions", projectId), { name, payload }),
+  vizUpdateSession: (projectId: string, id: string, patch: { name?: string; payload?: VisualizerSessionPayload }) =>
+    putJson<{ session: VizSession }>(withProject(`/api/visualizer/sessions/${encodeURIComponent(id)}`, projectId), patch),
+  vizDeleteSession: (projectId: string, id: string) =>
+    deleteJson<{ ok: boolean; id: string }>(withProject(`/api/visualizer/sessions/${encodeURIComponent(id)}`, projectId)),
+  /** Restores the session's media server-side, then returns the payload. */
+  vizLoadSession: (projectId: string, id: string) =>
+    postJson<{ session: VizSessionMeta; payload: VisualizerSessionPayload; warnings: string[]; restoredMedia: number }>(
+      withProject(`/api/visualizer/sessions/${encodeURIComponent(id)}/load`, projectId),
+    ),
+  /** Builds a timeline from the session — one shot per layer/stem. */
+  vizSessionToTimeline: (projectId: string, id: string) =>
+    postJson<VizSessionTimeline>(withProject(`/api/visualizer/sessions/${encodeURIComponent(id)}/timeline`, projectId)),
   // --- Python engine ---
   engineStatus: () => getJson<EngineStatus>("/api/engine/status"),
   engineSetup: () => postJson<EngineStatus>("/api/engine/setup"),

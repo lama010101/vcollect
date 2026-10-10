@@ -19,9 +19,13 @@ import {
   resolveStem,
   ribbonOutline,
   stemAngles,
+  visibleAt,
   visualizerRenderSchema,
+  vizMediaLayerSchema,
+  vizTimeWindowSchema,
   vizVideoKeySchema,
   windowSlice,
+  zoomPanRect,
   PEAK_RATE,
   VIZ_POINTS,
   type FrameStem,
@@ -31,7 +35,7 @@ import {
   type VizVideoKeyConfig,
 } from "@twio/shared";
 import { decodeStem } from "../src/visualizer/decode.ts";
-import { renderVisualizer, muxArgs, videoDecoderArgs } from "../src/visualizer/render.ts";
+import { renderVisualizer, muxArgs, videoDecoderArgs, encodeArgs } from "../src/visualizer/render.ts";
 import { frameSvg } from "../src/visualizer/svg.ts";
 import { stemSignalPayload } from "../src/visualizer/signals.ts";
 import { engineClient } from "../src/python/engineClient.ts";
@@ -518,8 +522,8 @@ describe("visualizer — layer stack (media + visuals rows)", () => {
       globalVisuals: {},
       stems: [{ name: "x.wav" }],
     }).globalVisuals;
-    assert.deepEqual(g.video, { layers: [{ kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1 }] });
-    assert.deepEqual(computeFrame(stems, g, 320, 240, 0.5).videoLayers, [{ kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null }]);
+    assert.deepEqual(g.video, { layers: [{ kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, visibility: { show: [], hide: [] } }] });
+    assert.deepEqual(computeFrame(stems, g, 320, 240, 0.5).videoLayers, [{ kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null, visible: true }]);
     // An explicit empty list is respected literally — nothing is drawn.
     const empty = globalsWith({ layers: [] });
     assert.deepEqual(empty.video.layers, []);
@@ -536,8 +540,8 @@ describe("visualizer — layer stack (media + visuals rows)", () => {
     assert.equal(m0.opacity, 1);
     assert.equal(gv.video.layers[1]!.kind, "visuals");
     assert.deepEqual(computeFrame(stems, gv, 320, 240, 0.5).videoLayers, [
-      { kind: "media", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null },
-      { kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null },
+      { kind: "media", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null, visible: true, zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 } },
+      { kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null, visible: true },
     ]);
     // Old "over" band → the visuals row sits under the media row.
     const gvo = globalsWith({ assetId: "asset-1", layer: "over", opacity: 0.7 });
@@ -757,8 +761,10 @@ describe("visualizer — layer stack (media + visuals rows)", () => {
         // Legacy chromaKey folds into key (colorkey method, despill kept off
         // so old configs render identically).
         key: { method: "colorkey", color: "#FF00FF", similarity: 0.2, blend: 0.05, despill: false, choke: 0, model: "mediapipe", feather: 1 },
+        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 },
+        visible: true,
       },
-      { kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null },
+      { kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null, visible: true },
     ]);
   });
 
@@ -1014,5 +1020,246 @@ describe("visualizer — end-to-end render", () => {
     assert.ok(args.includes("anullsrc=channel_layout=stereo:sample_rate=48000"));
     const args2 = muxArgs("/v.mp4", ["/a.wav", "/b.wav"], 2, "/o.mp4");
     assert.ok(args2.join(" ").includes("amix=inputs=2:normalize=0"));
+  });
+
+  it("encodeArgs swaps preset/CRF + dims for the draft pass", () => {
+    const hi = encodeArgs(1920, 1080, 30, false, "/tmp/v.mp4");
+    assert.equal(hi[hi.indexOf("-preset") + 1], "fast");
+    assert.equal(hi[hi.indexOf("-crf") + 1], "18");
+    const lo = encodeArgs(480, 270, 12, true, "/tmp/v.mp4");
+    assert.equal(lo[lo.indexOf("-preset") + 1], "ultrafast");
+    assert.equal(lo[lo.indexOf("-crf") + 1], "30");
+    assert.equal(lo[lo.indexOf("-s") + 1], "480x270");
+    assert.equal(lo[lo.indexOf("-r") + 1], "12");
+    // The schema accepts the draft flag on renderSettings.
+    const parsed = visualizerRenderSchema.parse({
+      renderSettings: { width: 480, height: 270, fps: 12, draft: true },
+      globalVisuals: {},
+      stems: [{ name: "x.wav" }],
+    });
+    assert.equal(parsed.renderSettings.draft, true);
+  });
+});
+
+// --- waveform layers: several visuals rows, each with its own settings --------
+
+describe("visualizer — waveform layers (per-row settings)", () => {
+  const sr = 48000;
+  const signal = buildStemSignal(sine(1.0, sr), sr);
+  const stems: FrameStem[] = [{ cfg: resolveStem({ name: "x.wav", muted: false, solo: false }, 0), signal }];
+  const globalsWith = (video: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    visualizerRenderSchema.parse({
+      renderSettings: { width: 320, height: 240, fps: 30 },
+      globalVisuals: { mode: "eqbars", video, ...extra },
+      stems: [{ name: "x.wav" }],
+    }).globalVisuals;
+
+  it("a visuals row may carry its own complete look (visuals) — absent = inherit", () => {
+    const bare = globalsWith({ layers: [{ kind: "visuals" }] });
+    const l0 = bare.video.layers[0]!;
+    assert.equal(l0.kind, "visuals");
+    assert.equal(l0.kind === "visuals" ? l0.visuals : null, undefined);
+    const own = globalsWith({ layers: [{ kind: "visuals", visuals: { mode: "eqradial" } }] });
+    const l1 = own.video.layers[0]!;
+    assert.equal(l1.kind, "visuals");
+    if (l1.kind === "visuals") {
+      assert.equal(l1.visuals?.mode, "eqradial");
+      assert.equal(l1.visuals?.globalAmplitude, 1); // schema defaults filled
+    }
+  });
+
+  it("computeFrame emits one channel per visuals row, each with its own mode geometry", () => {
+    const g = globalsWith({
+      layers: [
+        { kind: "visuals" }, // inherits global eqbars
+        { kind: "media", assetId: "a" },
+        { kind: "visuals", visuals: { mode: "ribbons" } },
+      ],
+    });
+    const f = computeFrame(stems, g, 320, 240, 0.5);
+    assert.equal(f.visualChannels.length, 2);
+    assert.deepEqual(
+      f.visualChannels.map((c) => c.rowIndex),
+      [0, 2],
+    );
+    assert.equal(f.visualChannels[0]!.visuals.mode, "eqbars");
+    assert.equal(f.visualChannels[0]!.visuals.eqbars.length, 1);
+    assert.equal(f.visualChannels[0]!.visuals.stems.length, 0);
+    assert.equal(f.visualChannels[1]!.visuals.mode, "ribbons");
+    assert.equal(f.visualChannels[1]!.visuals.stems.length, 1);
+    assert.equal(f.visualChannels[1]!.visuals.eqbars.length, 0);
+    // The flat top-level arrays = the FIRST visuals row's geometry (compat).
+    assert.equal(f.mode, "eqbars");
+    assert.equal(f.eqbars.length, 1);
+    assert.equal(f.stems.length, 0);
+  });
+
+  it("rows with the same mode but different params produce different geometry", () => {
+    const g = globalsWith({
+      layers: [
+        { kind: "visuals", visuals: { mode: "ribbons", globalAmplitude: 0.5 } },
+        { kind: "visuals", visuals: { mode: "ribbons", globalAmplitude: 3 } },
+      ],
+    });
+    const f = computeFrame(stems, g, 320, 240, 0.5);
+    const [a, b] = f.visualChannels;
+    assert.equal(a!.visuals.stems.length, 1);
+    assert.equal(b!.visuals.stems.length, 1);
+    // 3× amplitude → visibly different outlines (not just scale-independent
+    // extrema — a couple of coordinates are bound to differ).
+    assert.notDeepEqual([...b!.visuals.stems[0]!.ribbon], [...a!.visuals.stems[0]!.ribbon]);
+  });
+
+  it("a row without visuals inherits globals — identical to before", () => {
+    const inherited = computeFrame(stems, globalsWith({ layers: [{ kind: "visuals" }] }), 320, 240, 0.5);
+    const g2 = globalsWith({ layers: [{ kind: "visuals", visuals: { mode: "eqbars" } }] });
+    const explicit = computeFrame(stems, g2, 320, 240, 0.5);
+    assert.equal(inherited.visualChannels[0]!.visuals.eqbars[0]!.segs.length, explicit.visualChannels[0]!.visuals.eqbars[0]!.segs.length);
+  });
+
+  it("autoGlow rolls are decorrelated across rows but deterministic per row", () => {
+    const wave = { mode: "ribbons", autoGlow: { enabled: true, min: 0, max: 40 } };
+    const g = globalsWith({ layers: [{ kind: "visuals", visuals: wave }, { kind: "visuals", visuals: wave }] });
+    const f1 = computeFrame(stems, g, 320, 240, 0.7);
+    const f2 = computeFrame(stems, g, 320, 240, 0.7);
+    const gw = (s: { visualChannels: Array<{ visuals: { stems: Array<{ glowWidth: number }> } }> }, i: number) => s.visualChannels[i]!.visuals.stems[0]!.glowWidth;
+    assert.equal(gw(f1, 0), gw(f2, 0));
+    assert.equal(gw(f1, 1), gw(f2, 1));
+    assert.notEqual(gw(f1, 0), gw(f1, 1));
+  });
+
+  it("frameSvg draws every visuals row's own channel — silk gradient ids don't collide", () => {
+    const g = globalsWith({
+      layers: [
+        { kind: "visuals", visuals: { mode: "silk" } },
+        { kind: "media", assetId: "a" },
+        { kind: "visuals", visuals: { mode: "silk" } },
+      ],
+    });
+    const f = computeFrame(stems, g, 320, 240, 0.5);
+    const svg = frameSvg(f, 320, 240, "#050508", [null, "data:X", null]);
+    assert.ok(svg.includes('id="l0_silk0"'), "first silk layer gradient");
+    assert.ok(svg.includes('id="l2_silk0"'), "second silk layer gradient — own id");
+    assert.ok((svg.match(/<g opacity/g) ?? []).length >= 2, "two visuals <g> groups");
+  });
+});
+
+describe("visualizer — layer zoom/pan", () => {
+  const zp = (z: number, px: number, py: number) => ({ zoom: z, panX: px, panY: py });
+
+  it("defaults reproduce the centered cover-fit crop", () => {
+    // Same-aspect media → whole frame.
+    assert.deepEqual(zoomPanRect(1920, 1080, 1920, 1080, zp(1, 0.5, 0.5)), { sx: 0, sy: 0, sw: 1920, sh: 1080 });
+    // 16:9 media in a 9:16 frame → centered vertical sliver.
+    const r = zoomPanRect(1920, 1080, 1080, 1920, zp(1, 0.5, 0.5));
+    assert.ok(Math.abs(r.sw - 607.5) < 0.01 && r.sh === 1080);
+    assert.ok(Math.abs(r.sx - (1920 - r.sw) / 2) < 0.01 && r.sy === 0);
+  });
+
+  it("zoom shrinks the window; pan slides it to the media edges", () => {
+    // 2× zoom into a portrait crop of a landscape video.
+    const r = zoomPanRect(1920, 1080, 1080, 1920, zp(2, 0, 1));
+    assert.ok(Math.abs(r.sw - 303.75) < 0.01 && Math.abs(r.sh - 540) < 0.01);
+    assert.equal(r.sx, 0); // pan 0 → left edge
+    assert.equal(r.sy, 1080 - r.sh); // pan 1 → bottom edge
+    const c = zoomPanRect(1920, 1080, 1080, 1920, zp(2, 0.5, 0.5));
+    assert.equal(c.sx, (1920 - c.sw) / 2);
+    // The window never leaves the media.
+    for (const [px, py] of [[0, 0], [1, 1], [0.5, 0.5]] as const) {
+      const w = zoomPanRect(800, 600, 1080, 1920, zp(4, px, py));
+      assert.ok(w.sx >= 0 && w.sx + w.sw <= 800.01 && w.sy >= 0 && w.sy + w.sh <= 600.01);
+    }
+  });
+
+  it("pan is a no-op where the window has no slack", () => {
+    // Same-aspect media at zoom 1 — nothing hidden to pan within.
+    const a = zoomPanRect(1920, 1080, 1920, 1080, zp(1, 0, 1));
+    const b = zoomPanRect(1920, 1080, 1920, 1080, zp(1, 1, 0));
+    assert.deepEqual(a, b);
+    // 16:9 media → 9:16 frame at zoom 1: X pans (sliver slack), Y can't move.
+    const l = zoomPanRect(1920, 1080, 1080, 1920, zp(1, 0, 0.5));
+    assert.equal(l.sx, 0);
+    const rr = zoomPanRect(1920, 1080, 1080, 1920, zp(1, 1, 1));
+    assert.equal(rr.sx, 1920 - rr.sw);
+    assert.equal(rr.sy, 0); // full-height window — panY has no room
+  });
+
+  it("media layers default to zoomPan {1, 0.5, 0.5} and keep custom values", () => {
+    const def = vizMediaLayerSchema.parse({ kind: "media", assetId: "a" });
+    assert.ok(def.kind === "media");
+    assert.deepEqual(def.zoomPan, { zoom: 1, panX: 0.5, panY: 0.5 });
+    const custom = vizMediaLayerSchema.parse({ kind: "media", assetId: "a", zoomPan: { zoom: 2.5, panX: 0, panY: 1 } });
+    assert.ok(custom.kind === "media");
+    assert.deepEqual(custom.zoomPan, { zoom: 2.5, panX: 0, panY: 1 });
+  });
+
+  it("videoDecoderArgs crops the zoom/pan window in native space", () => {
+    // Default zp on known dims == the legacy cover-fit numbers.
+    const d = videoDecoderArgs("/tmp/v.mp4", 1080, 1920, 30, null, undefined, zp(1, 0.5, 0.5), 1920, 1080);
+    const vf = d.args[d.args.indexOf("-vf") + 1]!;
+    assert.equal(vf, "fps=30,crop=608:1080:656:0,scale=1080:1920");
+    // 2× zoom, pan to top-left.
+    const z = videoDecoderArgs("/tmp/v.mp4", 1080, 1920, 30, null, undefined, zp(2, 0, 0), 1920, 1080);
+    assert.equal(z.args[z.args.indexOf("-vf") + 1], "fps=30,crop=304:540:0:0,scale=1080:1920");
+    // No dims → legacy scale+cover-crop chain.
+    const legacy = videoDecoderArgs("/tmp/v.mp4", 1080, 1920, 30, null);
+    assert.ok(legacy.args[legacy.args.indexOf("-vf") + 1]!.includes("force_original_aspect_ratio=increase,crop=1080:1920"));
+  });
+});
+
+describe("visualizer — layer show/hide windows", () => {
+  const signal = buildStemSignal(sine(1.0, 48000), 48000);
+  const stems: FrameStem[] = [{ cfg: resolveStem({ name: "x.wav", muted: false, solo: false }, 0), signal }];
+  const globalsWith = (video: Record<string, unknown>) =>
+    visualizerRenderSchema.parse({
+      renderSettings: { width: 320, height: 240, fps: 30 },
+      globalVisuals: { mode: "eqbars", video },
+      stems: [{ name: "x.wav" }],
+    }).globalVisuals;
+
+  it("visibleAt: show restricts, hide subtracts, both empty = always", () => {
+    assert.equal(visibleAt({ show: [], hide: [] }, 0), true);
+    assert.equal(visibleAt({ show: [], hide: [{ start: 2, end: 4 }] }, 1), true);
+    assert.equal(visibleAt({ show: [], hide: [{ start: 2, end: 4 }] }, 3), false);
+    assert.equal(visibleAt({ show: [{ start: 1, end: 3 }], hide: [] }, 0.5), false);
+    assert.equal(visibleAt({ show: [{ start: 1, end: 3 }, { start: 8, end: 9 }], hide: [] }, 8.5), true);
+    // End is exclusive.
+    assert.equal(visibleAt({ show: [{ start: 1, end: 3 }], hide: [] }, 3), false);
+    // Hide wins inside a show window.
+    assert.equal(visibleAt({ show: [{ start: 1, end: 5 }], hide: [{ start: 2, end: 3 }] }, 2.5), false);
+    assert.equal(visibleAt(undefined, 7), true);
+  });
+
+  it("schema rejects end <= start and defaults both lists", () => {
+    assert.throws(() => vizTimeWindowSchema.parse({ start: 4, end: 4 }));
+    assert.throws(() => vizTimeWindowSchema.parse({ start: 5, end: 2 }));
+    const l = vizMediaLayerSchema.parse({ kind: "media", assetId: "a" });
+    assert.ok(l.kind === "media");
+    assert.deepEqual(l.visibility, { show: [], hide: [] });
+    const v = vizMediaLayerSchema.parse({ kind: "visuals", visibility: { show: [{ start: 1, end: 2 }] } });
+    assert.ok(v.kind === "visuals");
+    assert.deepEqual(v.visibility, { show: [{ start: 1, end: 2 }], hide: [] });
+  });
+
+  it("computeFrame evaluates windows per t — visible flag per row", () => {
+    const g = globalsWith({
+      layers: [
+        { kind: "visuals" },
+        { kind: "media", assetId: "a", visibility: { show: [{ start: 1, end: 3 }], hide: [{ start: 2, end: 2.5 }] } },
+      ],
+    });
+    const at = (t: number) => computeFrame(stems, g, 320, 240, t).videoLayers[1]!.visible;
+    assert.equal(at(0), false);
+    assert.equal(at(1.5), true);
+    assert.equal(at(2.2), false);
+    assert.equal(at(3), false);
+    // The visuals row with no windows stays visible throughout.
+    const v = (t: number) => computeFrame(stems, g, 320, 240, t).videoLayers[0]!.visible;
+    assert.equal(v(0) && v(1.5) && v(2.2), true);
+    // frameSvg skips a windowed-out row entirely.
+    const svg = frameSvg(computeFrame(stems, g, 320, 240, 0), 320, 240, "#050508", [null, "data:X"]);
+    assert.ok(!svg.includes("data:X"), "hidden-by-window media row draws nothing");
+    const svg2 = frameSvg(computeFrame(stems, g, 320, 240, 1.5), 320, 240, "#050508", [null, "data:X"]);
+    assert.ok(svg2.includes("data:X"), "shown window draws the media row");
   });
 });
