@@ -214,7 +214,7 @@ export function LibraryPage({ projectId }: { projectId: string }) {
     });
   }
 
-  const runSearch = useCallback(async () => {
+  const runSearch = useCallback(async (opts?: { skipSync?: boolean }) => {
     setSearching(true);
     setErr(null);
     try {
@@ -239,9 +239,15 @@ export function LibraryPage({ projectId }: { projectId: string }) {
         setHasSearched(true);
       } else {
         saveRecentQuery(q);
-        // Register any media placed in the project's assets folder outside the
-        // app before listing — the folder contents are the source of truth.
-        await api.syncProjectAssets(projectId).catch(() => {});
+        // Register media placed in the project's assets folder outside the
+        // app — in the BACKGROUND. Disk scans can take a while on large or
+        // freshly reorganized folders; the listing must not wait on them.
+        // When the sync registers/repoints files, refresh the results once.
+        if (!opts?.skipSync) {
+          void api.syncProjectAssets(projectId)
+            .then((r) => { if (r.added + r.moved + r.missing > 0) void runSearch({ skipSync: true }); })
+            .catch(() => {});
+        }
         const r = await api.searchAssetsAdvanced(buildFilters(), projectId);
         setResults(r.assets);
         setCount(r.count);
@@ -551,7 +557,7 @@ export function LibraryPage({ projectId }: { projectId: string }) {
             placeholder={searchMode === "providers" ? "Search providers for new assets…" : "Search the library…"}
             className="ui-input flex-1"
           />
-          <Button variant="primary" onClick={runSearch} disabled={searching}>
+          <Button variant="primary" onClick={() => runSearch()} disabled={searching}>
             {searching ? <Spinner className="w-4 h-4" /> : "Search"}
           </Button>
           <Button variant="secondary" onClick={() => setShowAdvanced((v) => !v)}>
@@ -826,7 +832,7 @@ function SearchAssetCard({
   }
 
   return (
-    <div className={`ui-card overflow-hidden border-2 ${ratingBorder(rating)}`}>
+    <div className={`ui-card asset-card overflow-hidden border-2 ${ratingBorder(rating)}`}>
       <div
         className="aspect-video bg-black flex items-center justify-center relative cursor-pointer group"
         onClick={() => {
@@ -929,7 +935,7 @@ function SearchAssetCard({
               File Explorer
             </button>
           )}
-          {!downloaded && acquireState !== "acquiring" && (
+          {!downloaded && acquireState !== "acquiring" && asset.provider_id !== "local" && (
             <Button variant="primary" size="sm" onClick={startAcquire} title="Download this asset to local disk">
               {acquireState === "done" ? "Re-acquire" : acquireState === "failed" ? "Retry" : "Acquire"}
             </Button>

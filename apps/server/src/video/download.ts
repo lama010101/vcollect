@@ -98,10 +98,11 @@ export function ourFilename(shotNumber: number, provider: string, providerAssetI
   return `${shot}_${prov}_${providerAssetId}.mp4`;
 }
 
-/** Where the downloaded file lands. When `projectSlug` is set the file is
- *  stored inside that project's dedicated assets folder
- *  (OUTPUT_ROOT/<slug>/assets/<searchQuery>/); otherwise it falls back to the
- *  legacy global query folder (OUTPUT_ROOT/<searchQuery>/). */
+/** Where the downloaded file lands. When `projectSlug` is set the file goes
+ *  to the project's single media folder (OUTPUT_ROOT/<slug>/assets/uploads/);
+ *  otherwise it falls back to the legacy global query folder
+ *  (OUTPUT_ROOT/<searchQuery>/). `searchQuery` only names the legacy folder
+ *  now — project downloads all share uploads/. */
 export interface DownloadDest {
   projectSlug?: string;
   searchQuery?: string;
@@ -110,8 +111,8 @@ export interface DownloadDest {
 /**
  * Download a real video asset from the provider URL. Throws on validation failure.
  *
- * The file is stored under the project's assets folder — organized by the
- * search query that discovered the asset.
+ * The file is stored in the project's single media folder,
+ * <slug>/assets/uploads/ — the same folder dropped files land in.
  *
  * @param dest destination selector (project folder + query subfolder)
  * @param shotNumber used to build our own filename
@@ -130,8 +131,12 @@ export async function downloadAsset(
   controller?: DownloadController,
 ): Promise<DownloadResult> {
   const filename = ourFilename(shotNumber, provider, providerAssetId);
-  const query = dest?.searchQuery ?? "unknown";
-  const dir = dest?.projectSlug ? projectAssetDir(dest.projectSlug, query) : queryDir(query);
+  // Every project keeps its media in one folder — <slug>/assets/uploads/ —
+  // the same place dropped files land. The legacy global layout (no project)
+  // still falls back to query-named root folders.
+  const dir = dest?.projectSlug
+    ? projectAssetDir(dest.projectSlug, "uploads")
+    : queryDir(dest?.searchQuery ?? "unknown");
   const file = join(dir, filename);
 
   await downloadHttp(downloadUrl, file, expectedContentType, onProgress, controller);

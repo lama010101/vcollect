@@ -816,6 +816,10 @@ export const api = {
   assetThumbUrl: (id: string) => `${base}/api/assets/${id}/thumb`,
   folders: (projectId?: string) => getJson<FoldersResponse>(withProject("/api/folders", projectId)),
   revealAsset: (id: string) => postJson<{ ok: boolean; error?: string }>(`/api/assets/${id}/reveal`),
+  // Open the project's assets folder (OUTPUT_ROOT/<slug>/assets) in the OS
+  // file explorer — where downloaded + uploaded asset files live on disk.
+  revealAssetsFolder: (projectId?: string) =>
+    postJson<{ ok: boolean; error?: string }>(withProject("/api/folders/reveal", projectId)),
   // --- Local video upload (drag & drop) — the file lands in the project's
   // own assets folder (OUTPUT_ROOT/<slug>/assets/uploads/). ---
   uploadProjectAsset: (projectId: string, file: File) =>
@@ -826,7 +830,7 @@ export const api = {
   // Register video files found on disk inside the project's assets folder —
   // everything in <slug>/assets/ must be visible no matter how it got there.
   syncProjectAssets: (projectId: string) =>
-    postJson<{ scanned: number; added: number; known: number; skipped: number }>(
+    postJson<{ scanned: number; added: number; moved: number; missing: number; known: number; skipped: number }>(
       `/api/assets/sync?project=${encodeURIComponent(projectId)}`,
     ),
   setAssetReady: (id: string, ready: boolean) =>

@@ -15,6 +15,11 @@ import { probe } from "./ffprobe.js";
 
 mkdirSync(THUMBNAILS_DIR, { recursive: true });
 
+// Serve/display size — cards are ~300px wide, so 640 covers 2× displays.
+// Full-resolution frames made 0.5–3 MB "thumbnails"; these land ~30–60 KB.
+export const THUMB_MAX_DIM = 640;
+const THUMB_JPEG = { quality: 78, mozjpeg: true } as const;
+
 async function extractFramePng(file: string, frameIndex: number): Promise<Buffer> {
   const bin = ffmpegService.ffmpegPath();
   return new Promise((resolve, reject) => {
@@ -46,7 +51,7 @@ async function sharpnessScore(png: Buffer): Promise<number> {
 /**
  * Generate the representative thumbnail for an image file — sharp decodes
  * directly (no ffmpeg spawn), flattens alpha onto black (matches the dark
- * video-thumb look) and bounds the result to 1920×1080 so giant source
+ * video-thumb look) and bounds the result to THUMB_MAX_DIM so giant source
  * images don't produce giant thumbs. Same output location/naming as
  * generateThumbnail. @returns absolute path to the JPEG, or null on failure.
  */
@@ -57,8 +62,8 @@ export async function generateImageThumbnail(file: string, assetId: string): Pro
     const dest = join(thumbDir, `${assetId}.jpg`);
     await sharp(file)
       .flatten({ background: "#000000" })
-      .resize(1920, 1080, { fit: "inside", withoutEnlargement: true })
-      .jpeg({ quality: 85 })
+      .resize(THUMB_MAX_DIM, THUMB_MAX_DIM, { fit: "inside", withoutEnlargement: true })
+      .jpeg(THUMB_JPEG)
       .toFile(dest);
     return dest;
   } catch (err) {
@@ -93,7 +98,10 @@ export async function generateThumbnail(file: string, assetId: string): Promise<
     }
     if (!best) return null;
     const dest = join(thumbDir, `${assetId}.jpg`);
-    await sharp(best.png).jpeg({ quality: 85 }).toFile(dest);
+    await sharp(best.png)
+      .resize(THUMB_MAX_DIM, THUMB_MAX_DIM, { fit: "inside", withoutEnlargement: true })
+      .jpeg(THUMB_JPEG)
+      .toFile(dest);
     return dest;
   } catch (err) {
     console.warn(`[thumbnails] failed for ${assetId}: ${(err as Error).message}`);

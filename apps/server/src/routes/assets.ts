@@ -3,6 +3,8 @@
 //   GET  /api/assets/search?project=    legacy free-text OR structured filters
 //   POST /api/assets/:id/copy           copy the asset to another project
 //   GET  /api/folders?project=          section-folder tree of downloaded files
+//   POST /api/folders/reveal?project=   open the project's assets folder in
+//                                       the OS file explorer
 //   POST /api/assets/:id/reveal         reveal the file in the OS explorer
 //   POST /api/assets/:id/ready          flag/unflag ready-for-edit
 //   POST /api/assets/:id/rating         set 0–10 rating (null clears)
@@ -13,8 +15,10 @@
 
 import type { FastifyInstance } from "fastify";
 import { basename, resolve } from "node:path";
-import { createReadStream, existsSync } from "node:fs";
-import { mediaMimeForFile, OUTPUT_ROOT, THUMBNAILS_DIR } from "../config.js";
+import { createReadStream, existsSync, renameSync, statSync, unlinkSync } from "node:fs";
+import sharp from "sharp";
+import { mediaMimeForFile, OUTPUT_ROOT, projectPaths, THUMBNAILS_DIR } from "../config.js";
+import { THUMB_MAX_DIM } from "../video/thumbnails.js";
 import { copyAssetToProject } from "../db/assetCopy.js";
 import {
   getAsset,
@@ -26,7 +30,7 @@ import {
   type AssetSortKey,
 } from "../db/repository.js";
 import { PROJECT_ID_ALL } from "@twio/shared";
-import { assetAbsolutePath, getFolders, revealInExplorer } from "./folders.js";
+import { assetAbsolutePath, getFolders, getProjectRow, revealInExplorer } from "./folders.js";
 import { clampInt, projectOfQuery } from "./helpers.js";
 
 export async function registerAssetRoutes(app: FastifyInstance): Promise<void> {
@@ -135,6 +139,17 @@ export async function registerAssetRoutes(app: FastifyInstance): Promise<void> {
     return getFolders(projectId);
   });
 
+  // Open the folder the project keeps its asset files in — the same
+  // "footage root" the Folders page reports (OUTPUT_ROOT/<slug>/assets, or
+  // OUTPUT_ROOT itself for the virtual All Projects view).
+  app.post("/api/folders/reveal", async (req, reply) => {
+    const projectId = projectOfQuery(req.query as Record<string, unknown>);
+    if (projectId === PROJECT_ID_ALL) return revealInExplorer(OUTPUT_ROOT);
+    const p = getProjectRow(projectId);
+    if (!p) return reply.code(404).send({ ok: false, error: "project not found" });
+    return revealInExplorer(projectPaths(p.slug).assets);
+  });
+
   app.post("/api/assets/:id/reveal", async (req, reply) => {
     const { id } = req.params as { id: string };
     const a = getAsset(id);
@@ -178,10 +193,34 @@ export async function registerAssetRoutes(app: FastifyInstance): Promise<void> {
     reply.type(mediaMimeForFile(a.local_path));
     return reply.send(createReadStream(abs));
   });
+  // Legacy thumbs were written at source resolution (0.5–3 MB each) — far
+  // too heavy for grid views (a full Library page fetched hundreds of MB).
+  // Anything over the budget is re-encoded once, in place, on first serve.
+  const THUMB_SERVE_MAX_BYTES = 200 * 1024;
   app.get("/api/assets/:id/thumb", async (req, reply) => {
     const { id } = req.params as { id: string };
     const dest = resolve(THUMBNAILS_DIR, `${basename(id)}.jpg`);
     if (!existsSync(dest)) return reply.code(404).send({ error: "no thumbnail" });
+    if (statSync(dest).size > THUMB_SERVE_MAX_BYTES) {
+      const tmp = `${dest}.tmp`;
+      try {
+        await sharp(dest)
+          .rotate() // honor EXIF orientation
+          .resize(THUMB_MAX_DIM, THUMB_MAX_DIM, { fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality: 78, mozjpeg: true })
+          .toFile(tmp);
+        renameSync(tmp, dest);
+      } catch {
+        try { unlinkSync(tmp); } catch { /* tmp may not exist */ }
+      }
+    }
+    const st = statSync(dest);
+    const ims = Date.parse(req.headers["if-modified-since"] ?? "");
+    if (!Number.isNaN(ims) && Math.floor(st.mtimeMs / 1000) <= Math.floor(ims / 1000)) {
+      return reply.code(304).send();
+    }
+    reply.header("Cache-Control", "public, max-age=86400");
+    reply.header("Last-Modified", st.mtime.toUTCString());
     reply.type("image/jpeg");
     return reply.send(createReadStream(dest));
   });

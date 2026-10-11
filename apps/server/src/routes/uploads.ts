@@ -157,13 +157,22 @@ export async function saveUploadedFile(
   }
 
   // Pick the destination. If the asset row already exists (file was deleted),
-  // recreate it at the row's canonical path; otherwise use the upload's name
-  // with a suffix on collision (same name, different content).
+  // recreate it under the canonical uploads dir — keeping the row's basename
+  // — and repoint the row so re-uploads never resurrect a retired layout
+  // path. Otherwise use the upload's name with a suffix on collision
+  // (same name, different content).
   let localPath: string;
   let destAbs: string;
   if (existing?.local_path) {
-    localPath = existing.local_path;
-    destAbs = resolve(OUTPUT_ROOT, localPath);
+    const base = basename(existing.local_path);
+    destAbs = join(uploadsDir, base);
+    if (destAbs !== resolve(OUTPUT_ROOT, existing.local_path) && existsSync(destAbs)) {
+      destAbs = uniqueDest(uploadsDir, base);
+    }
+    localPath = `${project.slug}/assets/uploads/${basename(destAbs)}`;
+    if (localPath !== existing.local_path) {
+      db.prepare(`UPDATE assets SET local_path = ? WHERE id = ?`).run(localPath, assetId);
+    }
   } else {
     destAbs = join(uploadsDir, filename);
     if (existsSync(destAbs)) destAbs = uniqueDest(uploadsDir, filename);
@@ -262,11 +271,13 @@ export async function registerUploadRoutes(app: FastifyInstance): Promise<void> 
     const projectId = String(q.project ?? DEFAULT_PROJECT_ID).trim();
     if (projectId === PROJECT_ID_ALL) {
       const ids = (db.all(`SELECT id FROM projects`) as Array<{ id: string }>).map((r) => r.id);
-      const totals = { scanned: 0, added: 0, known: 0, skipped: 0 };
+      const totals = { scanned: 0, added: 0, moved: 0, missing: 0, known: 0, skipped: 0 };
       for (const id of ids) {
         const r = await syncProjectAssets(id);
         totals.scanned += r.scanned;
         totals.added += r.added;
+        totals.moved += r.moved;
+        totals.missing += r.missing;
         totals.known += r.known;
         totals.skipped += r.skipped;
       }

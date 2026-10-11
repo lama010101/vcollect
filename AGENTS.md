@@ -32,27 +32,33 @@
   workspace cwd), while the CLI runs from the repo root. Without this, the dev
   server and CLI would use different DBs.
 
-- **Per-project asset folders:** real asset files live in each project's
-  dedicated folder — `OUTPUT_ROOT/<slug>/assets/<query>/` for provider
-  downloads and `OUTPUT_ROOT/<slug>/assets/uploads/` for drag & drop files
-  (videos AND images — `VIDEO_FILE_EXTENSIONS` + `IMAGE_FILE_EXTENSIONS` in
-  config.ts). `local_path` stays relative to `OUTPUT_ROOT` (so
-  `<slug>/assets/...`). Build dirs via `projectAssetDir(slug, subdir)`, never
-  `OUTPUT_ROOT/<query>` directly (that global layout is legacy;
-  `migrateAssetsToProjectFolders` moves old files). Uploads: `POST
-  /api/assets/upload?project=<id>&name=` (raw body) → `routes/uploads.ts`
-  `saveUploadedFile` → `provider_id='local'` asset row; videos validate via
-  ffprobe `isPlayableVideo`, images via `sharp().metadata()` — never trust
-  the extension. The frontend drop zone is global in `App.tsx` and fires
-  `ASSETS_CHANGED_EVENT` so Folders/Music Edit refresh. **Folder = source of
-  truth:** `db/assetSync.ts#syncProjectAssets` + `POST
-  /api/assets/sync?project=<id>` register any video or image file found on
-  disk inside `<slug>/assets/` that has no DB row — Music Edit's library and
-  the Folders page call it before loading, so manually-copied files appear
-  everywhere a downloaded asset would. Image assets are kept out of
-  video-only surfaces via `isImageFileName(local_path)` (Music Edit source
-  library filters them; Folders/Library render `<img>` instead of a player).
-  `/api/assets/:id/file` sets Content-Type via `mediaMimeForFile`.
+- **Per-project asset folders:** each project keeps its media in ONE folder —
+  `OUTPUT_ROOT/<slug>/assets/uploads/` — for provider downloads AND drag &
+  drop files (videos AND images — `VIDEO_FILE_EXTENSIONS` +
+  `IMAGE_FILE_EXTENSIONS` in config.ts). Older files may still sit in legacy
+  `assets/<query>/` / `assets/unknown/` subdirs or user-made subfolders;
+  sync tracks them wherever they are. `local_path` stays relative to
+  `OUTPUT_ROOT` (so `<slug>/assets/...`). Build dirs via
+  `projectAssetDir(slug, subdir)`, never `OUTPUT_ROOT/<query>` directly
+  (that global layout is legacy; `migrateAssetsToProjectFolders` moves old
+  files). Uploads: `POST /api/assets/upload?project=<id>&name=` (raw body) →
+  `routes/uploads.ts` `saveUploadedFile` → `provider_id='local'` asset row —
+  the `project` param is the ACTIVE project id so drops always land in that
+  project's uploads/; videos validate via ffprobe `isPlayableVideo`, images
+  via `sharp().metadata()` — never trust the extension. The frontend drop
+  zone is global in `App.tsx` and fires `ASSETS_CHANGED_EVENT` so
+  Folders/Music Edit refresh. **Folder = source of truth:**
+  `db/assetSync.ts#syncProjectAssets` + `POST
+  /api/assets/sync?project=<id>` walks `<slug>/assets/` recursively: files
+  with no DB row are registered, files that MOVED are repointed to the new
+  path by sha256 (moved count), and rows whose file vanished get
+  `local_path`/`downloaded_at` cleared → "not downloaded" (missing count —
+  sha256 is kept so a restored file re-links to its row). Music Edit's
+  library and the Folders page call it before loading, so manually-copied
+  files appear everywhere a downloaded asset would. Image assets are kept
+  out of video-only surfaces via `isImageFileName(local_path)` (Music Edit
+  source library filters them; Folders/Library render `<img>` instead of a
+  player). `/api/assets/:id/file` sets Content-Type via `mediaMimeForFile`.
 
 - **Imports:** Source files use `.js` extensions in relative imports (Node ESM
   convention). Tests use `.ts` extensions (tsx resolves those). The

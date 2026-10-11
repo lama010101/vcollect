@@ -268,17 +268,19 @@ function Section({
   title,
   action,
   defaultOpen = true,
+  className,
   children,
 }: {
   icon: ReactNode;
   title: ReactNode;
   action?: ReactNode;
   defaultOpen?: boolean;
+  className?: string;
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <Card className="p-5 space-y-4">
+    <Card className={`p-5 space-y-4 ${className ?? ""}`}>
       <div className="flex items-center justify-between gap-3">
         <button type="button" onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 group min-w-0">
           <span className="text-slate-500">{icon}</span>
@@ -2174,6 +2176,18 @@ export function Visualizer({
               </>
             )}
           </div>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() =>
+              void api.revealAssetsFolder(projectId).then((r) => {
+                if (!r.ok) onToast(r.error ?? "Could not open the assets folder", "error");
+              })
+            }
+            title="Open this project's assets folder on disk — where downloaded and dropped media files live"
+          >
+            📁 Folder
+          </Button>
           {hasVisualsLayer && (
             <p className="text-[11px] text-slate-500">◈ rows = waveform layers — each carries its own Look settings on the row. No ◈ row → no waveforms.</p>
           )}
@@ -3081,6 +3095,10 @@ export function Visualizer({
       <Section
         icon="▣"
         title="2. Layers"
+        // Raised above the following cards (.ui-card's backdrop-blur makes
+        // each card its own stacking context) so the "+ Add a layer" picker
+        // — which overflows this card downward — paints over the preview.
+        className="relative z-10"
         action={
           <span className="text-xs text-slate-500">
             {globals.video.layers.length}/{VIZ_MAX_VIDEO_LAYERS} — row 1 is the top layer; waveforms need a ◈ row
