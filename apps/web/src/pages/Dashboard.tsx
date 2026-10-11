@@ -1,14 +1,17 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { api, type Dashboard as Dash, type Provider, type Task, type TaskConfig, type Shot } from "../api.js";
 import { Card, StatCard, Button, Badge, ProgressBar, SectionTitle, EmptyState, Spinner } from "../components/ui.js";
+import { ProjectsPanel } from "../components/ProjectsPanel.js";
 
 interface DashboardProps {
   projectId: string;
   onToast: (text: string, tone?: "info" | "success" | "error") => void;
-  onNavigate: (v: { name: "dashboard" } | { name: "library" } | { name: "timeline" } | { name: "folders" } | { name: "projects" } | { name: "help" }) => void;
+  onNavigate: (v: { name: "dashboard" } | { name: "library" } | { name: "timeline" } | { name: "folders" } | { name: "import" } | { name: "help" }) => void;
+  onSwitchProject: (id: string) => void;
+  onProjectsChanged: () => void;
 }
 
-export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
+export function Dashboard({ projectId, onToast, onNavigate, onSwitchProject, onProjectsChanged }: DashboardProps) {
   const [d, setD] = useState<Dash | null>(null);
   const [provs, setProvs] = useState<Provider[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -124,6 +127,14 @@ export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
 
   return (
     <div className="space-y-6">
+      {/* ===== Projects: select / create / manage ===== */}
+      <ProjectsPanel
+        onChanged={onProjectsChanged}
+        onSwitch={onSwitchProject}
+        onImport={(pid) => { onSwitchProject(pid); onNavigate({ name: "import" }); }}
+        activeProjectId={projectId}
+      />
+
       {/* ===== Hero stats row ===== */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
         <StatCard label="Total assets" value={d.total} icon="◆" tone="info" />
@@ -156,13 +167,10 @@ export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
                 ⌕ Browse the library →
               </button>
               <button onClick={() => onNavigate({ name: "timeline" })} className="w-full text-left text-sm text-slate-400 hover:text-sky-400 transition-colors py-1.5 px-2 rounded hover:bg-slate-800/40">
-                ▬ Open timeline & review shots →
+                ▬ Open 3D timeline & review shots →
               </button>
               <button onClick={() => onNavigate({ name: "folders" })} className="w-full text-left text-sm text-slate-400 hover:text-sky-400 transition-colors py-1.5 px-2 rounded hover:bg-slate-800/40">
                 ▤ Browse downloaded folders →
-              </button>
-              <button onClick={() => onNavigate({ name: "projects" })} className="w-full text-left text-sm text-slate-400 hover:text-sky-400 transition-colors py-1.5 px-2 rounded hover:bg-slate-800/40">
-                ◇ Manage projects →
               </button>
             </div>
           </div>
@@ -255,7 +263,7 @@ export function Dashboard({ projectId, onToast, onNavigate }: DashboardProps) {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Shot progress */}
         <Card className="p-4">
-          <SectionTitle icon="▬" className="mb-3" action={<button onClick={() => onNavigate({ name: "timeline" })} className="text-xs text-sky-400 hover:underline">Open timeline →</button>}>
+          <SectionTitle icon="▬" className="mb-3" action={<button onClick={() => onNavigate({ name: "timeline" })} className="text-xs text-sky-400 hover:underline">Open 3D timeline →</button>}>
             Shot Progress
           </SectionTitle>
           <div className="space-y-3">

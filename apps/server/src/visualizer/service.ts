@@ -155,7 +155,7 @@ export function startRenderJob(projectId: string, raw: VisualizerRenderInput): V
     if (!a.local_path) {
       throw new VisualizerError(422, "LAYER_NOT_DOWNLOADED", `Layer ${i + 1}: asset "${a.title ?? a.id}" has no downloaded file — download it first.`);
     }
-    const abs = assetAbsolutePath(a.local_path, "");
+    const abs = assetAbsolutePath(a.local_path);
     if (!existsSync(abs)) {
       throw new VisualizerError(404, "LAYER_FILE_MISSING", `Layer ${i + 1}: the asset's file is missing on disk: ${a.local_path}`);
     }

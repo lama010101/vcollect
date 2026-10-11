@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, useRef } from "react";
-import { api, type Asset, type AssetDownloadProgress, type Shot, type ShotAcquireProgress, type Task, type TaskStatus, type Timeline } from "../api.js";
+import { api, type Asset, type AssetDownloadProgress, type Shot, type Task, type TaskStatus, type Timeline } from "../api.js";
 import {
   ACQUIRE_COUNT_DEFAULT,
   MIN_ACQUIRE_RATING_DEFAULT,
@@ -25,6 +25,9 @@ export function ShotReview({ shotId, onBack }: { shotId: string; onBack: () => v
   const [tasksByAsset, setTasksByAsset] = useState<Map<string, { taskId: string; status: TaskStatus; progress: Task["progress"] }>>(new Map());
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The shot-acquire task id this page is watching (tasks registry). Null when
+  // no acquire run is active — polling then stops and controls hide.
+  const acquireTaskIdRef = useRef<string | null>(null);
   const taskPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const assetsRef = useRef<Asset[]>([]);
   const finishedTasksRef = useRef<Set<string>>(new Set());
@@ -40,9 +43,10 @@ export function ShotReview({ shotId, onBack }: { shotId: string; onBack: () => v
 
   const load = useCallback(async () => {
     const r = await api.shot(shotId);
+    const a = r.assets ?? [];
     setShot(r.shot ?? null);
-    setAssets(r.assets ?? []);
-    assetsRef.current = r.assets ?? [];
+    setAssets(a);
+    assetsRef.current = a;
     setRatingOverrides(new Map());
     setOnRail(new Set((r.shotAssets ?? []).filter((l) => l.on_rail === 1).map((l) => l.asset_id)));
     setSelectedLinks(new Set((r.shotAssets ?? []).filter((l) => l.selected === 1).map((l) => l.asset_id)));
@@ -101,32 +105,50 @@ export function ShotReview({ shotId, onBack }: { shotId: string; onBack: () => v
   }
 
   function startPolling() {
-    // Track the currently-downloading asset id across polls. When it changes
-    // (one asset finished → next started, or → null between assets), refresh
-    // the assets list so completed downloads show their thumbnails immediately
-    // instead of only when the entire acquire finishes.
+    // Track the currently-downloading item + how many items finished across
+    // polls. When either changes (one asset finished → next started, or → null
+    // between assets), refresh the assets list so completed downloads show
+    // their thumbnails immediately instead of only when the task ends.
     let lastAssetId: string | undefined = undefined;
+    let lastFinished = -1;
     pollRef.current = setInterval(async () => {
+      const taskId = acquireTaskIdRef.current;
+      if (!taskId) { stopPolling(); return; }
       try {
-        const p: ShotAcquireProgress = await api.acquireShotProgress(shotId);
-        setCurrentAsset(p.currentAsset);
-        setAcquirePaused(!!p.paused);
-        if (p.error) {
-          setError(p.error);
+        const { task } = await api.task(taskId);
+        const busyNow = task.status === "queued" || task.status === "running" || task.status === "paused";
+        setAcquirePaused(task.status === "paused");
+        if (task.error) {
+          setError(task.error);
         }
-        const curId = p.currentAsset?.assetId;
-        if (curId !== lastAssetId) {
-          lastAssetId = curId;
+        const activeItem = task.items.find((it) => it.status === "running" || it.status === "paused") ?? null;
+        const cur: AssetDownloadProgress | null = activeItem
+          ? {
+              assetId: activeItem.id,
+              assetName: activeItem.label,
+              receivedBytes: activeItem.progress?.receivedBytes ?? 0,
+              totalBytes: activeItem.progress?.totalBytes ?? 0,
+              pct: activeItem.progress?.pct ?? 0,
+            }
+          : null;
+        setCurrentAsset(cur);
+        const finished = task.items.filter((it) => it.status === "done" || it.status === "failed").length;
+        if (cur?.assetId !== lastAssetId || finished !== lastFinished) {
+          lastAssetId = cur?.assetId;
+          lastFinished = finished;
           await load();
         }
-        if (!p.running) {
+        if (!busyNow) {
           stopPolling();
+          acquireTaskIdRef.current = null;
           setBusy(false);
           stopTimer();
           setCurrentAsset(null);
           await load();
-          if (p.lastResult) {
-            setDone({ downloaded: p.lastResult.downloaded, candidatesFound: p.lastResult.candidatesFound });
+          if (task.status === "done") {
+            setDone({ downloaded: 0, candidatesFound: assetsRef.current.length });
+          } else if (task.status === "failed") {
+            setError(task.error ?? "Acquire failed");
           }
         }
       } catch (e) {
@@ -140,12 +162,17 @@ export function ShotReview({ shotId, onBack }: { shotId: string; onBack: () => v
 
   useEffect(() => () => { stopTimer(); stopPolling(); stopTaskPolling(); }, [stopTaskPolling]);
 
-  // If an acquire is already running for this shot on mount, resume polling.
+  // If a shot-acquire task is already active for this shot on mount, resume
+  // polling it (tasks carry their shotId so we can find ours in the registry).
   useEffect(() => {
-    api.acquireShotProgress(shotId).then((p) => {
-      if (p.running && p.shotId === shotId) {
+    api.tasks().then(({ tasks }) => {
+      const t = tasks.find((x) =>
+        x.kind === "shot" && x.shotId === shotId &&
+        (x.status === "queued" || x.status === "running" || x.status === "paused"));
+      if (t) {
+        acquireTaskIdRef.current = t.id;
         setBusy(true);
-        setAcquirePaused(!!p.paused);
+        setAcquirePaused(t.status === "paused");
         startTimer();
         startPolling();
       }
@@ -162,9 +189,18 @@ export function ShotReview({ shotId, onBack }: { shotId: string; onBack: () => v
     setBusy(true);
     startTimer();
     try {
-      const r = await api.acquireShot(shotId);
-      if (r.alreadyRunning) {
+      // Don't start a second task when one is already active for this shot —
+      // mirror the old alreadyRunning response by attaching to the live task.
+      const { tasks } = await api.tasks();
+      const existing = tasks.find((x) =>
+        x.kind === "shot" && x.shotId === shotId &&
+        (x.status === "queued" || x.status === "running" || x.status === "paused"));
+      if (existing) {
+        acquireTaskIdRef.current = existing.id;
         setError("Acquisition is already running.");
+      } else {
+        const { task } = await api.startAcquireShotTask(shotId);
+        acquireTaskIdRef.current = task.id;
       }
       startPolling();
     } catch (e) {
@@ -175,20 +211,24 @@ export function ShotReview({ shotId, onBack }: { shotId: string; onBack: () => v
   }
 
   async function stopAcquire() {
+    const taskId = acquireTaskIdRef.current;
+    if (!taskId) return;
     try {
-      await api.cancelShotAcquire(shotId);
+      await api.cancelTask(taskId);
     } catch (e) {
       setError(`Stop failed: ${(e as Error).message}`);
     }
   }
 
   async function toggleAcquirePause() {
+    const taskId = acquireTaskIdRef.current;
+    if (!taskId) return;
     try {
       if (acquirePaused) {
-        await api.resumeShotAcquire(shotId);
+        await api.resumeTask(taskId);
         setAcquirePaused(false);
       } else {
-        await api.pauseShotAcquire(shotId);
+        await api.pauseTask(taskId);
         setAcquirePaused(true);
       }
     } catch { /* next poll reflects the real state */ }
@@ -854,7 +894,7 @@ function AssetCard({
                   : "bg-slate-700 text-slate-400 hover:bg-slate-600"
               }`}
               aria-pressed={onRail}
-              title="Show on this shot's rail on the Timeline page (even past the rail limit)"
+              title="Show on this shot's rail on the 3D timeline page (even past the rail limit)"
             >
               {onRail ? "✓ ON TIMELINE" : "ADD TO TIMELINE"}
             </button>

@@ -627,19 +627,6 @@ export const acquireAllProgress: AcquireAllProgress = {
   running: false, total: 0, completed: 0, currentShotId: null, currentAsset: null, results: [], startedAt: null, error: null, shotErrors: [],
 };
 
-/** Progress for a single-shot acquire (polled by the review UI). */
-export interface AcquireShotProgress {
-  running: boolean;
-  paused: boolean;
-  shotId: string | null;
-  currentAsset: AssetDownloadProgress | null;
-  lastResult: PipelineProgress | null;
-  error: string | null;
-}
-export const acquireShotProgress: AcquireShotProgress = {
-  running: false, paused: false, shotId: null, currentAsset: null, lastResult: null, error: null,
-};
-
 export async function acquireAll(
   onProgress?: (p: PipelineProgress) => void,
   projectId: string = PROJECT_ID_ALL,
@@ -704,78 +691,6 @@ export async function acquireAll(
   return results;
 }
 
-/**
- * Run acquisition for a single shot in the background, updating
- * `acquireShotProgress` so the UI can poll per-asset download progress.
- * The run gets a DownloadController so the UI can pause / resume / cancel it.
- */
-let shotAcquireCtl: { abort: AbortController; gate: PauseGate } | null = null;
-
-export function acquireShotBackground(shotId: string): { started: boolean } | { alreadyRunning: boolean } {
-  if (acquireShotProgress.running) return { alreadyRunning: true };
-  if (acquireAllProgress.running) return { alreadyRunning: true };
-  const abort = new AbortController();
-  const gate = new PauseGate(abort.signal);
-  shotAcquireCtl = { abort, gate };
-  const controller: DownloadController = {
-    signal: abort.signal,
-    isPaused: () => gate.isPaused(),
-    waitIfPaused: () => gate.waitIfPaused(),
-  };
-  acquireShotProgress.running = true;
-  acquireShotProgress.paused = false;
-  acquireShotProgress.shotId = shotId;
-  acquireShotProgress.currentAsset = null;
-  acquireShotProgress.lastResult = null;
-  acquireShotProgress.error = null;
-  acquireShot(shotId, emptyDiversityContext(), (ap) => {
-    acquireShotProgress.currentAsset = ap;
-  }, controller)
-    .then((p) => {
-      acquireShotProgress.lastResult = p;
-      if (p.error) {
-        acquireShotProgress.error = p.error;
-      }
-    })
-    .catch((e) => {
-      const msg = (e as Error).message;
-      console.error(`[acquire shot ${shotId}] fatal: ${msg}`);
-      acquireShotProgress.error = msg;
-    })
-    .finally(() => {
-      acquireShotProgress.running = false;
-      acquireShotProgress.paused = false;
-      acquireShotProgress.shotId = null;
-      acquireShotProgress.currentAsset = null;
-      shotAcquireCtl = null;
-    });
-  return { started: true };
-}
-
-/** Cancel the running single-shot acquire (the search/persist phase). */
-export function cancelShotAcquire(shotId?: string): { ok: boolean } {
-  if (!acquireShotProgress.running) return { ok: false };
-  if (shotId && acquireShotProgress.shotId !== shotId) return { ok: false };
-  shotAcquireCtl?.abort.abort();
-  return { ok: true };
-}
-
-export function pauseShotAcquire(shotId?: string): { ok: boolean } {
-  if (!acquireShotProgress.running) return { ok: false };
-  if (shotId && acquireShotProgress.shotId !== shotId) return { ok: false };
-  shotAcquireCtl?.gate.pause();
-  acquireShotProgress.paused = true;
-  return { ok: true };
-}
-
-export function resumeShotAcquire(shotId?: string): { ok: boolean } {
-  if (!acquireShotProgress.running) return { ok: false };
-  if (shotId && acquireShotProgress.shotId !== shotId) return { ok: false };
-  shotAcquireCtl?.gate.resume();
-  acquireShotProgress.paused = false;
-  return { ok: true };
-}
-
 // =============================================================================
 // Timeline "fetch videos" — run candidate discovery for every shot of one
 // timeline (search + persist, no downloads). Driven by the Timeline page;
@@ -814,7 +729,7 @@ export function fetchTimelineBackground(
   timelineId: string,
   maxPerShot: number,
 ): { started: boolean; total?: number } | { alreadyRunning: boolean } {
-  if (timelineFetchProgress.running || acquireShotProgress.running || acquireAllProgress.running) {
+  if (timelineFetchProgress.running || acquireAllProgress.running) {
     return { alreadyRunning: true };
   }
   const shots = listShotsByTimeline(timelineId);
@@ -1060,130 +975,4 @@ export async function acquireAssetById(
     console.warn(`[acquire-asset] failed for ${assetId}: ${msg}`);
     return { assetId, status: "failed", error: msg };
   }
-}
-
-// --- Background acquire-asset with progress polling -------------------------
-
-export interface AcquireAssetProgress {
-  running: boolean;
-  assetId: string | null;
-  currentAsset: AssetDownloadProgress | null;
-  lastResult: AcquireAssetResult | null;
-  error: string | null;
-}
-export const acquireAssetProgress: AcquireAssetProgress = {
-  running: false, assetId: null, currentAsset: null, lastResult: null, error: null,
-};
-
-/** Run acquireAssetById in the background, updating acquireAssetProgress. */
-export function acquireAssetBackground(assetId: string): { started: boolean } | { alreadyRunning: boolean } {
-  if (acquireAssetProgress.running) return { alreadyRunning: true };
-  acquireAssetProgress.running = true;
-  acquireAssetProgress.assetId = assetId;
-  acquireAssetProgress.currentAsset = null;
-  acquireAssetProgress.lastResult = null;
-  acquireAssetProgress.error = null;
-  acquireAssetById(assetId, (ap) => {
-    acquireAssetProgress.currentAsset = ap;
-  })
-    .then((r) => {
-      acquireAssetProgress.lastResult = r;
-      if (r.status === "failed" && r.error) acquireAssetProgress.error = r.error;
-    })
-    .catch((e) => {
-      const msg = (e as Error).message;
-      console.error(`[acquire asset ${assetId}] fatal: ${msg}`);
-      acquireAssetProgress.error = msg;
-    })
-    .finally(() => {
-      acquireAssetProgress.running = false;
-      acquireAssetProgress.assetId = null;
-      acquireAssetProgress.currentAsset = null;
-    });
-  return { started: true };
-}
-
-// --- Background batch acquire (Acquire All on the search page) --------------
-
-export interface AcquireBatchResult {
-  assetId: string;
-  status: "downloaded" | "already_downloaded" | "rejected" | "failed";
-  error?: string;
-  reason?: string;
-}
-
-export interface AcquireBatchProgress {
-  running: boolean;
-  total: number;
-  completed: number;
-  succeeded: number;
-  failed: number;
-  currentAssetId: string | null;
-  currentAsset: AssetDownloadProgress | null;
-  results: AcquireBatchResult[];
-  error: string | null;
-}
-
-export const acquireBatchProgress: AcquireBatchProgress = {
-  running: false,
-  total: 0,
-  completed: 0,
-  succeeded: 0,
-  failed: 0,
-  currentAssetId: null,
-  currentAsset: null,
-  results: [],
-  error: null,
-};
-
-/** Acquire multiple discovered assets sequentially in the background. Updates
- *  acquireBatchProgress so the frontend can poll overall progress. Skips
- *  assets that are already downloaded. */
-export function acquireAssetsBatchBackground(assetIds: string[]): { started: boolean } | { alreadyRunning: boolean } {
-  if (acquireBatchProgress.running) return { alreadyRunning: true };
-  acquireBatchProgress.running = true;
-  acquireBatchProgress.total = assetIds.length;
-  acquireBatchProgress.completed = 0;
-  acquireBatchProgress.succeeded = 0;
-  acquireBatchProgress.failed = 0;
-  acquireBatchProgress.currentAssetId = null;
-  acquireBatchProgress.currentAsset = null;
-  acquireBatchProgress.results = [];
-  acquireBatchProgress.error = null;
-
-  (async () => {
-    for (const id of assetIds) {
-      acquireBatchProgress.currentAssetId = id;
-      acquireBatchProgress.currentAsset = null;
-      try {
-        const r = await acquireAssetById(id, (ap) => {
-          acquireBatchProgress.currentAsset = ap;
-        });
-        acquireBatchProgress.results.push(r);
-        if (r.status === "downloaded" || r.status === "already_downloaded") {
-          acquireBatchProgress.succeeded++;
-        } else {
-          acquireBatchProgress.failed++;
-        }
-      } catch (e) {
-        const msg = (e as Error).message;
-        console.error(`[acquire-batch] fatal for ${id}: ${msg}`);
-        acquireBatchProgress.results.push({ assetId: id, status: "failed", error: msg });
-        acquireBatchProgress.failed++;
-      }
-      acquireBatchProgress.completed++;
-    }
-  })()
-    .catch((e) => {
-      const msg = (e as Error).message;
-      console.error(`[acquire-batch] fatal: ${msg}`);
-      acquireBatchProgress.error = msg;
-    })
-    .finally(() => {
-      acquireBatchProgress.running = false;
-      acquireBatchProgress.currentAssetId = null;
-      acquireBatchProgress.currentAsset = null;
-    });
-
-  return { started: true };
 }

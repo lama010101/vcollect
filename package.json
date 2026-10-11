@@ -27,10 +27,13 @@
     "dashboard": "tsx apps/server/src/cli.ts dashboard"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0",
+    "concurrently": "^10.0.6",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vitest": "^5.0.3"
+  },
+  "overrides": {
+    "vite": "^6.4.4"
   },
   "engines": {
     "node": ">=20"

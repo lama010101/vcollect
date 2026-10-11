@@ -83,6 +83,27 @@ export const searchOptionsSchema = z.object({
   page: z.number().int().positive().optional(),
 });
 
+// --- Provider candidate (mirrors the AssetCandidate interface in types.ts) ---
+// Validates candidates posted back by the client (e.g. POST /api/providers/acquire).
+export const assetCandidateSchema = z.object({
+  provider: providerNameSchema,
+  providerAssetId: z.string(),
+  providerUrl: z.string(),
+  downloadUrl: z.string(),
+  title: z.string().nullable(),
+  creatorName: z.string().nullable(),
+  creatorUrl: z.string().nullable(),
+  width: z.number(),
+  height: z.number(),
+  durationSeconds: z.number(),
+  fps: z.number().nullable(),
+  thumbnailUrl: z.string().nullable(),
+  sourceLicense: z.string().nullable(),
+  licenseUrl: z.string().nullable(),
+  tags: z.array(z.string()),
+});
+export type AssetCandidateInput = z.infer<typeof assetCandidateSchema>;
+
 // --- Review request body (PRD §23) -------------------------------------------
 export const reviewRequestSchema = z.object({
   action: reviewActionSchema,

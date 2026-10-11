@@ -282,6 +282,6 @@ export function revealInExplorer(absolutePath: string): { ok: boolean; error?: s
 /** Resolve a local_path (relative to OUTPUT_ROOT) to an absolute filesystem path.
  * local_path is relative to OUTPUT_ROOT (e.g. "<query>/PEXELS_123.mp4").
  */
-export function assetAbsolutePath(localPath: string, _slug: string): string {
+export function assetAbsolutePath(localPath: string): string {
   return resolve(OUTPUT_ROOT, localPath);
 }

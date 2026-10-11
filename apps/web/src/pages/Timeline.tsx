@@ -142,7 +142,7 @@ export function TimelinePage({ onOpenShot, projectId }: { onOpenShot: (id: strin
       await loadTimelines();
       setSelectedId(r.timelineId);
     } catch (e) {
-      setError(`Visualizer session failed: ${(e as Error).message}`);
+      setError(`4D timeline session failed: ${(e as Error).message}`);
     } finally {
       setVizLoading(false);
     }
@@ -395,9 +395,9 @@ export function TimelinePage({ onOpenShot, projectId }: { onOpenShot: (id: strin
         {/* Import a saved visualizer setup — each layer-stack row + stem
             becomes a shot on a new "Viz — <name>" timeline. */}
         <div className="mt-3 pt-3 border-t border-slate-800 space-y-1.5">
-          <label className="block text-[10px] font-semibold uppercase tracking-wide text-slate-500">Visualizer session</label>
+          <label className="block text-[10px] font-semibold uppercase tracking-wide text-slate-500">4D timeline session</label>
           {vizSessions.length === 0 ? (
-            <p className="text-[11px] text-slate-600">No sessions — save one on the Visualizer page.</p>
+            <p className="text-[11px] text-slate-600">No sessions — save one on the 4D timeline page.</p>
           ) : (
             <div className="flex gap-2">
               <select value={vizSel} onChange={(e) => setVizSel(e.target.value)} className="ui-input flex-1 text-xs min-w-0">

@@ -213,6 +213,9 @@ body {
   .ui-btn-danger {
     @apply bg-rose-700 hover:bg-rose-600 text-white px-4 py-2;
   }
+  .ui-btn-success {
+    @apply bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2;
+  }
   .ui-btn-ghost {
     @apply text-slate-400 hover:text-slate-200 hover:bg-slate-700/40 px-3 py-1.5;
   }

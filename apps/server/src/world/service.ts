@@ -340,7 +340,7 @@ export function startWorldJob(projectId: string, raw: unknown): WorldJob {
   if (!a.local_path) {
     throw new WorldError(422, "VIDEO_NOT_DOWNLOADED", `Asset "${a.title ?? a.id}" has no downloaded file — download it first.`);
   }
-  const srcAbs = assetAbsolutePath(a.local_path, "");
+  const srcAbs = assetAbsolutePath(a.local_path);
   if (!existsSync(srcAbs)) {
     throw new WorldError(404, "VIDEO_FILE_MISSING", `The asset's file is missing on disk: ${a.local_path}`);
   }

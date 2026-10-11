@@ -13,7 +13,7 @@ import type { Readable, Writable } from "node:stream";
 import { mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import sharp from "sharp";
-import { computeDancer, computeFrame, frameCenter, keyVideoFrame, VIZ_JS_KEY_METHODS, zoomPanRect, type FrameStem, type VisualizerRenderInput, type VizVideoKeyConfig, type VizZoomPanConfig } from "@twio/shared";
+import { computeDancer, computeFrame, frameCenter, keyVideoFrame, primaryWaveParams, VIZ_JS_KEY_METHODS, zoomPanAt, zoomPanRect, type FrameStem, type VisualizerRenderInput, type VizVideoKeyConfig, type VizZoomPanConfig } from "@twio/shared";
 import { ffmpegService } from "../video/ffmpeg.js";
 import { probe, probeAudio } from "../video/ffprobe.js";
 import { VisualizerError } from "./errors.js";
@@ -73,6 +73,20 @@ export interface VizRenderResult {
 }
 
 const fmt = (n: number): string => n.toFixed(6);
+
+/** Round a zoomPanRect to whole pixels and clamp it inside the media — the
+ *  one crop box every consumer agrees on (decoder vf, image extract, and the
+ *  per-frame animate path), so static and Ken Burns renders stay aligned. */
+function cropBox(r: { sx: number; sy: number; sw: number; sh: number }, mediaW: number, mediaH: number) {
+  const width = Math.min(mediaW, Math.max(1, Math.round(r.sw)));
+  const height = Math.min(mediaH, Math.max(1, Math.round(r.sh)));
+  return {
+    width,
+    height,
+    left: Math.min(Math.max(0, Math.round(r.sx)), mediaW - width),
+    top: Math.min(Math.max(0, Math.round(r.sy)), mediaH - height),
+  };
+}
 
 function aborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
@@ -167,7 +181,10 @@ class FrameReader {
  *  the libvpx decoder — the native vp9 decoder drops the alpha stream).
  *  Zoom/pan: when source dims are known the vf crops the `zoomPanRect` window
  *  in NATIVE space, then scales it to WxH — at defaults that window IS the
- *  cover-fit rect (identical pixels to the legacy scale+crop chain). */
+ *  cover-fit rect (identical pixels to the legacy scale+crop chain).
+ *  `nativeOut` (animated zoom/pan) skips the crop/scale entirely — frames
+ *  leave the pipe at native mediaW×mediaH and the frame loop evaluates
+ *  `zoomPanAt(t) → zoomPanRect` per frame, the same math the preview runs. */
 export function videoDecoderArgs(
   srcPath: string,
   width: number,
@@ -178,16 +195,16 @@ export function videoDecoderArgs(
   zoomPan?: VizZoomPanConfig,
   mediaW?: number,
   mediaH?: number,
+  nativeOut?: boolean,
 ): { args: string[]; channels: 3 | 4; keyed: boolean } {
   const keyed = !!keyedPath || (!!key && key.method !== "none");
   let vf = `fps=${fps}`;
-  if (mediaW && mediaH) {
-    const r = zoomPanRect(mediaW, mediaH, width, height, zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5 });
-    const cw = Math.max(1, Math.round(r.sw));
-    const ch = Math.max(1, Math.round(r.sh));
-    const cx = Math.min(Math.max(0, Math.round(r.sx)), mediaW - cw);
-    const cy = Math.min(Math.max(0, Math.round(r.sy)), mediaH - ch);
-    vf += `,crop=${cw}:${ch}:${cx}:${cy},scale=${width}:${height}`;
+  if (nativeOut && mediaW && mediaH) {
+    // no crop/scale — raw frames stay at native dims for the JS crop
+  } else if (mediaW && mediaH) {
+    const r = zoomPanRect(mediaW, mediaH, width, height, zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5, animate: false });
+    const b = cropBox(r, mediaW, mediaH);
+    vf += `,crop=${b.width}:${b.height}:${b.left}:${b.top},scale=${width}:${height}`;
   } else {
     vf += `,scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`;
   }
@@ -316,6 +333,11 @@ export async function renderVisualizer(
     jsKey: VizVideoKeyConfig | null;
     /** Static image layers: the single already-encoded data URI. */
     href: string | null;
+    /** Animated zoom/pan (Ken Burns): frames arrive at NATIVE media res and
+     *  the frame loop evaluates `zoomPanAt(t) → zoomPanRect` + extract per
+     *  frame — the same math as the preview's drawImage source rect. `buf`
+     *  caches the one decoded native frame for image layers. */
+    anim: { zp: VizZoomPanConfig; w: number; h: number; buf: Buffer | null } | null;
     err: string;
   }
   const layerPipes: LayerPipe[] = [];
@@ -323,7 +345,7 @@ export async function renderVisualizer(
   for (let i = 0; i < renderLayers.length; i++) {
     const l = renderLayers[i]!;
     if (l.kind === "visuals") {
-      layerPipes.push({ isVisuals: true, reader: null, proc: null, channels: 3, jsKey: null, href: null, err: "" });
+      layerPipes.push({ isVisuals: true, reader: null, proc: null, channels: 3, jsKey: null, href: null, anim: null, err: "" });
       continue;
     }
     const jsKey = !l.keyedPath && VIZ_JS_KEY_METHODS.has(l.key.method) ? l.key : null;
@@ -337,32 +359,46 @@ export async function renderVisualizer(
       // the ROTATED pixel space sharp will actually decode to.
       const rw = meta.orientation && meta.orientation >= 5 ? meta.height! : meta.width;
       const rh = meta.orientation && meta.orientation >= 5 ? meta.width : meta.height!;
-      const zp = l.zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5 };
-      const r = zoomPanRect(rw, rh, width, height, zp);
-      const cw = Math.max(1, Math.round(r.sw));
-      const ch = Math.max(1, Math.round(r.sh));
+      const zp = l.zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5, animate: false };
+      const channels = wantAlpha ? 4 : 3;
+      if (zp.animate) {
+        // Ken Burns — decode once at native res; every frame re-crops it via
+        // zoomPanAt(t) so the ramp matches the preview pixel-for-pixel.
+        const buf = await (wantAlpha ? sharp(l.path).rotate().ensureAlpha() : sharp(l.path).rotate().removeAlpha())
+          .raw()
+          .toBuffer();
+        layerPipes.push({ isVisuals: false, reader: null, proc: null, channels, jsKey, href: null, anim: { zp, w: rw, h: rh, buf }, err: "" });
+        continue;
+      }
+      const b = cropBox(zoomPanRect(rw, rh, width, height, zp), rw, rh);
       const img = sharp(l.path)
         .rotate()
-        .extract({
-          left: Math.min(Math.max(0, Math.round(r.sx)), rw - cw),
-          top: Math.min(Math.max(0, Math.round(r.sy)), rh - ch),
-          width: cw,
-          height: ch,
-        })
+        .extract({ left: b.left, top: b.top, width: b.width, height: b.height })
         .resize(width, height, { fit: "fill" });
-      const channels = wantAlpha ? 4 : 3;
       const raw = await (wantAlpha ? img.ensureAlpha() : img.removeAlpha()).raw().toBuffer();
       if (jsKey) keyVideoFrame(raw, width, height, jsKey);
       const enc =
         channels === 4
           ? { buf: await sharp(raw, { raw: { width, height, channels: 4 } }).png().toBuffer(), mime: "image/png" }
           : { buf: await sharp(raw, { raw: { width, height, channels: 3 } }).jpeg({ quality: 82 }).toBuffer(), mime: "image/jpeg" };
-      layerPipes.push({ isVisuals: false, reader: null, proc: null, channels, jsKey, href: `data:${enc.mime};base64,${enc.buf.toString("base64")}`, err: "" });
+      layerPipes.push({ isVisuals: false, reader: null, proc: null, channels, jsKey, href: `data:${enc.mime};base64,${enc.buf.toString("base64")}`, anim: null, err: "" });
       continue;
     }
-    const plan = videoDecoderArgs(l.path, width, height, fps, l.key, l.keyedPath);
+    // Animated zoom/pan needs native dims to crop against — without them the
+    // decoder falls back to the static zoomPan crop (animate can't run).
+    const animated = !!l.zoomPan?.animate && !!l.mediaW && !!l.mediaH;
+    const plan = videoDecoderArgs(l.path, width, height, fps, l.key, l.keyedPath, l.zoomPan, l.mediaW, l.mediaH, animated);
     const proc = await ffmpegService.ffmpegSpawn(plan.args, { signal: opts.signal });
-    const pipe: LayerPipe = { isVisuals: false, reader: null, proc, channels: plan.channels, jsKey, href: null, err: "" };
+    const pipe: LayerPipe = {
+      isVisuals: false,
+      reader: null,
+      proc,
+      channels: plan.channels,
+      jsKey,
+      href: null,
+      anim: animated ? { zp: l.zoomPan!, w: l.mediaW!, h: l.mediaH!, buf: null } : null,
+      err: "",
+    };
     proc.stderr?.on("data", (d) => {
       pipe.err += d.toString();
       if (pipe.err.length > 4000) pipe.err = pipe.err.slice(-4000);
@@ -372,7 +408,8 @@ export async function renderVisualizer(
       pipe.err += ` ${e.message}`;
     });
     proc.stdin?.on("error", () => {});
-    pipe.reader = new FrameReader(proc.stdout!, width * height * plan.channels);
+    const frameBytes = (animated ? l.mediaW! * l.mediaH! : width * height) * plan.channels;
+    pipe.reader = new FrameReader(proc.stdout!, frameBytes);
     layerPipes.push(pipe);
   }
 
@@ -383,7 +420,7 @@ export async function renderVisualizer(
       const t = k / fps;
       const state = computeFrame(stems, globals, width, height, t);
       if (globals.dancer.enabled) {
-        state.dancer = computeDancer(stems, globals.dancer, width, height, t, frameCenter(stems, globals, width, height, t));
+        state.dancer = computeDancer(stems, globals.dancer, width, height, t, frameCenter(stems, primaryWaveParams(globals), width, height, t));
       }
       const layerHrefs: (string | null)[] = [];
       for (let li = 0; li < layerPipes.length; li++) {
@@ -396,13 +433,24 @@ export async function renderVisualizer(
           layerHrefs.push(pipe.href);
           continue;
         }
-        const raw = await pipe.reader!.next();
+        let raw: Buffer | null = pipe.anim?.buf ?? (await pipe.reader!.next());
         if (!raw) {
           throw new VisualizerError(
             500,
             "VIDEO_DECODE_FAILED",
             `Media layer ${li + 1} stopped yielding frames at t=${t.toFixed(2)}s${pipe.err.trim() ? `: ${pipe.err.trim().slice(-400)}` : "."}`,
           );
+        }
+        // Ken Burns: the native-res frame is re-cropped per output frame —
+        // the same zoomPanAt(t) → zoomPanRect math the Canvas preview draws.
+        if (pipe.anim) {
+          const a = pipe.anim;
+          const b = cropBox(zoomPanRect(a.w, a.h, width, height, zoomPanAt(a.zp, t, duration)), a.w, a.h);
+          raw = await sharp(raw, { raw: { width: a.w, height: a.h, channels: pipe.channels } })
+            .extract({ left: b.left, top: b.top, width: b.width, height: b.height })
+            .resize(width, height, { fit: "fill" })
+            .raw()
+            .toBuffer();
         }
         // Color methods are keyed here via the shared JS implementation — the
         // exact same function the Canvas preview runs, so export pixels match.

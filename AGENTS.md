@@ -168,9 +168,12 @@
   its stack position: `row.visuals` is a complete `VizWaveParams`
   (`vizWaveParamsSchema`: mode + waveformLengthSec + globalAmplitude +
   glowIntensity/autoGlow + autoCenter + innerRadius + layout +
-  centerConvergence — i.e. the whole "2. Look" control set minus
+  centerConvergence — i.e. the whole per-row Look control set minus
   background/video/dancer); absent `visuals`, the row inherits the global
-  look (what old configs and the default row do). **Row
+  look (what old configs and the default row do). In the UI every ◈ row
+  always shows these controls (no separate Look section); the star + dancer
+  anchor to `primaryWaveParams(globals)` — the FIRST visuals row's
+  effective params — so the center stays editable per-row. **Row
   order is the only z-order** (row N-1 sits under row N) and **only listed
   rows draw** — no `kind:"visuals"` row means no waveforms at all. The UI
   lists the stack **top-first** (row 1 = top layer, like a Layers panel)
@@ -186,15 +189,24 @@
   inset, >1 = zoom clipped by the viewBox (visuals rows get a
   `translate(cx cy) scale(s) translate(-w/2 -h/2)` `<g transform>` /
   offscreen-canvas equivalent). Media rows also carry `zoomPan`
-  (`vizZoomPanSchema`: zoom 1–16 + panX/panY 0–1) — WHICH PART of the
-  source fills the tile: `zoomPanRect` shrinks the cover-fit window by
-  zoom and slides it across the free slack, so defaults reproduce the
-  old centered cover-fit and pan no-ops where nothing is hidden. The
+  (`vizZoomPanSchema`: zoom 1–16 + panX/panY 0–1 + `animate` flag) —
+  WHICH PART of the source fills the tile: `zoomPanRect` shrinks the
+  cover-fit window by zoom and slides it across the free slack, so
+  defaults reproduce the old centered cover-fit and pan no-ops where
+  nothing is hidden. With `animate` on, `zoomPanAt(zp, t, duration)`
+  ramps the effect linearly from neutral (zoom 1, centered) at t=0 to
+  the configured values at the end of the render — Ken Burns. The
   video decoder crops the rect in native space
   (`fps,crop=w:h:x:y,scale`) using probed ORIENTED dims
   (`probe().rotation` swaps w/h on 90|270); images use
   `sharp().rotate().extract().resize()`; keyed WebMs keep source dims.
   Without dims the decoder falls back to `scale=increase,crop`.
+  Animated layers take a different path: the decoder emits NATIVE-res
+  frames (`nativeOut` → vf is just `fps[,format=rgba]`) or the image is
+  decoded once uncropped, and the frame loop does
+  `zoomPanAt → zoomPanRect → sharp.extract().resize()` per frame — the
+  same shared math the Canvas preview's drawImage source rect runs, so
+  the ramp is pixel-identical between preview and export.
   Every row also carries `visibility` (`vizVisibilitySchema`:
   `{show: [{start,end}], hide: [{start,end}]}` seconds windows) —
   `visibleAt()` evaluates them per t into `state.videoLayers[].visible`;

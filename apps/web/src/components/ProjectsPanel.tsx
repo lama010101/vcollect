@@ -1,15 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Project, type ProjectSettingsUpdate } from "../api.js";
-import { Button, Badge, EmptyState } from "../components/ui.js";
+import { Button, Badge, EmptyState } from "./ui.js";
+
+/** Tiles | List view for the project cards — persisted. Tiles is the default:
+ *  each project is a square tile with a cover thumbnail taken from its folder
+ *  (an image asset when it has one, else a video poster frame). */
+const VIEW_STORAGE_KEY = "twio.ui.projectsView";
+const TILE_BTN =
+  "rounded-md bg-black/75 hover:bg-black/95 backdrop-blur-sm px-2 py-1.5 text-xs leading-none text-white shadow-md border border-white/30";
 
 /**
- * Projects management page — list, create, rename, delete projects, and
+ * Projects management panel — list, create, rename, delete projects, and
  * configure per-project acquisition settings (X/Y/Z + candidates per provider)
- * with per-setting "enforce globally" toggles.
+ * with per-setting "enforce globally" toggles. Embedded on the Dashboard.
  *
  * The virtual "All Projects" entry is shown but non-editable.
  */
-export function Projects({
+export function ProjectsPanel({
   onChanged,
   onSwitch,
   onImport,
@@ -26,6 +33,14 @@ export function Projects({
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [expandedSettings, setExpandedSettings] = useState<string | null>(null);
+  const [view, setView] = useState<"tiles" | "list">(() =>
+    localStorage.getItem(VIEW_STORAGE_KEY) === "list" ? "list" : "tiles",
+  );
+  const setViewMode = (v: "tiles" | "list") => {
+    setView(v);
+    localStorage.setItem(VIEW_STORAGE_KEY, v);
+  };
+  const expandedProject = projects.find((p) => p.id === expandedSettings) ?? null;
 
   async function load() {
     try {
@@ -79,7 +94,23 @@ export function Projects({
 
   return (
     <div className="space-y-4">
-      <h2 className="text-lg font-semibold text-slate-200">Projects</h2>
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-lg font-semibold text-slate-200">Projects</h2>
+        <div className="flex rounded-lg border border-slate-700/60 overflow-hidden text-xs" role="group" aria-label="Projects view">
+          {(["tiles", "list"] as const).map((v) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => setViewMode(v)}
+              className={`px-2.5 py-1.5 capitalize ${view === v ? "bg-sky-600/80 text-white" : "bg-slate-900/40 text-slate-400 hover:text-slate-200"}`}
+              aria-pressed={view === v}
+              title={v === "tiles" ? "Tiles — cover image from each project folder" : "List — rows with actions"}
+            >
+              {v === "tiles" ? "▦ Tiles" : "☰ List"}
+            </button>
+          ))}
+        </div>
+      </div>
       {error && <div className="text-xs text-rose-400 bg-rose-950/40 rounded-lg p-2 border border-rose-800/40">{error}</div>}
 
       {/* Create form */}
@@ -103,11 +134,81 @@ export function Projects({
       </div>
 
       {/* Project list */}
+      {loading && <p className="text-sm text-slate-400">Loading projects…</p>}
+      {!loading && projects.length === 0 && (
+        <EmptyState icon="◇" title="No projects yet" description="Create your first project above to get started." />
+      )}
+      {view === "tiles" && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3">
+          {projects.map((p) => {
+            const active = activeProjectId === p.id;
+            return (
+              <div
+                key={p.id}
+                className={`group relative aspect-square rounded-xl overflow-hidden border-2 bg-slate-900 ${active ? "border-sky-500" : "border-slate-700/60 hover:border-slate-500/70"}`}
+              >
+                <button
+                  type="button"
+                  onClick={() => onSwitch(p.id)}
+                  className="absolute inset-0 w-full h-full"
+                  title={p.description ?? (active ? `${p.name} — active project` : `Switch to ${p.name}`)}
+                >
+                  {p.coverAssetId ? (
+                    <img
+                      src={api.assetThumbUrl(p.coverAssetId)}
+                      alt=""
+                      loading="lazy"
+                      className="absolute inset-0 w-full h-full object-cover"
+                      onError={(e) => { e.currentTarget.style.display = "none"; }}
+                    />
+                  ) : (
+                    <span className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-slate-800 to-slate-950 text-4xl text-slate-600">
+                      {p.isVirtual ? "◇" : (p.name.trim()[0] ?? "?").toUpperCase()}
+                    </span>
+                  )}
+                  <span className="absolute inset-x-0 bottom-0 flex items-end justify-between gap-2 bg-gradient-to-t from-black/90 via-black/45 to-transparent px-2.5 pb-2 pt-10">
+                    <span className="min-w-0 truncate text-left text-sm font-semibold text-white">{p.name}</span>
+                    <span className="flex shrink-0 flex-col items-end gap-0.5 text-[10px] leading-none text-slate-200">
+                      <span title={`${p.counts?.imageCount ?? 0} images`}>▤ {p.counts?.imageCount ?? 0}</span>
+                      <span title={`${p.counts?.videoCount ?? 0} videos`}>▶ {p.counts?.videoCount ?? 0}</span>
+                    </span>
+                  </span>
+                </button>
+                {(active || p.isVirtual) && (
+                  <span className={`absolute left-1.5 top-1.5 z-10 rounded px-1.5 py-0.5 text-[10px] font-semibold ${active ? "bg-sky-600/90 text-white" : "bg-slate-700/90 text-slate-200"}`}>
+                    {active ? "✓ active" : "all"}
+                  </span>
+                )}
+                {!p.isVirtual && (
+                  <div className="absolute right-1.5 top-1.5 z-10 flex gap-1">
+                    <button type="button" onClick={() => onImport(p.id)} className={TILE_BTN} title={`♪ Import script into ${p.name}`}>♪</button>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedSettings(expandedSettings === p.id ? null : p.id)}
+                      className={`${TILE_BTN} ${expandedSettings === p.id ? "bg-violet-700/80" : ""}`}
+                      title="⚙ Acquisition settings"
+                    >⚙</button>
+                    <button type="button" onClick={() => rename(p)} className={TILE_BTN} title={`Rename ${p.name}`} aria-label={`Rename ${p.name}`}>✎</button>
+                    <button type="button" onClick={() => remove(p)} className={TILE_BTN} title={`Delete ${p.name}`} aria-label={`Delete ${p.name}`}>✕</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {/* In tiles view the acquisition settings open as a card under the grid. */}
+      {view === "tiles" && expandedProject && !expandedProject.isVirtual && (
+        <div className="ui-card overflow-hidden">
+          <div className="flex items-center justify-between border-b border-slate-700/40 bg-slate-900/40 px-4 py-2 text-xs font-semibold text-slate-300">
+            <span>⚙ Acquisition settings — {expandedProject.name}</span>
+            <button type="button" className="text-slate-500 hover:text-slate-200" onClick={() => setExpandedSettings(null)}>✕</button>
+          </div>
+          <ProjectSettingsPanel project={expandedProject} onSaved={load} />
+        </div>
+      )}
+      {view === "list" && (
       <div className="grid grid-cols-1 gap-3">
-        {loading && <p className="text-sm text-slate-400">Loading projects…</p>}
-        {!loading && projects.length === 0 && (
-          <EmptyState icon="◇" title="No projects yet" description="Create your first project above to get started." />
-        )}
         {projects.map((p) => (
           <div
             key={p.id}
@@ -169,6 +270,7 @@ export function Projects({
           </div>
         ))}
       </div>
+      )}
     </div>
   );
 }

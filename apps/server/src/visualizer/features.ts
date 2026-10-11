@@ -23,8 +23,8 @@ import { ffmpegService } from "../video/ffmpeg.js";
 import { VisualizerError } from "./errors.js";
 
 export const FEATURE_ANALYSIS_SR = 22050;
-const FEATURES_VERSION = 2; // bump when the manifest/binary shape changes
-const ENGINE_CACHE_DIR = resolve(OUTPUT_ROOT, "cache", "engine");
+export const FEATURES_VERSION = 2; // bump when the manifest/binary shape changes
+export const ENGINE_CACHE_DIR = resolve(OUTPUT_ROOT, "cache", "engine");
 
 interface StemManifest {
   version: number;

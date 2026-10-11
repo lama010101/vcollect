@@ -78,7 +78,7 @@ export function StatCard({
 
 // --- Button ------------------------------------------------------------------
 
-type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
+type ButtonVariant = "primary" | "secondary" | "danger" | "success" | "ghost";
 type ButtonSize = "default" | "sm";
 
 export function Button({
@@ -95,6 +95,7 @@ export function Button({
   const variantCls =
     variant === "primary" ? "ui-btn-primary" :
     variant === "danger" ? "ui-btn-danger" :
+    variant === "success" ? "ui-btn-success" :
     variant === "ghost" ? "ui-btn-ghost" :
     "ui-btn-secondary";
   const sizeCls = size === "sm" ? "ui-btn-sm" : "";

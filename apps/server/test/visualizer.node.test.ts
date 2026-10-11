@@ -25,6 +25,7 @@ import {
   vizTimeWindowSchema,
   vizVideoKeySchema,
   windowSlice,
+  zoomPanAt,
   zoomPanRect,
   PEAK_RATE,
   VIZ_POINTS,
@@ -540,7 +541,7 @@ describe("visualizer — layer stack (media + visuals rows)", () => {
     assert.equal(m0.opacity, 1);
     assert.equal(gv.video.layers[1]!.kind, "visuals");
     assert.deepEqual(computeFrame(stems, gv, 320, 240, 0.5).videoLayers, [
-      { kind: "media", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null, visible: true, zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 } },
+      { kind: "media", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null, visible: true, zoomPan: { zoom: 1, panX: 0.5, panY: 0.5, animate: false } },
       { kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null, visible: true },
     ]);
     // Old "over" band → the visuals row sits under the media row.
@@ -761,7 +762,7 @@ describe("visualizer — layer stack (media + visuals rows)", () => {
         // Legacy chromaKey folds into key (colorkey method, despill kept off
         // so old configs render identically).
         key: { method: "colorkey", color: "#FF00FF", similarity: 0.2, blend: 0.05, despill: false, choke: 0, model: "mediapipe", feather: 1 },
-        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 },
+        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5, animate: false },
         visible: true,
       },
       { kind: "visuals", hidden: false, x: 0.5, y: 0.5, opacity: 1, scale: 1, key: null, visible: true },
@@ -1145,7 +1146,7 @@ describe("visualizer — waveform layers (per-row settings)", () => {
 });
 
 describe("visualizer — layer zoom/pan", () => {
-  const zp = (z: number, px: number, py: number) => ({ zoom: z, panX: px, panY: py });
+  const zp = (z: number, px: number, py: number, animate = false) => ({ zoom: z, panX: px, panY: py, animate });
 
   it("defaults reproduce the centered cover-fit crop", () => {
     // Same-aspect media → whole frame.
@@ -1187,10 +1188,25 @@ describe("visualizer — layer zoom/pan", () => {
   it("media layers default to zoomPan {1, 0.5, 0.5} and keep custom values", () => {
     const def = vizMediaLayerSchema.parse({ kind: "media", assetId: "a" });
     assert.ok(def.kind === "media");
-    assert.deepEqual(def.zoomPan, { zoom: 1, panX: 0.5, panY: 0.5 });
-    const custom = vizMediaLayerSchema.parse({ kind: "media", assetId: "a", zoomPan: { zoom: 2.5, panX: 0, panY: 1 } });
+    assert.deepEqual(def.zoomPan, { zoom: 1, panX: 0.5, panY: 0.5, animate: false });
+    const custom = vizMediaLayerSchema.parse({ kind: "media", assetId: "a", zoomPan: { zoom: 2.5, panX: 0, panY: 1, animate: true } });
     assert.ok(custom.kind === "media");
-    assert.deepEqual(custom.zoomPan, { zoom: 2.5, panX: 0, panY: 1 });
+    assert.deepEqual(custom.zoomPan, { zoom: 2.5, panX: 0, panY: 1, animate: true });
+  });
+
+  it("zoomPanAt ramps from neutral to the configured values over the duration", () => {
+    const z = zp(3, 1, 0, true);
+    // t=0 → neutral: cover-fit zoom and centered pan (zero effect).
+    assert.deepEqual(zoomPanAt(z, 0, 10), { zoom: 1, panX: 0.5, panY: 0.5 });
+    // Midpoint — linear interpolation toward the target.
+    assert.deepEqual(zoomPanAt(z, 5, 10), { zoom: 2, panX: 0.75, panY: 0.25 });
+    // End of the video → the configured values, held past the end.
+    assert.deepEqual(zoomPanAt(z, 10, 10), { zoom: 3, panX: 1, panY: 0 });
+    assert.deepEqual(zoomPanAt(z, 12, 10), { zoom: 3, panX: 1, panY: 0 });
+    // No animate → the config applies verbatim at any t; a zero/negative
+    // duration disables the ramp instead of dividing by zero.
+    assert.deepEqual(zoomPanAt(zp(3, 1, 0), 5, 10), { zoom: 3, panX: 1, panY: 0 });
+    assert.deepEqual(zoomPanAt(z, 5, 0), { zoom: 3, panX: 1, panY: 0 });
   });
 
   it("videoDecoderArgs crops the zoom/pan window in native space", () => {
@@ -1204,6 +1220,16 @@ describe("visualizer — layer zoom/pan", () => {
     // No dims → legacy scale+cover-crop chain.
     const legacy = videoDecoderArgs("/tmp/v.mp4", 1080, 1920, 30, null);
     assert.ok(legacy.args[legacy.args.indexOf("-vf") + 1]!.includes("force_original_aspect_ratio=increase,crop=1080:1920"));
+  });
+
+  it("videoDecoderArgs nativeOut emits full-res frames for the JS Ken Burns crop", () => {
+    // Animated zoom/pan → no crop/scale in the vf; the frame loop re-crops.
+    const a = videoDecoderArgs("/tmp/v.mp4", 1080, 1920, 30, null, undefined, zp(3, 1, 0, true), 1920, 1080, true);
+    assert.equal(a.args[a.args.indexOf("-vf") + 1], "fps=30");
+    // Keyed animated layers still decode to rgba for the JS key pass.
+    const k = videoDecoderArgs("/tmp/v.mp4", 1080, 1920, 30, vizVideoKeySchema.parse({ method: "hsv" }), undefined, zp(2, 0.5, 0.5, true), 1920, 1080, true);
+    assert.equal(k.args[k.args.indexOf("-vf") + 1], "fps=30,format=rgba");
+    assert.equal(k.channels, 4);
   });
 });
 

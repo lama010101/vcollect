@@ -9,9 +9,12 @@
 //   GET  render/:id             job progress / result
 //   POST render/:id/cancel
 //   GET  renders?project=       rendered MP4s + EDL files
+//   POST reveal?project=&name=  open the renders folder (file selected) in the
+//                               OS file explorer
 // =============================================================================
 
 import type { FastifyInstance } from "fastify";
+import { basename, join } from "node:path";
 import { DEFAULT_PROJECT_ID, musicEditAnalyzeSchema, musicEditPlanSchema } from "@twio/shared";
 import { analyzeSong, analyzerStatus } from "../musicEdit/beatAnalysis.js";
 import { MusicEditError } from "../musicEdit/errors.js";
@@ -23,11 +26,13 @@ import {
   listRenders,
   listSongs,
   MAX_SONG_BYTES,
+  projectMusicDir,
   resolveAssetSources,
   saveSong,
   songPath,
   startRenderJob,
 } from "../musicEdit/service.js";
+import { revealInExplorer } from "./folders.js";
 
 function projectOf(query: unknown): string {
   const q = ((query as Record<string, unknown>).project as string | undefined)?.trim();
@@ -93,4 +98,12 @@ export async function registerMusicEditRoutes(app: FastifyInstance): Promise<voi
   app.post("/api/music-edit/render/:id/cancel", async (req) => ({ job: cancelRenderJob((req.params as { id: string }).id) }));
 
   app.get("/api/music-edit/renders", async (req) => ({ renders: listRenders(projectOf(req.query)) }));
+
+  // Open the renders folder (or a specific rendered file selected) in the OS
+  // file explorer — basename() keeps the path inside the renders dir.
+  app.post("/api/music-edit/reveal", async (req) => {
+    const name = String((req.query as Record<string, unknown>).name ?? "");
+    const dir = projectMusicDir(projectOf(req.query), "renders");
+    return revealInExplorer(name ? join(dir, basename(name)) : dir);
+  });
 }

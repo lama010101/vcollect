@@ -151,7 +151,7 @@ describe("visualizer sessions — load restores media", () => {
     assert.ok(newId.startsWith(`LOCAL_${PID}_`), `expected content-addressed id, got ${newId}`);
     const restored = getAsset(newId);
     assert.ok(restored?.local_path, "re-registered asset has a local_path");
-    assert.ok(existsSync(assetAbsolutePath(restored.local_path!, "")), "restored file exists on disk");
+    assert.ok(existsSync(assetAbsolutePath(restored.local_path!)), "restored file exists on disk");
 
     // Second load is stable — the re-registered asset now resolves directly.
     r = await loadSession(PID, s.id);
@@ -224,7 +224,7 @@ describe("visualizer sessions — session → timeline", () => {
         mode: "ribbons",
         video: {
           layers: [
-            { kind: "visuals" },                              // bottom — inherits 2. Look
+            { kind: "visuals" },                              // bottom — inherits the base look
             { kind: "media", assetId: "TL_MEDIA" },
             { kind: "visuals", visuals: { mode: "eqradial" } }, // top — own settings
           ],
@@ -247,7 +247,7 @@ describe("visualizer sessions — session → timeline", () => {
     assert.match(shots[0]!.visual_description, /own settings/);
     assert.match(shots[1]!.visual_description, /Media — bg\.mp4/);
     assert.match(shots[2]!.visual_description, /ribbons/);
-    assert.match(shots[2]!.visual_description, /2\. Look/);
+    assert.match(shots[2]!.visual_description, /base look/);
     assert.equal(shots[3]!.section, "STEMS");
     assert.match(shots[3]!.visual_description, /Stem — song\.wav \(drums\)/);
     for (const sh of shots) {

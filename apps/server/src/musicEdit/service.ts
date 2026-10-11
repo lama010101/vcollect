@@ -24,7 +24,7 @@ export interface ResolvedSource extends PlanSource {
   path: string;
 }
 
-function projectMusicDir(projectId: string, sub: "songs" | "renders"): string {
+export function projectMusicDir(projectId: string, sub: "songs" | "renders"): string {
   const project = getProject(projectId);
   if (!project || project.isVirtual) throw new MusicEditError(404, "PROJECT_NOT_FOUND", `Project not found: ${projectId}`);
   const dir = resolve(projectPaths(project.slug).output, "music_edit", sub);
@@ -113,7 +113,7 @@ export async function resolveAssetSources(assetIds: string[]): Promise<ResolvedS
       const a = getAsset(id);
       if (!a) throw new MusicEditError(404, "VIDEO_NOT_FOUND", `Video asset not found: ${id}`);
       if (!a.local_path) throw new MusicEditError(422, "VIDEO_NOT_DOWNLOADED", `Video "${a.title ?? id}" has not been downloaded.`);
-      return probeSource(id, basename(a.local_path), assetAbsolutePath(a.local_path, ""));
+      return probeSource(id, basename(a.local_path), assetAbsolutePath(a.local_path));
     }),
   );
 }

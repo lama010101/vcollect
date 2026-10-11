@@ -23,7 +23,7 @@ import {
   type CreateProjectInput,
 } from "@twio/shared";
 import { db } from "./client.js";
-import { OUTPUT_ROOT, projectPaths } from "../config.js";
+import { IMAGE_FILE_EXTENSIONS, OUTPUT_ROOT, projectPaths, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { createTimeline } from "./repository.js";
 import type { ProjectRow } from "./schema.js";
 
@@ -275,23 +275,46 @@ export function ensureDefaultProject(): void {
 }
 
 // Per-project counts for the Projects management page.
-const projectCountsStmt = lazy(
-  `SELECT
+// `videoCount`/`imageCount` split downloaded assets by file extension (the same
+// VIDEO_/IMAGE_FILE_EXTENSIONS the upload + folder-sync paths accept), and
+// `coverAssetId` picks a representative downloaded asset for the tiles view —
+// an image when the project has one, else the latest download (its thumbnail
+// is a poster frame). All extension lists are compile-time constants.
+const imageExtLike = [...IMAGE_FILE_EXTENSIONS].map((e) => `lower(local_path) LIKE '%${e}'`).join(" OR ");
+const videoExtLike = [...VIDEO_FILE_EXTENSIONS].map((e) => `lower(local_path) LIKE '%${e}'`).join(" OR ");
+const projectCountsSelects = `
      (SELECT COUNT(*) FROM shots WHERE shots.project_id = p.id) AS shotCount,
      (SELECT COUNT(*) FROM assets WHERE assets.project_id = p.id) AS assetCount,
-     (SELECT COUNT(*) FROM assets WHERE assets.project_id = p.id AND assets.local_path IS NOT NULL) AS downloadedCount
-   FROM projects p WHERE p.id = ?`,
-);
-export function projectCounts(id: string): { shotCount: number; assetCount: number; downloadedCount: number } {
+     (SELECT COUNT(*) FROM assets WHERE assets.project_id = p.id AND assets.local_path IS NOT NULL) AS downloadedCount,
+     (SELECT COUNT(*) FROM assets WHERE assets.project_id = p.id AND assets.local_path IS NOT NULL AND (${videoExtLike})) AS videoCount,
+     (SELECT COUNT(*) FROM assets WHERE assets.project_id = p.id AND assets.local_path IS NOT NULL AND (${imageExtLike})) AS imageCount,
+     (SELECT id FROM assets WHERE assets.project_id = p.id AND assets.local_path IS NOT NULL
+        ORDER BY CASE WHEN (${imageExtLike}) THEN 0 ELSE 1 END, downloaded_at DESC, id
+        LIMIT 1) AS coverAssetId`;
+export interface ProjectCountsRow {
+  shotCount: number;
+  assetCount: number;
+  downloadedCount: number;
+  videoCount: number;
+  imageCount: number;
+  coverAssetId: string | null;
+}
+const projectCountsStmt = lazy(`SELECT ${projectCountsSelects} FROM projects p WHERE p.id = ?`);
+export function projectCounts(id: string): ProjectCountsRow {
   if (id === PROJECT_ID_ALL) {
     const all = db.prepare(
       `SELECT
          (SELECT COUNT(*) FROM shots) AS shotCount,
          (SELECT COUNT(*) FROM assets) AS assetCount,
-         (SELECT COUNT(*) FROM assets WHERE local_path IS NOT NULL) AS downloadedCount`,
-    ).get() as { shotCount: number; assetCount: number; downloadedCount: number };
+         (SELECT COUNT(*) FROM assets WHERE local_path IS NOT NULL) AS downloadedCount,
+         (SELECT COUNT(*) FROM assets WHERE local_path IS NOT NULL AND (${videoExtLike})) AS videoCount,
+         (SELECT COUNT(*) FROM assets WHERE local_path IS NOT NULL AND (${imageExtLike})) AS imageCount,
+         (SELECT id FROM assets WHERE local_path IS NOT NULL
+            ORDER BY CASE WHEN (${imageExtLike}) THEN 0 ELSE 1 END, downloaded_at DESC, id
+            LIMIT 1) AS coverAssetId`,
+    ).get() as unknown as ProjectCountsRow;
     return all;
   }
-  const r = projectCountsStmt().get(id) as { shotCount: number; assetCount: number; downloadedCount: number } | undefined;
-  return r ?? { shotCount: 0, assetCount: 0, downloadedCount: 0 };
+  const r = projectCountsStmt().get(id) as ProjectCountsRow | undefined;
+  return r ?? { shotCount: 0, assetCount: 0, downloadedCount: 0, videoCount: 0, imageCount: 0, coverAssetId: null };
 }

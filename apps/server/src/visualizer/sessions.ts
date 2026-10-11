@@ -205,7 +205,7 @@ export async function saveSession(
   for (const l of payload.globalVisuals.video.layers) {
     if (l.kind !== "media") continue;
     const a = getAsset(l.assetId);
-    const abs = a && a.project_id === projectId && a.local_path ? assetAbsolutePath(a.local_path, "") : null;
+    const abs = a && a.project_id === projectId && a.local_path ? assetAbsolutePath(a.local_path) : null;
     if (abs && existsSync(abs)) {
       let snap = byPath.get(abs);
       if (!snap) {
@@ -323,7 +323,7 @@ export async function loadSession(projectId: string, id: string): Promise<Sessio
     const label = `Layer ${i + 1}`;
     const entry = stored.media.find((m) => m.assetId === l.assetId) ?? null;
     const a = getAsset(l.assetId);
-    const abs = a && a.project_id === projectId && a.local_path ? assetAbsolutePath(a.local_path, "") : null;
+    const abs = a && a.project_id === projectId && a.local_path ? assetAbsolutePath(a.local_path) : null;
     if (abs && existsSync(abs)) continue; // asset row + file both live
     if (!entry?.file || !existsSync(join(dir, "media", entry.file))) {
       warnings.push(
@@ -470,7 +470,7 @@ export async function sessionToTimeline(projectId: string, id: string): Promise<
     for (const l of [...layers].reverse()) {
       if (l.kind === "visuals") {
         const mode = l.visuals?.mode ?? stored.payload.globalVisuals.mode;
-        mk("VIZ_STACK", `◈ Waveform — ${mode}${l.visuals ? " (own settings)" : " (2. Look)"}`, mix);
+        mk("VIZ_STACK", `◈ Waveform — ${mode}${l.visuals ? " (own settings)" : " (base look)"}`, mix);
         continue;
       }
       const a = getAsset(l.assetId);

@@ -275,8 +275,30 @@ export const vizZoomPanSchema = z.object({
    *  (default), 1 = near edge; clamped so the window stays inside the media. */
   panX: z.number().min(0).max(1).default(0.5),
   panY: z.number().min(0).max(1).default(0.5),
+  /** Ken Burns ramp — the crop starts neutral (zoom 1, centered pan) and
+   *  reaches the configured zoom/pan at the end of the render. Off = static
+   *  crop exactly as before. */
+  animate: z.boolean().default(false),
 });
 export type VizZoomPanConfig = z.infer<typeof vizZoomPanSchema>;
+
+/** Effective zoom/pan at time t. With `animate` on, the effect ramps
+ *  linearly from neutral (zoom 1, centered pan — zero zoom/pan effect) at
+ *  t=0 to the configured values at `durationSec`, then holds there. Without
+ *  `animate` the configured values apply verbatim at every t. */
+export function zoomPanAt(
+  zp: VizZoomPanConfig,
+  t: number,
+  durationSec: number,
+): Pick<VizZoomPanConfig, "zoom" | "panX" | "panY"> {
+  if (!zp.animate || !(durationSec > 0)) return { zoom: zp.zoom, panX: zp.panX, panY: zp.panY };
+  const p = Math.min(1, Math.max(0, t / durationSec));
+  return {
+    zoom: 1 + (zp.zoom - 1) * p,
+    panX: 0.5 + (zp.panX - 0.5) * p,
+    panY: 0.5 + (zp.panY - 0.5) * p,
+  };
+}
 
 /** Source subrect for a media layer's zoom/pan — the cover-fit window shrunk
  *  by `zoom` around its center, then slid so its center sits at `pan` of the
@@ -340,11 +362,11 @@ const vizMediaAssetLayerSchema = z
   })
   .transform(foldChromaKey);
 
-/** The mode visuals ("2. Look") as a stack row — the waveforms draw at this
+/** The mode visuals as a stack row — the waveforms draw at this
  *  row's position; a stack without a visuals row renders no mode visuals at
  *  all. Carries opacity/scale like media rows (no asset, no keying). Several
  *  visuals rows may coexist: `visuals` holds the row's own complete look
- *  (mode + params); absent it draws with the global "2. Look" values —
+ *  (mode + params); absent it draws with the global wave params —
  *  which is also what old configs (and the default row) do. */
 const vizVisualsLayerSchema = z.object({
   kind: z.literal("visuals"),
@@ -367,7 +389,7 @@ export const VIZ_MAX_VIDEO_LAYERS = 10;
 
 /** The visuals stack row added by default and inserted when migrating
  *  band-model configs. `visuals` gives the row its own look (leave unset to
- *  inherit the global "2. Look"). */
+ *  inherit the global wave params). */
 export const vizVisualsLayer = (visuals?: VizWaveParams): VizMediaLayerConfig => ({
   kind: "visuals",
   hidden: false,
@@ -415,7 +437,7 @@ export const vizVideoSchema = z
         scale: legacy.scale,
         chromaKey: legacy.chromaKey,
         key: legacy.key,
-        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 },
+        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5, animate: false },
         visibility: { show: [], hide: [] },
       });
       return { layers: legacy.layer === "over" ? [vizVisualsLayer(), media] : [media, vizVisualsLayer()] };
@@ -435,7 +457,7 @@ export const vizVideoSchema = z
         scale: legacy.scale,
         chromaKey: legacy.chromaKey,
         key: legacy.key,
-        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 },
+        zoomPan: { zoom: 1, panX: 0.5, panY: 0.5, animate: false },
         visibility: { show: [], hide: [] },
       });
       const vi = out.findIndex((l) => l.kind === "visuals");
@@ -1161,6 +1183,16 @@ export function visualsForRow(state: VizFrameState, rowIndex: number): VizModeVi
     silks: state.silks,
     particles: state.particles,
   };
+}
+
+/** The primary waveform layer's params — the FIRST `kind:"visuals"` row's own
+ *  `visuals` (the bottom-most waveform layer), or the global wave params when
+ *  that row carries none / there is no visuals row. The convergence star and
+ *  the dancer anchor to this center, so the anchor point stays editable via
+ *  that row's Center controls (there is no separate global look panel). */
+export function primaryWaveParams(globals: VisualizerGlobals): VizWaveParams {
+  const row = globals.video.layers.find((l): l is Extract<VizMediaLayerConfig, { kind: "visuals" }> => l.kind === "visuals");
+  return row?.visuals ?? globals;
 }
 
 export interface FrameStem {
@@ -2384,7 +2416,10 @@ export function computeFrame(
   height: number,
   t: number,
 ): VizFrameState {
-  const center: Vec2 = frameCenter(stems, globals, width, height, t);
+  // The star + dancer anchor to the FIRST visuals row's effective center — its
+  // own look when it carries one, else the global wave params.
+  const anchor = primaryWaveParams(globals);
+  const center: Vec2 = frameCenter(stems, anchor, width, height, t);
   const solo = anySolo(stems.map((s) => s.cfg));
   const cell = beatCellIndex(stems, t);
 
@@ -2400,7 +2435,7 @@ export function computeFrame(
   }
   const masterRms = audibleCount > 0 ? Math.sqrt(master / audibleCount) : 0;
   const minDim = Math.min(width, height);
-  const starR = minDim * 0.022 + masterRms * globals.centerConvergence.pulseSensitivity * minDim * 0.09;
+  const starR = minDim * 0.022 + masterRms * anchor.centerConvergence.pulseSensitivity * minDim * 0.09;
 
   // One channel per visuals row: each draws with its own `visuals` params
   // (falling back to the global look), its own beat center and its own

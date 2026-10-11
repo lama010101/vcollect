@@ -157,7 +157,7 @@ export async function registerVisualizerRoutes(app: FastifyInstance): Promise<vo
     if (!a.local_path) {
       throw new VisualizerError(422, "VIDEO_NOT_DOWNLOADED", `Asset "${a.title ?? a.id}" has no downloaded file — download it first.`);
     }
-    const abs = assetAbsolutePath(a.local_path, "");
+    const abs = assetAbsolutePath(a.local_path);
     if (!existsSync(abs)) {
       throw new VisualizerError(404, "VIDEO_FILE_MISSING", `The asset's file is missing on disk: ${a.local_path}`);
     }

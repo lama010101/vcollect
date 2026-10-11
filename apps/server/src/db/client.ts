@@ -43,6 +43,12 @@ export interface Statement {
 
 /** Thin wrapper exposing typed helpers over a prepared statement. */
 export class Sql {
+  /** Nesting depth of open transaction() calls — 0 = no open transaction. */
+  private txDepth = 0;
+  /** Prepared statements are reusable, so cache them by SQL text: run/get/all
+   *  route through prepare() and hot paths shouldn't re-prepare every call. */
+  private readonly stmtCache = new Map<string, Statement>();
+
   constructor(private readonly db: DatabaseSync) {}
 
   exec(sql: string): void {
@@ -50,12 +56,16 @@ export class Sql {
   }
 
   prepare(sql: string): Statement {
+    const cached = this.stmtCache.get(sql);
+    if (cached) return cached;
     const s: StatementSync = this.db.prepare(sql);
-    return {
+    const stmt: Statement = {
       run: (...p: unknown[]) => s.run(...(p as never[])) as unknown as RunResult,
       get: (...p: unknown[]) => s.get(...(p as never[])) as Record<string, unknown> | undefined,
       all: (...p: unknown[]) => s.all(...(p as never[])) as Record<string, unknown>[],
     };
+    this.stmtCache.set(sql, stmt);
+    return stmt;
   }
 
   run(sql: string, ...params: unknown[]): RunResult {
@@ -70,21 +80,45 @@ export class Sql {
     return this.prepare(sql).all(...params) as T[];
   }
 
-  /** Run a function inside a transaction. Throws on error → rollback. */
+  /** Run a function inside a transaction. Throws on error → rollback.
+   *  Reentrant: nested calls run inside a SAVEPOINT instead of a bare BEGIN,
+   *  so repository helpers that open their own transaction (e.g. deleteShot)
+   *  can be called from a caller's transaction. An inner throw rolls back
+   *  only the inner unit; the outer transaction may continue or rethrow. */
   transaction<T>(fn: () => T): T {
-    this.db.exec("BEGIN");
+    const depth = this.txDepth;
+    const outer = depth === 0;
+    const sp = `twio_sp_${depth}`;
+    this.db.exec(outer ? "BEGIN" : `SAVEPOINT ${sp}`);
+    this.txDepth = depth + 1;
     try {
       const result = fn();
-      this.db.exec("COMMIT");
+      // Restore depth BEFORE COMMIT/RELEASE so a failed commit can't leave it
+      // wrong; assigning `depth` (not decrementing) keeps the catch idempotent.
+      this.txDepth = depth;
+      this.db.exec(outer ? "COMMIT" : `RELEASE SAVEPOINT ${sp}`);
       return result;
     } catch (err) {
+      this.txDepth = depth;
       try {
-        this.db.exec("ROLLBACK");
+        if (outer) {
+          this.db.exec("ROLLBACK");
+        } else {
+          // RELEASE after ROLLBACK TO so the savepoint name can be reused.
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+          this.db.exec(`RELEASE SAVEPOINT ${sp}`);
+        }
       } catch {
         /* ignore */
       }
       throw err;
     }
+  }
+
+  /** Close the underlying connection (clears the statement cache first). */
+  close(): void {
+    this.stmtCache.clear();
+    this.db.close();
   }
 }
 
@@ -92,7 +126,7 @@ export const db = new Sql(sqlite);
 
 export function closeDb(): void {
   try {
-    sqlite.close();
+    db.close();
   } catch {
     /* already closed */
   }

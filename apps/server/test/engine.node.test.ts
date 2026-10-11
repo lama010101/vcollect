@@ -1,11 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EngineClient, engineClient, EngineRpcError } from "../src/python/engineClient.ts";
 import { DEPS_STAMP_PATH, resolveBasePython, VENV_PYTHON } from "../src/python/pythonService.ts";
-import { stemFeatures } from "../src/visualizer/features.ts";
+import { ENGINE_CACHE_DIR, FEATURES_VERSION, stemFeatures } from "../src/visualizer/features.ts";
 
 /** Minimal mono 16-bit WAV writer (same pattern as visualizer.node.test.ts). */
 function wavBuffer(samples: Float32Array, sr: number): Buffer {
@@ -80,12 +81,19 @@ describe("python engine — stem features (needs provisioned venv)", () => {
       const samples = new Float32Array(Math.round(2 * sr));
       // 120 BPM click track — clicks at 0.25/0.75/1.25/1.75 s (a click at
       // t=0 has no rising edge for spectral flux, so the first is offset).
-      // Random amplitude → unique sha256 each run → the first stemFeatures
-      // call is always a real compute (the engine cache is content-keyed).
-      const amp = 0.85 + Math.random() * 0.1;
-      for (let k = 0; k < 4; k++) samples[Math.round((0.25 + k * 0.5) * sr)] = amp;
+      for (let k = 0; k < 4; k++) samples[Math.round((0.25 + k * 0.5) * sr)] = 0.9;
+      // Random low-amplitude tail → a unique sha256 each run (16-bit
+      // quantization makes single-sample variation collide-prone, so we
+      // spread ~1000 random samples across the file instead).
+      for (let i = 0; i < 1000; i++) samples[Math.floor(sr * 1.5) + i] = Math.random() * 0.01;
       const wav = join(dir, "clicks.wav");
       writeFileSync(wav, wavBuffer(samples, sr));
+
+      // Deterministic cold cache: drop this file's cache dir (derived the
+      // same way stemFeatures does) so the first call is always a real
+      // compute even if a previous run cached identical content.
+      const sha256 = createHash("sha256").update(readFileSync(wav)).digest("hex");
+      rmSync(join(ENGINE_CACHE_DIR, `${sha256}-v${FEATURES_VERSION}`), { recursive: true, force: true });
 
       const { features, cached } = await stemFeatures(wav);
       assert.ok(features.frames > 0);

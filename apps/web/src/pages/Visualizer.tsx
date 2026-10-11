@@ -3,6 +3,7 @@ import {
   computeDancer,
   computeFrame,
   frameCenter,
+  primaryWaveParams,
   detectStemKind,
   isStemAudible,
   keyVideoFrame,
@@ -16,6 +17,7 @@ import {
   vizWaveParamsSchema,
   vizZoomPanSchema,
   waveParamsFromGlobals,
+  zoomPanAt,
   zoomPanRect,
   type DancerConfig,
   type FrameStem,
@@ -172,7 +174,8 @@ function normalizePersisted(p: Partial<PersistedViz>): PersistedViz {
     const toLayer = (raw: RawLayer | null | undefined): VizMediaLayerConfig | null => {
       if (!raw || typeof raw !== "object") return null;
       if (raw.kind === "visuals") {
-        // Per-row look — validated; invalid/missing → inherits 2. Look.
+        // Per-row look — validated; invalid/missing → inherits the global
+        // wave params (the base look).
         const pv2 = vizWaveParamsSchema.safeParse(raw.visuals);
         const pvis = vizVisibilitySchema.safeParse(raw.visibility);
         return {
@@ -202,7 +205,7 @@ function normalizePersisted(p: Partial<PersistedViz>): PersistedViz {
             opacity: num(raw.opacity, 1),
             scale: num(raw.scale, 1),
             key: foldKey(raw),
-            zoomPan: pzp.success ? pzp.data : { zoom: 1, panX: 0.5, panY: 0.5 },
+            zoomPan: pzp.success ? pzp.data : { zoom: 1, panX: 0.5, panY: 0.5, animate: false },
             visibility: pvis.success ? pvis.data : { show: [], hide: [] },
           }
         : null;
@@ -486,8 +489,9 @@ function EyeIcon({ off, className = "" }: { off?: boolean; className?: string })
   );
 }
 
-/** The waveform "Look" control set — bound to ANY `VizWaveParams` object: the
- *  global "2. Look" params (base look) or a waveform layer's own `visuals`.
+/** The waveform "Look" control set — bound to ANY `VizWaveParams` object,
+ *  i.e. a waveform layer's own `visuals` (shown effective: rows without a
+ *  stamped copy display the base look and materialize it on first edit).
  *  `onChange` gets a partial patch the caller merges into its state. */
 function WaveLookControls({ p, onChange, engine }: { p: VizWaveParams; onChange: (patch: Partial<VizWaveParams>) => void; engine: EngineStatus | null }) {
   return (
@@ -581,7 +585,7 @@ function WaveLookControls({ p, onChange, engine }: { p: VizWaveParams; onChange:
   );
 }
 
-/** All "2. Look" mode visuals — mirrors svg.ts's modeVisualsSvg so the
+/** All mode visuals — mirrors svg.ts's modeVisualsSvg so the
  *  visuals layer emits identical shapes wherever it sits in the stack. */
 function drawVisuals(ctx: CanvasRenderingContext2D, vis: VizModeVisuals): void {
   for (const s of vis.stems) {
@@ -851,6 +855,8 @@ function drawState(
   h: number,
   bg: string,
   media?: ReadonlyArray<HTMLVideoElement | HTMLImageElement | null>,
+  t = 0,
+  duration = 0,
 ): void {
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, w, h);
@@ -896,7 +902,10 @@ function drawState(
     if (!ready || srcW === 0 || srcH === 0) return;
     // Source-crop window — the layer's zoom/pan selects which part of the
     // media fills the tile (defaults reproduce the centered cover-fit).
-    const r = zoomPanRect(srcW, srcH, w, h, v.zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5 });
+    // `animate` ramps the effect from neutral to the configured values over
+    // the mix duration — same zoomPanAt() the export's frame loop runs.
+    const zp = v.zoomPan ?? { zoom: 1, panX: 0.5, panY: 0.5, animate: false };
+    const r = zoomPanRect(srcW, srcH, w, h, zoomPanAt(zp, t, duration));
     const { sx, sy, sw, sh } = r;
     ctx.globalAlpha = v.opacity;
     // Color methods key the drawn pixels via the shared pass; `cutout` draws
@@ -1220,7 +1229,7 @@ export function Visualizer({
           }
           if (r.job.status === "done") {
             pushRenderLog(`✔ done — ${r.job.frameCount} frames`);
-            onToast("Visualizer rendered", "success");
+            onToast("4D timeline rendered", "success");
             loadRenders().catch(() => {});
           } else if (r.job.status === "failed") {
             pushRenderLog(`✖ failed — ${r.job.error?.message ?? "unknown error"}`);
@@ -1310,7 +1319,6 @@ export function Visualizer({
   // --- Fullscreen preview -----------------------------------------------------
   const previewBoxRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
-  const [lookOpen, setLookOpen] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
 
   useEffect(() => {
@@ -1606,7 +1614,7 @@ export function Visualizer({
       }
       const state = computeFrame(resolvedStems, globals, w, h, t);
       if (globals.dancer.enabled) {
-        state.dancer = computeDancer(resolvedStems, globals.dancer, w, h, t, frameCenter(resolvedStems, globals, w, h, t));
+        state.dancer = computeDancer(resolvedStems, globals.dancer, w, h, t, frameCenter(resolvedStems, primaryWaveParams(globals), w, h, t));
       }
       // Media-layer sync — each video element free-runs while playing (drift-
       // corrected per frame) and follows the scrub position when paused.
@@ -1630,7 +1638,7 @@ export function Visualizer({
         }
         return el;
       });
-      drawState(ctx, state, w, h, globals.backgroundColor, layerMedia);
+      drawState(ctx, state, w, h, globals.backgroundColor, layerMedia, t, duration);
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
@@ -1930,15 +1938,20 @@ export function Visualizer({
               opacity: 1,
               scale: 1,
               key: { ...DEFAULT_VIDEO_KEY },
-              zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 },
+              zoomPan: { zoom: 1, panX: 0.5, panY: 0.5, animate: false },
               visibility: { show: [], hide: [] },
             },
           ],
     );
-  /** Add a waveform layer stamped with a copy of the current 2. Look — from
-   *  then on its settings are its own, edited on the row (mode included). */
+  /** Add a waveform layer stamped with a copy of the top ◈ row's look (the
+   *  base look when the stack has no waveform row yet) — from then on its
+   *  settings are its own, edited on the row (mode included). */
   const addVisualsLayer = () =>
-    setLayers((ls) => (ls.length >= VIZ_MAX_VIDEO_LAYERS ? ls : [...ls, vizVisualsLayer(waveParamsFromGlobals(globals))]));
+    setLayers((ls) => {
+      if (ls.length >= VIZ_MAX_VIDEO_LAYERS) return ls;
+      const topVis = [...ls].reverse().find((l): l is Extract<VizMediaLayerConfig, { kind: "visuals" }> => l.kind === "visuals");
+      return [...ls, vizVisualsLayer(waveParamsFromGlobals(topVis?.visuals ?? globals))];
+    });
   const patchLayer = (i: number, patch: Partial<VizMediaLayerConfig>) =>
     setLayers((ls) => ls.map((l, j) => (j === i ? ({ ...l, ...patch } as VizMediaLayerConfig) : l)));
   const setLayerKey = (i: number, patch: Partial<VizVideoKeyConfig>) =>
@@ -2034,64 +2047,15 @@ export function Visualizer({
     canvas.height = Math.max(2, Math.round(w / aspect));
   }, [fullscreen, canvasH, renderSettings.width, renderSettings.height]);
 
-  // The "2. Look" controls — shared between the settings section and the
-  // fullscreen preview overlay, so edits apply live in both places. These are
-  // the BASE look: waveform layer rows can carry their own copy and override
-  // them entirely (same control set, bound to the row's `visuals`).
-  const lookContent = (
-    <>
-      <WaveLookControls p={globals} onChange={(patch) => setGlobals((g) => ({ ...g, ...patch }))} engine={engine} />
-      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 pt-1">
-        <label className="flex items-center gap-2 text-xs text-slate-400">
-          Background
-          <input type="color" value={globals.backgroundColor} onChange={(e) => setG("backgroundColor", e.target.value)} className="w-8 h-6 rounded border border-slate-600" />
-        </label>
-        <span className="text-[11px] text-slate-500">
-          Base look — ◈ waveform layers without their own settings draw with these. Add more waveform layers in "3. Media layers" to stack different looks.
-        </span>
-      </div>
+  // The base look — what a waveform row draws with until it's edited on the
+  // row (its own copy materializes on the first change), and what "Add a
+  // waveform layer" falls back to when the stack has no ◈ row yet.
+  const baseLook = waveParamsFromGlobals(globals);
 
-      {/* Dancer */}
-      <div className="border-t border-slate-700/50 pt-4 space-y-3">
-        <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={globals.dancer.enabled} onChange={(e) => setDancer({ enabled: e.target.checked })} />
-          <span className="font-semibold text-slate-200">Procedural dancer</span>
-          <span className="text-xs text-slate-500">— a computed skeleton dancing at the convergence point</span>
-        </label>
-        {globals.dancer.enabled && (
-          <div className="grid md:grid-cols-4 gap-3 text-xs text-slate-400">
-            <label className="space-y-1">Style
-              <select className="ui-input w-full" value={globals.dancer.style} onChange={(e) => setDancer({ style: e.target.value as DancerConfig["style"] })}>
-                <option value="neon">Neon outline</option>
-                <option value="silhouette">Silhouette</option>
-              </select>
-            </label>
-            <label className="space-y-1">Size {globals.dancer.scale.toFixed(2)}×
-              <input type="range" min={0.3} max={2} step={0.05} value={globals.dancer.scale} className="w-full" onChange={(e) => setDancer({ scale: Number(e.target.value) })} />
-            </label>
-            <label className="space-y-1">Energy {globals.dancer.intensity.toFixed(2)}×
-              <input type="range" min={0} max={2} step={0.05} value={globals.dancer.intensity} className="w-full" onChange={(e) => setDancer({ intensity: Number(e.target.value) })} />
-            </label>
-            <label className="space-y-1">Color
-              <div className="flex items-center gap-2">
-                <select className="ui-input flex-1" value={globals.dancer.colorMode} onChange={(e) => setDancer({ colorMode: e.target.value as DancerConfig["colorMode"] })}>
-                  <option value="stems">By stem kind</option>
-                  <option value="fixed">Fixed</option>
-                </select>
-                {globals.dancer.colorMode === "fixed" && (
-                  <input type="color" value={globals.dancer.color} onChange={(e) => setDancer({ color: e.target.value })} className="w-8 h-6 rounded border border-slate-600" />
-                )}
-              </div>
-            </label>
-          </div>
-        )}
-      </div>
-    </>
-  );
-
-
-  // The "3. Media layers" controls — shared between the settings section and the
-  // fullscreen overlay (alongside "2. Look"), so edits apply live in both places.
+  // The "2. Layers" controls — shared between the settings section and the
+  // fullscreen overlay, so edits apply live in both places. Waveform (◈) rows
+  // carry their own complete look — the same control set the old global
+  // "Look" section had, bound to the row's `visuals`.
   const layersContent = (
     <>
         <div className="flex flex-wrap items-center gap-3 text-sm">
@@ -2129,12 +2093,12 @@ export function Visualizer({
                       setPickerOpen(false);
                     }}
                     className="w-full flex items-center gap-2 px-2 py-2 text-left text-xs text-slate-200 hover:bg-slate-800/60 disabled:opacity-40 border-b border-slate-800"
-                    title="Add a waveform layer at the top of the stack — starts as a copy of the 2. Look settings, editable on the row"
+                    title="Add a waveform layer at the top of the stack — copies the top ◈ row's look, editable on the row"
                   >
                     <span className="w-12 h-8 rounded border border-violet-600/50 bg-violet-950/50 flex items-center justify-center text-violet-300 shrink-0">◈</span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate">Waveform layer</span>
-                      <span className="text-[10px] text-slate-500">own settings · starts as a copy of 2. Look · stack as many as you like</span>
+                      <span className="text-[10px] text-slate-500">own look settings · starts as a copy of the top ◈ row · stack as many as you like</span>
                     </span>
                   </button>
                   <div className="flex items-center gap-1.5 px-2 py-1.5 border-b border-slate-800">
@@ -2211,7 +2175,7 @@ export function Visualizer({
             )}
           </div>
           {hasVisualsLayer && (
-            <p className="text-[11px] text-slate-500">◈ rows = waveform layers — each can carry its own settings (or inherit 2. Look). No ◈ row → no waveforms.</p>
+            <p className="text-[11px] text-slate-500">◈ rows = waveform layers — each carries its own Look settings on the row. No ◈ row → no waveforms.</p>
           )}
           {videoAssets.length === 0 && (
             <p className="text-[11px] text-slate-500">
@@ -2222,7 +2186,7 @@ export function Visualizer({
 
         {globals.video.layers.length === 0 ? (
           <p className="text-sm text-slate-500">
-            Nothing is drawn — the frame is empty (even the 2. Look visuals need an explicit ◈ row). Add layers above: each row is a layer, drawn in row order.
+            Nothing is drawn — the frame is empty. Add a ◈ waveform row for the mode visuals, or media rows for videos/images — each row is a layer, drawn in row order.
           </p>
         ) : (
           <ol className="space-y-1.5">
@@ -2316,7 +2280,7 @@ export function Visualizer({
                     {isVis ? (
                       <span
                         className={`w-12 h-8 rounded border border-violet-600/50 bg-violet-950/50 flex items-center justify-center text-violet-300 shrink-0 ${l.hidden ? "opacity-40 grayscale" : ""}`}
-                        title="The visuals configured in section 2. Look"
+                        title="Waveform visuals — this row's own look below"
                       >
                         ◈
                       </span>
@@ -2330,16 +2294,14 @@ export function Visualizer({
                       />
                     ) : null}
                     <div className={`min-w-0 flex-1 ${l.hidden ? "opacity-40" : ""}`}>
-                      <div className="truncate text-xs text-slate-200" title={isVis ? (l.visuals ? `Waveform layer — ${l.visuals.mode}` : "Waveform visuals — inherited from 2. Look") : asset?.title ?? (l.kind === "media" ? l.assetId : "")}>
-                        {isVis ? (l.visuals ? `Waveform · ${l.visuals.mode}` : "Waveform visuals") : asset?.title ?? (l.kind === "media" ? l.assetId : "")}
+                      <div className="truncate text-xs text-slate-200" title={isVis ? `Waveform layer — ${(l.visuals ?? baseLook).mode}` : asset?.title ?? (l.kind === "media" ? l.assetId : "")}>
+                        {isVis ? `Waveform · ${(l.visuals ?? baseLook).mode}` : asset?.title ?? (l.kind === "media" ? l.assetId : "")}
                       </div>
                       <div className="flex items-center gap-1.5">
                         {isVis ? (
                           <>
                             <Badge tone="violet">visuals</Badge>
-                            <span className="text-[10px] text-slate-500">
-                              {l.visuals ? `${l.visuals.mode} · own settings` : `${globals.mode} · inherits 2. Look`}
-                            </span>
+                            <span className="text-[10px] text-slate-500">{(l.visuals ?? baseLook).mode}</span>
                           </>
                         ) : (
                           <>
@@ -2417,8 +2379,8 @@ export function Visualizer({
                         <button
                           type="button"
                           className="text-slate-500 hover:text-slate-200 disabled:opacity-30"
-                          disabled={l.zoomPan.zoom === 1 && l.zoomPan.panX === 0.5 && l.zoomPan.panY === 0.5}
-                          onClick={() => patchLayer(i, { zoomPan: { zoom: 1, panX: 0.5, panY: 0.5 } })}
+                          disabled={l.zoomPan.zoom === 1 && l.zoomPan.panX === 0.5 && l.zoomPan.panY === 0.5 && !l.zoomPan.animate}
+                          onClick={() => patchLayer(i, { zoomPan: { zoom: 1, panX: 0.5, panY: 0.5, animate: false } })}
                           title="Back to the cover-fit view"
                         >
                           ⌖
@@ -2438,6 +2400,15 @@ export function Visualizer({
                         <span className="w-3 text-slate-500">Y</span>
                         <input type="range" min={0} max={1} step={0.01} value={l.zoomPan.panY} className="w-20" onChange={(e) => setLayerZoomPan(i, { panY: Number(e.target.value) })} />
                         <span className="w-8 text-right">{Math.round(l.zoomPan.panY * 100)}%</span>
+                      </label>
+                      <label className="flex items-center gap-1.5" title="Ken Burns — the view starts normal (no zoom, centered) and smoothly reaches these values at the end of the video">
+                        <input
+                          type="checkbox"
+                          checked={l.zoomPan.animate}
+                          onChange={(e) => setLayerZoomPan(i, { animate: e.target.checked })}
+                          className="accent-sky-600"
+                        />
+                        <span className="text-slate-400">Animate</span>
                       </label>
                     </div>
                     )}
@@ -2674,33 +2645,12 @@ export function Visualizer({
                     )}
                     {isVis && (
                       <div className={`${LAYER_CARD} flex-1 min-w-[320px]`}>
-                        <div className="flex items-center justify-between gap-3">
-                          <span className={LAYER_CARD_LABEL}>Waveform</span>
-                          {l.visuals ? (
-                            <button
-                              type="button"
-                              className="text-slate-500 hover:text-slate-200"
-                              onClick={() => patchLayer(i, { visuals: undefined })}
-                              title="Drop this row's own settings — draw with the shared 2. Look again"
-                            >
-                              ↺ use 2. Look
-                            </button>
-                          ) : (
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => patchLayer(i, { visuals: waveParamsFromGlobals(globals) })}
-                              title="Give this waveform layer its own settings — copied from 2. Look"
-                            >
-                              Customize
-                            </Button>
-                          )}
-                        </div>
-                        {l.visuals ? (
-                          <WaveLookControls p={l.visuals} engine={engine} onChange={(patch) => patchLayer(i, { visuals: { ...l.visuals!, ...patch } })} />
-                        ) : (
-                          <p className="text-[10px] text-slate-500">Draws with the shared 2. Look — hit Customize to tweak this layer alone (mode, amp, glow, center…).</p>
-                        )}
+                        <span className={LAYER_CARD_LABEL}>Look — this layer's own settings</span>
+                        <WaveLookControls
+                          p={l.visuals ?? baseLook}
+                          engine={engine}
+                          onChange={(patch) => patchLayer(i, { visuals: { ...(l.visuals ?? baseLook), ...patch } })}
+                        />
                       </div>
                     )}
                   </div>
@@ -2711,9 +2661,53 @@ export function Visualizer({
         )}
         {globals.video.layers.length > 0 && (
           <p className="text-[11px] text-slate-500">
-            Videos loop if shorter than the mix · every layer is cover-cropped to the frame · a layer's own audio is not used · row 1 draws on top · drag a row vertically to reorder · only rows in this list are drawn — no ◈ row, no 2. Look visuals · the eye hides a row without deleting it (hidden media isn't decoded on export).
+            Videos loop if shorter than the mix · every layer is cover-cropped to the frame · a layer's own audio is not used · row 1 draws on top · drag a row vertically to reorder · only rows in this list are drawn — no ◈ row, no waveforms · the eye hides a row without deleting it (hidden media isn't decoded on export).
           </p>
         )}
+
+        {/* Frame-level extras — the background fills under the whole stack;
+            the dancer rides on top of it, anchored to the bottom ◈ row's
+            center (the first visuals row). */}
+        <div className="border-t border-slate-700/50 pt-3 space-y-3">
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
+            <label className="flex items-center gap-2 text-xs text-slate-400">
+              Background
+              <input type="color" value={globals.backgroundColor} onChange={(e) => setG("backgroundColor", e.target.value)} className="w-8 h-6 rounded border border-slate-600" />
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={globals.dancer.enabled} onChange={(e) => setDancer({ enabled: e.target.checked })} />
+              <span className="font-semibold text-slate-200">Procedural dancer</span>
+              <span className="text-xs text-slate-500">— a computed skeleton dancing at the bottom ◈ row's center</span>
+            </label>
+          </div>
+          {globals.dancer.enabled && (
+            <div className="grid md:grid-cols-4 gap-3 text-xs text-slate-400">
+              <label className="space-y-1">Style
+                <select className="ui-input w-full" value={globals.dancer.style} onChange={(e) => setDancer({ style: e.target.value as DancerConfig["style"] })}>
+                  <option value="neon">Neon outline</option>
+                  <option value="silhouette">Silhouette</option>
+                </select>
+              </label>
+              <label className="space-y-1">Size {globals.dancer.scale.toFixed(2)}×
+                <input type="range" min={0.3} max={2} step={0.05} value={globals.dancer.scale} className="w-full" onChange={(e) => setDancer({ scale: Number(e.target.value) })} />
+              </label>
+              <label className="space-y-1">Energy {globals.dancer.intensity.toFixed(2)}×
+                <input type="range" min={0} max={2} step={0.05} value={globals.dancer.intensity} className="w-full" onChange={(e) => setDancer({ intensity: Number(e.target.value) })} />
+              </label>
+              <label className="space-y-1">Color
+                <div className="flex items-center gap-2">
+                  <select className="ui-input flex-1" value={globals.dancer.colorMode} onChange={(e) => setDancer({ colorMode: e.target.value as DancerConfig["colorMode"] })}>
+                    <option value="stems">By stem kind</option>
+                    <option value="fixed">Fixed</option>
+                  </select>
+                  {globals.dancer.colorMode === "fixed" && (
+                    <input type="color" value={globals.dancer.color} onChange={(e) => setDancer({ color: e.target.value })} className="w-8 h-6 rounded border border-slate-600" />
+                  )}
+                </div>
+              </label>
+            </div>
+          )}
+        </div>
     </>
   );
 
@@ -3083,24 +3077,21 @@ export function Visualizer({
         </div>
       </Section>
 
-      {/* 2. Visual settings */}
-      <Section icon="◈" title="2. Look">{lookContent}</Section>
-
-      {/* 3. Media layers */}
+      {/* 2. Layers — media rows + waveform (◈) rows, each ◈ row with its own Look */}
       <Section
         icon="▣"
-        title="3. Media layers"
+        title="2. Layers"
         action={
           <span className="text-xs text-slate-500">
-            {globals.video.layers.length}/{VIZ_MAX_VIDEO_LAYERS} — row 1 is the top layer; the 2. Look visuals need a ◈ row
+            {globals.video.layers.length}/{VIZ_MAX_VIDEO_LAYERS} — row 1 is the top layer; waveforms need a ◈ row
           </span>
         }
       >
         {layersContent}
       </Section>
 
-      {/* 4. Preview */}
-      <Section icon="▶" title="4. Live preview" action={<span className="text-xs text-slate-500">same math as the MP4 export — pixel-identical geometry</span>}>
+      {/* 3. Preview */}
+      <Section icon="▶" title="3. Live preview" action={<span className="text-xs text-slate-500">same math as the MP4 export — pixel-identical geometry</span>}>
         {globals.video.layers.map((l, i) => {
           // Visuals rows draw procedurally; hidden rows keep their config but
           // don't draw — skipping the element also saves the video decode.
@@ -3174,38 +3165,17 @@ export function Visualizer({
                 onClick={() => setLayersOpen((o) => !o)}
                 onDoubleClick={(e) => e.stopPropagation()}
                 className="absolute top-3 left-3 z-10 rounded-md border border-slate-600 bg-slate-900/80 px-2.5 py-1.5 text-xs text-slate-200 hover:bg-slate-800"
-                title="Show/hide the Media layers panel"
+                title="Show/hide the Layers panel"
               >
                 {layersOpen ? "✕ Layers" : "▣ Layers"}
               </button>
-              <button
-                type="button"
-                onClick={() => setLookOpen((o) => !o)}
-                onDoubleClick={(e) => e.stopPropagation()}
-                className="absolute top-3 right-3 z-10 rounded-md border border-slate-600 bg-slate-900/80 px-2.5 py-1.5 text-xs text-slate-200 hover:bg-slate-800"
-                title="Show/hide the Look settings"
-              >
-                {lookOpen ? "✕ Look" : "◈ Look"}
-              </button>
-              {lookOpen && (
-                <div
-                  className="absolute top-12 right-3 bottom-3 z-10 w-80 max-w-[85vw] overflow-y-auto rounded-lg border border-slate-700 bg-slate-900/95 p-4 space-y-4 shadow-xl"
-                  onDoubleClick={(e) => e.stopPropagation()}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wide text-slate-300">◈ 2. Look</span>
-                    <button type="button" className="text-slate-500 hover:text-slate-200" onClick={() => setLookOpen(false)}>✕</button>
-                  </div>
-                  {lookContent}
-                </div>
-              )}
               {layersOpen && (
                 <div
                   className="absolute top-12 left-3 bottom-3 z-10 w-[26rem] max-w-[85vw] overflow-y-auto rounded-lg border border-slate-700 bg-slate-900/95 p-4 space-y-4 shadow-xl"
                   onDoubleClick={(e) => e.stopPropagation()}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wide text-slate-300">▣ 3. Media layers</span>
+                    <span className="text-xs font-semibold uppercase tracking-wide text-slate-300">▣ 2. Layers</span>
                     <button type="button" className="text-slate-500 hover:text-slate-200" onClick={() => setLayersOpen(false)}>✕</button>
                   </div>
                   {layersContent}
@@ -3267,8 +3237,8 @@ export function Visualizer({
         )}
       </Section>
 
-      {/* 5. Render */}
-      <Section icon="⇩" title="5. Render">
+      {/* 4. Render */}
+      <Section icon="⇩" title="4. Render">
         <div className="flex flex-wrap items-center gap-3 text-sm">
           <div
             className="flex items-center rounded-md border border-slate-700 p-0.5"

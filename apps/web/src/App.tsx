@@ -6,7 +6,6 @@ import { ShotReview } from "./pages/ShotReview.js";
 import { Help } from "./pages/Help.js";
 import { Folders } from "./pages/Folders.js";
 import { LibraryPage } from "./pages/Library.js";
-import { Projects } from "./pages/Projects.js";
 import { ImportScript } from "./pages/ImportScript.js";
 import { MusicEdit } from "./pages/MusicEdit.js";
 import { Visualizer } from "./pages/Visualizer.js";
@@ -22,7 +21,6 @@ type View =
   | { name: "review"; shotId: string }
   | { name: "folders" }
   | { name: "library" }
-  | { name: "projects" }
   | { name: "import" }
   | { name: "music" }
   | { name: "visualizer" }
@@ -36,13 +34,12 @@ const THEME_STORAGE_KEY = "twio.theme";
 const NAV_ITEMS: Array<{ key: View["name"]; label: string; icon: string; desc: string }> = [
   { key: "dashboard", label: "Dashboard", icon: "▣", desc: "Overview & actions" },
   { key: "library", label: "Library", icon: "⌕", desc: "Browse all assets — videos & images" },
+  { key: "music", label: "Video Cutter", icon: "✂", desc: "Cut footage to a song's beats" },
+  { key: "visualizer", label: "4D timeline", icon: "∿", desc: "Multi-stem waveform video renderer" },
+  { key: "timeline", label: "3D timeline", icon: "▬", desc: "Shot schedule" },
   { key: "import", label: "Import Script", icon: "♪", desc: "Paste script to create shots + timeline" },
-  { key: "timeline", label: "Timeline", icon: "▬", desc: "Shot schedule" },
-  { key: "music", label: "Music Edit", icon: "♫", desc: "Beat-synced music video from a song" },
-  { key: "visualizer", label: "Visualizer", icon: "∿", desc: "Multi-stem waveform video renderer" },
   { key: "world", label: "World Cam", icon: "◎", desc: "Re-render video along a new camera path (remote GPU)" },
   { key: "folders", label: "Folders", icon: "▤", desc: "Browse files" },
-  { key: "projects", label: "Projects", icon: "◇", desc: "Manage projects" },
   { key: "help", label: "Help", icon: "?", desc: "How it works" },
 ];
 
@@ -372,18 +369,17 @@ export default function App() {
         {/* Page content */}
         <main className="flex-1 overflow-y-auto p-6">
           <div className="max-w-7xl mx-auto animate-fade-in">
-            {view.name === "dashboard" && <Dashboard projectId={activeProjectId} onToast={push} onNavigate={navigate} />}
+            {view.name === "dashboard" && <Dashboard projectId={activeProjectId} onToast={push} onNavigate={navigate} onSwitchProject={switchProject} onProjectsChanged={loadProjects} />}
             {view.name === "timeline" && !isAllProjects && <TimelinePage onOpenShot={(id) => navigate({ name: "review", shotId: id })} projectId={activeProjectId} />}
             {view.name === "timeline" && isAllProjects && (
               <div className="text-center py-20 text-slate-500">
                 <div className="text-4xl mb-3 opacity-40">◇</div>
-                <p>Select a specific project to use timelines.</p>
+                <p>Select a specific project to use the 3D timeline.</p>
               </div>
             )}
             {view.name === "review" && <ShotReview shotId={view.shotId} onBack={() => navigate({ name: "timeline" })} />}
             {view.name === "folders" && <Folders projectId={activeProjectId} projects={projects} />}
             {view.name === "library" && <LibraryPage projectId={activeProjectId} />}
-            {view.name === "projects" && <Projects onChanged={loadProjects} onSwitch={switchProject} onImport={(pid) => { switchProject(pid); navigate({ name: "import" }); }} activeProjectId={activeProjectId} />}
             {view.name === "import" && !isAllProjects && (
               <ImportScript
                 projectId={activeProjectId}
@@ -406,14 +402,14 @@ export default function App() {
             {view.name === "music" && isAllProjects && (
               <div className="text-center py-20 text-slate-500">
                 <div className="text-4xl mb-3 opacity-40">◇</div>
-                <p>Select a specific project to edit a music video.</p>
+                <p>Select a specific project to use Video Cutter.</p>
               </div>
             )}
             {view.name === "visualizer" && !isAllProjects && <Visualizer projectId={activeProjectId} onToast={push} />}
             {view.name === "visualizer" && isAllProjects && (
               <div className="text-center py-20 text-slate-500">
                 <div className="text-4xl mb-3 opacity-40">◇</div>
-                <p>Select a specific project to use the visualizer.</p>
+                <p>Select a specific project to use the 4D timeline.</p>
               </div>
             )}
             {view.name === "world" && !isAllProjects && <WorldCam projectId={activeProjectId} onToast={push} />}

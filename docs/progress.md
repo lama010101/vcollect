@@ -129,6 +129,41 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
 
+### 2026-10-10 — API hardening: CORS lockdown, path traversal guards, 404s, candidate validation
+
+- **CORS** (`src/index.ts`): `origin: true` reflected ANY origin — now
+  loopback-only by default (localhost / 127.0.0.1 / [::1], any port).
+  `TWIO_CORS_ORIGIN` env overrides: comma-separated exact origins, or `*`
+  to restore allow-all (documented in `.env.example`).
+- **Path traversal**: `GET /api/manifests/:file` and
+  `GET /api/assets/:id/thumb` now `basename()` the route param before
+  `resolve()`; the thumb route also drops a pointless dynamic
+  `import("./config.js")` for the already-importable `THUMBNAILS_DIR`.
+- **Proper 404s**: `GET /api/assets/:id`, `DELETE /api/shots/:id`, and
+  `DELETE /api/timelines/:id` returned 200 even when the row didn't exist —
+  all three now return `reply.code(404)` (timeline delete scopes via the
+  existing `?project=` → `getTimeline(id, projectId)`).
+- **`POST /api/providers/acquire` validates the candidate**: new
+  `assetCandidateSchema` in `@twio/shared` (`schemas.ts`, mirrors
+  `AssetCandidate`; `provider` uses `providerNameSchema` so the parsed type
+  stays assignable to the interface) replaces the `as AssetCandidate` cast —
+  malformed bodies get a 400 with the flattened zod error.
+- **Flaky engine test fixed** (`test/engine.node.test.ts`): the 120 BPM
+  click WAV used a random amplitude for a "unique" sha256, but 16-bit
+  quantization left only ~3.3k distinct files → ~75% cache-hit flake against
+  the persistent `output/cache/engine/` dir. Now the clicks are constant and
+  ~1000 random low-amp samples fill a tail region; the test also deletes the
+  file's derived cache dir (`ENGINE_CACHE_DIR`/`FEATURES_VERSION` exported
+  from `visualizer/features.ts`) before the first `stemFeatures` call, so
+  `cached === false` is deterministic.
+- **Dead parameter**: `assetAbsolutePath(localPath, _slug)` →
+  `assetAbsolutePath(localPath)`; all 8 call sites updated.
+- **Deps**: dropped unused `zod` from `apps/server` deps (only `@twio/shared`
+  imports it); lockfile updated.
+- Verified: `npm run typecheck` ✅ (shared+server+web); `npm run test:server`
+  ✅ 147/0 fail (`analyze_stem` passes deterministically);
+  `npm run test:shared` ✅ 15/0 fail.
+
 ### 2026-10-10 — Visualizer: upload a full song → engine stem separation
 
 - **"Split song → stems"** in 1. Stems — upload any audio file; a

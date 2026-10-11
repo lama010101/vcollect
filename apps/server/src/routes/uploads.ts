@@ -4,9 +4,11 @@
 //
 // POST /api/assets/upload?project=<id>&name=<filename> with the raw file as
 // the request body (Content-Type: application/octet-stream, video/* or
-// image/*). The file is validated (extension + real content — ffprobe for
-// videos, sharp metadata for images), hashed and stored inside the target
-// project's dedicated assets folder:
+// image/*). The request body is STREAMED to a temp file (hashed in-flight,
+// byte-capped) — multi-hundred-MB uploads never sit in memory. The file is
+// then validated (extension + real content — ffprobe for videos, sharp
+// metadata for images) and moved into the target project's dedicated assets
+// folder:
 //   OUTPUT_ROOT/<slug>/assets/uploads/<filename>
 // A 'local'-provider asset row is created so the upload shows up in Folders
 // (Uploads section); video uploads also appear in the Music Edit source
@@ -14,9 +16,12 @@
 // =============================================================================
 
 import type { FastifyInstance } from "fastify";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { copyFileSync, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import sharp from "sharp";
 import { config, IMAGE_FILE_EXTENSIONS, OUTPUT_ROOT, projectAssetDir, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { getProject } from "../db/projectRepository.js";
@@ -75,32 +80,70 @@ export interface UploadResult {
   alreadyUploaded: boolean;
 }
 
+/** An upload already spooled to a temp file by the streaming content-type
+ *  parser — the sha256 was computed in-flight so saving needs no re-hash. */
+export interface StagedUpload {
+  /** Absolute path to the spooled request body (OS temp dir). */
+  tmpPath: string;
+  /** Bytes written to the temp file. */
+  sizeBytes: number;
+  /** SHA-256 hex digest computed while streaming. */
+  sha256: string;
+}
+
+/** Type guard for the object the streaming content-type parser produces. */
+function isStagedUpload(body: unknown): body is StagedUpload {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    typeof (body as StagedUpload).tmpPath === "string"
+  );
+}
+
 /**
- * Persist an uploaded video or image buffer into a project's dedicated assets
- * folder. Throws an Error with a `.statusCode` (400/415/422) on validation
- * failure — the route maps it to an HTTP status.
+ * Persist an uploaded video or image into a project's dedicated assets
+ * folder. `data` is either a Buffer (tests / in-memory callers — hashed and
+ * written here) or a StagedUpload (the HTTP route — the request body was
+ * already spooled to a temp file and hashed while streaming, so it's just
+ * moved into place). Throws an Error with a `.statusCode` (400/415/422) on
+ * validation failure — the route maps it to an HTTP status.
  */
 export async function saveUploadedFile(
   projectId: string,
   rawName: string,
-  data: Buffer,
+  data: Buffer | StagedUpload,
 ): Promise<UploadResult> {
   const err = (statusCode: number, message: string): Error =>
     Object.assign(new Error(message), { statusCode });
 
+  const staged: StagedUpload | null = Buffer.isBuffer(data) ? null : data;
+  // Remove the spooled temp file on every early exit that leaves it behind.
+  const cleanupTmp = (): void => {
+    if (staged) { try { rmSync(staged.tmpPath, { force: true }); } catch { /* ignore */ } }
+  };
+
   const project = getProject(projectId);
-  if (!project || project.isVirtual) throw err(404, `project not found: ${projectId}`);
+  if (!project || project.isVirtual) {
+    cleanupTmp();
+    throw err(404, `project not found: ${projectId}`);
+  }
 
   const filename = sanitizeFilename(rawName) || "upload.mp4";
   const ext = extname(filename).toLowerCase();
   const kind = mediaKindForExt(ext);
   if (!kind) {
+    cleanupTmp();
     throw err(415, `unsupported file type "${ext || "(none)"}" — allowed: ${[...VIDEO_EXTENSIONS, ...IMAGE_EXTENSIONS].join(", ")}`);
   }
-  if (data.length === 0) throw err(400, "empty upload");
+  const sizeBytes = Buffer.isBuffer(data) ? data.length : data.sizeBytes;
+  if (sizeBytes === 0) {
+    cleanupTmp();
+    throw err(400, "empty upload");
+  }
 
-  // Content-addressed asset id: re-uploading the same file is a no-op.
-  const sha256 = createHash("sha256").update(data).digest("hex");
+  // Content-addressed asset id: re-uploading the same file is a no-op. The
+  // staged path reuses the digest computed while streaming — no re-hash.
+  const sha256 = Buffer.isBuffer(data) ? createHash("sha256").update(data).digest("hex") : data.sha256;
   const assetId = `LOCAL_${project.id}_${sha256.slice(0, 16)}`;
   const uploadsDir = projectAssetDir(project.slug, "uploads");
 
@@ -108,7 +151,8 @@ export async function saveUploadedFile(
   if (existing?.local_path) {
     const abs = resolve(OUTPUT_ROOT, existing.local_path);
     if (existsSync(abs)) {
-      return { assetId, filename: basename(existing.local_path), localPath: existing.local_path, sizeBytes: data.length, alreadyUploaded: true };
+      cleanupTmp(); // already stored — the spooled temp file is redundant
+      return { assetId, filename: basename(existing.local_path), localPath: existing.local_path, sizeBytes, alreadyUploaded: true };
     }
   }
 
@@ -120,13 +164,34 @@ export async function saveUploadedFile(
   if (existing?.local_path) {
     localPath = existing.local_path;
     destAbs = resolve(OUTPUT_ROOT, localPath);
-    mkdirSync(dirname(destAbs), { recursive: true });
   } else {
     destAbs = join(uploadsDir, filename);
     if (existsSync(destAbs)) destAbs = uniqueDest(uploadsDir, filename);
     localPath = `${project.slug}/assets/uploads/${basename(destAbs)}`;
   }
-  writeFileSync(destAbs, data);
+  mkdirSync(dirname(destAbs), { recursive: true });
+  if (Buffer.isBuffer(data)) {
+    writeFileSync(destAbs, data);
+  } else {
+    // Move the spooled temp file into place. os.tmpdir() can live on a
+    // different drive than OUTPUT_ROOT (C: vs D: on this box) — renameSync
+    // may fail with EXDEV, so fall back to copy + unlink.
+    try {
+      renameSync(data.tmpPath, destAbs);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EXDEV") {
+        cleanupTmp();
+        throw e;
+      }
+      try {
+        copyFileSync(data.tmpPath, destAbs);
+      } catch (copyErr) {
+        cleanupTmp();
+        throw copyErr;
+      }
+      rmSync(data.tmpPath, { force: true });
+    }
+  }
 
   let width: number | null = null;
   let height: number | null = null;
@@ -183,7 +248,7 @@ export async function saveUploadedFile(
   // Thumbnail is best-effort — never fail the upload over it.
   await (kind === "image" ? generateImageThumbnail(destAbs, assetId) : generateThumbnail(destAbs, assetId)).catch(() => null);
 
-  return { assetId, filename: basename(destAbs), localPath, sizeBytes: data.length, alreadyUploaded: false };
+  return { assetId, filename: basename(destAbs), localPath, sizeBytes, alreadyUploaded: false };
 }
 
 export async function registerUploadRoutes(app: FastifyInstance): Promise<void> {
@@ -213,27 +278,61 @@ export async function registerUploadRoutes(app: FastifyInstance): Promise<void> 
   });
 
   await app.register(async (scope) => {
-    // Raw file body. Cap at the same limit used for provider downloads.
-    // The webapp always sends application/octet-stream; video/* + image/* are
-    // matched by RegExp (Fastify doesn't treat "video/*" strings as
-    // wildcards) so direct API callers can send a proper media type.
+    // Raw file body, streamed to a temp file. No `parseAs` — Fastify hands the
+    // parser the raw request stream, so multi-hundred-MB uploads never sit in
+    // memory. The size cap (same limit as provider downloads) is enforced by
+    // the byte-counting transform below — Fastify's `bodyLimit` option only
+    // applies to string/buffer parsers. The webapp always sends
+    // application/octet-stream; video/* + image/* are matched by RegExp
+    // (Fastify doesn't treat "video/*" strings as wildcards) so direct API
+    // callers can send a proper media type.
+    const uploadByteLimit = config.maxDownloadMb * 1024 * 1024;
     scope.addContentTypeParser(
       /^application\/octet-stream$|^video\/|^image\//,
-      { parseAs: "buffer", bodyLimit: config.maxDownloadMb * 1024 * 1024 },
-      (_req, body, done) => done(null, body),
+      (_req, body, done) => {
+        const tmpPath = join(tmpdir(), `twio-upload-${randomUUID()}`);
+        const hash = createHash("sha256");
+        let sizeBytes = 0;
+        const meter = new Transform({
+          transform(chunk: Buffer, _enc, cb) {
+            sizeBytes += chunk.length;
+            if (sizeBytes > uploadByteLimit) {
+              cb(Object.assign(
+                new Error(`upload exceeds the ${config.maxDownloadMb} MB limit`),
+                // Fastify maps err.statusCode → HTTP status; `code` matches
+                // what the old buffered parser's bodyLimit produced.
+                { statusCode: 413, code: "FST_ERR_CTP_BODY_TOO_LARGE" },
+              ));
+              return;
+            }
+            hash.update(chunk);
+            cb(null, chunk);
+          },
+        });
+        pipeline(body, meter, createWriteStream(tmpPath))
+          .then(() => done(null, { tmpPath, sizeBytes, sha256: hash.digest("hex") }))
+          .catch((e: Error) => {
+            // pipeline() already destroyed every stream in the chain — just
+            // drop the partial temp file.
+            try { rmSync(tmpPath, { force: true }); } catch { /* ignore */ }
+            done(e);
+          });
+      },
     );
 
     scope.post("/api/assets/upload", async (req, reply) => {
       const q = req.query as Record<string, unknown>;
       const projectId = String(q.project ?? DEFAULT_PROJECT_ID).trim();
+      const name = String(q.name ?? "upload.mp4");
+      const staged = isStagedUpload(req.body) ? req.body : null;
       if (projectId === PROJECT_ID_ALL) {
+        if (staged) { try { rmSync(staged.tmpPath, { force: true }); } catch { /* ignore */ } }
         return reply.code(400).send({ error: "select a specific project before uploading" });
       }
-      const name = String(q.name ?? "upload.mp4");
-      if (!Buffer.isBuffer(req.body)) {
+      if (!staged) {
         return reply.code(400).send({ error: "send the file as the raw request body" });
       }
-      const result = await saveUploadedFile(projectId, name, req.body);
+      const result = await saveUploadedFile(projectId, name, staged);
       return reply.code(result.alreadyUploaded ? 200 : 201).send({
         ...result,
         asset: getAsset(result.assetId) ?? null,

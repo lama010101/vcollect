@@ -360,14 +360,6 @@ export interface AssetDownloadProgress {
   totalBytes: number;
   pct: number;
 }
-export interface AcquireAssetProgress {
-  running: boolean;
-  assetId: string | null;
-  currentAsset: AssetDownloadProgress | null;
-  lastResult: { assetId: string; status: string; error?: string; reason?: string } | null;
-  error: string | null;
-  requestedAssetId?: string;
-}
 export interface AcquireBatchResult {
   assetId: string;
   status: "downloaded" | "already_downloaded" | "rejected" | "failed";
@@ -395,16 +387,6 @@ export interface AcquireProgress {
   error: string | null;
   shotErrors: string[];
 }
-export interface ShotAcquireProgress {
-  running: boolean;
-  paused?: boolean;
-  shotId: string | null;
-  currentAsset: AssetDownloadProgress | null;
-  lastResult: { shotId: string; status: string; downloaded: number; candidatesFound: number; error?: string | null; downloadErrors?: string[] } | null;
-  error: string | null;
-  requestedShotId?: string;
-}
-
 // --- Concurrent download tasks ---
 export type TaskKind = "asset" | "shot" | "batch";
 export type TaskStatus = "queued" | "running" | "paused" | "done" | "failed" | "cancelled";
@@ -486,6 +468,8 @@ export interface ProjectCounts {
   shotCount: number;
   assetCount: number;
   downloadedCount: number;
+  videoCount: number;
+  imageCount: number;
 }
 export interface Project {
   id: string;
@@ -496,6 +480,8 @@ export interface Project {
   updatedAt: string;
   isVirtual?: boolean;
   counts?: ProjectCounts;
+  /** Representative downloaded asset for the tiles cover (image preferred). */
+  coverAssetId?: string | null;
   // Per-project acquisition settings.
   acquireCount?: number | null;
   enforceAcquireCount?: boolean;
@@ -822,11 +808,6 @@ export const api = {
   providers: () => getJson<{ providers: Provider[] }>("/api/providers"),
   acquireAll: (projectId?: string) => postJson<{ started?: boolean; alreadyRunning?: boolean; total?: number }>(withProject("/api/acquire", projectId)),
   acquireProgress: () => getJson<AcquireProgress>("/api/acquire/progress"),
-  acquireShot: (id: string) => postJson<{ started?: boolean; alreadyRunning?: boolean }>(`/api/acquire/${id}`),
-  acquireShotProgress: (id: string) => getJson<ShotAcquireProgress>(`/api/acquire/${id}/progress`),
-  cancelShotAcquire: (id: string) => postJson<{ ok: boolean }>(`/api/acquire/${id}/cancel`),
-  pauseShotAcquire: (id: string) => postJson<{ ok: boolean }>(`/api/acquire/${id}/pause`),
-  resumeShotAcquire: (id: string) => postJson<{ ok: boolean }>(`/api/acquire/${id}/resume`),
   acquireReserve: (projectId?: string) => postJson<unknown>(withProject("/api/acquire/reserve", projectId)),
   generateManifests: (projectId?: string) => postJson<unknown>(withProject("/api/manifests/generate", projectId)),
   review: (shotId: string, assetId: string, body: unknown) =>
@@ -852,16 +833,6 @@ export const api = {
     postJson<{ ok: boolean; id: string; ready: boolean }>(`/api/assets/${id}/ready`, { ready }),
   setAssetRating: (id: string, rating: number | null) =>
     postJson<{ ok: boolean; id: string; rating: number | null }>(`/api/assets/${id}/rating`, { rating }),
-  // --- Acquire a single discovered asset by id (search-page acquisition) ---
-  acquireAsset: (id: string) =>
-    postJson<{ started?: boolean; alreadyRunning?: boolean }>(`/api/assets/${id}/acquire`),
-  acquireAssetProgress: (id: string) =>
-    getJson<AcquireAssetProgress>(`/api/assets/${id}/acquire/progress`),
-  // --- Acquire multiple discovered assets (Acquire All on the Library page) ---
-  acquireAssetsBatch: (assetIds: string[]) =>
-    postJson<{ started?: boolean; alreadyRunning?: boolean }>(`/api/assets/acquire-batch`, { assetIds }),
-  acquireAssetsBatchProgress: () =>
-    getJson<AcquireBatchProgress>(`/api/assets/acquire-batch/progress`),
   // --- Live provider search (discover new assets) ---
   searchProviders: (query: string, projectId: string, opts?: { orientation?: string; minWidth?: number; minHeight?: number; provider?: string }) =>
     postJson<{ query: string; count: number; candidates: AssetCandidate[] }>(
@@ -906,6 +877,12 @@ export const api = {
   musicRenderJob: (id: string) => getJson<{ job: MusicRenderJob }>(`/api/music-edit/render/${encodeURIComponent(id)}`),
   cancelMusicRender: (id: string) => postJson<{ job: MusicRenderJob }>(`/api/music-edit/render/${encodeURIComponent(id)}/cancel`),
   musicRenders: (projectId: string) => getJson<{ renders: MusicRenderedFile[] }>(withProject("/api/music-edit/renders", projectId)),
+  // Open the renders folder (a rendered file selected when `name` is given)
+  // in the OS file explorer.
+  musicRevealRender: (projectId: string, name?: string) =>
+    postJson<{ ok: boolean; error?: string }>(
+      withProject(`/api/music-edit/reveal${name ? `?name=${encodeURIComponent(name)}` : ""}`, projectId),
+    ),
   // --- Visualizer ---
   vizStems: (projectId: string) => getJson<{ stems: VizStem[] }>(withProject("/api/visualizer/stems", projectId)),
   vizUploadStem: (projectId: string, file: File) =>

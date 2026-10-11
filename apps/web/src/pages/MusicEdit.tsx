@@ -398,6 +398,15 @@ export function MusicEdit({
     }
   };
 
+  /** Open the renders folder (or a file inside it) in the OS file explorer. */
+  const revealRender = (name?: string) =>
+    api
+      .musicRevealRender(projectId, name)
+      .then((r) => {
+        if (!r.ok) setError(r.error ?? "Could not open the folder");
+      })
+      .catch((e) => setError((e as Error).message));
+
   const move = (idx: number, delta: number) =>
     setOrder((o) => {
       const j = idx + delta;
@@ -514,7 +523,7 @@ export function MusicEdit({
             <div className="max-h-80 overflow-y-auto space-y-1 pr-1">
               {libraryLoading && <Spinner />}
               {!libraryLoading && library.length === 0 && (
-                <EmptyState icon="▤" title="No downloaded videos" description="Download footage from the Timeline or Library pages first." />
+                <EmptyState icon="▤" title="No downloaded videos" description="Download footage from the 3D timeline or Library pages first." />
               )}
               {library.map((a) => (
                 <div key={a.id} className="flex items-center gap-2 text-sm rounded px-2 py-1 hover:bg-slate-700/30">
@@ -647,8 +656,13 @@ export function MusicEdit({
           <Button variant="primary" onClick={buildPlan} disabled={!canPlan}>
             {planning ? "Building edit list…" : "Build edit list"}
           </Button>
-          <Button onClick={render} disabled={!plan || rendering}>
-            {rendering ? "Rendering…" : "Render MP4"}
+          <Button
+            variant={plan && !rendering ? "success" : "secondary"}
+            className={plan && !rendering ? "px-6 py-2.5 text-base font-semibold shadow-lg shadow-emerald-950/50" : ""}
+            onClick={render}
+            disabled={!plan || rendering}
+          >
+            {rendering ? "Rendering…" : "▶ Render MP4"}
           </Button>
           {plan && (
             <Button variant="ghost" onClick={() => downloadJson(`${song.replace(/\.[^.]+$/, "")}-edl.json`, plan)}>
@@ -714,7 +728,16 @@ export function MusicEdit({
       {/* 5. Render */}
       {(job || renders.length > 0) && (
         <Card className="p-5 space-y-4">
-          <SectionTitle icon="▶">5. Render</SectionTitle>
+          <SectionTitle
+            icon="▶"
+            action={
+              <Button size="sm" variant="ghost" onClick={() => revealRender()} title="Open the renders folder in the file explorer (created on demand if empty)">
+                📁 Open folder
+              </Button>
+            }
+          >
+            5. Render
+          </SectionTitle>
           {job && (
             <div className="space-y-2">
               <div className="flex items-center gap-3 text-sm">
@@ -748,6 +771,13 @@ export function MusicEdit({
                       EDL
                     </a>
                   )}
+                  <button
+                    className="text-slate-500 hover:text-sky-400 text-xs shrink-0"
+                    title={`Show in folder — ${r.name}`}
+                    onClick={() => revealRender(r.name)}
+                  >
+                    📁
+                  </button>
                 </li>
               ))}
             </ul>
