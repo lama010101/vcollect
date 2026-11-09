@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ASSETS_CHANGED_EVENT, isImageFileName, type FoldersResponse, type FolderNode, type FolderAsset, type Project } from "../api.js";
+import { api, ASSETS_CHANGED_EVENT, isAudioFileName, isImageFileName, type FoldersResponse, type FolderNode, type FolderAsset, type Project } from "../api.js";
 import { RatingSlider } from "../components/RatingSlider.js";
 import { PROJECT_ID_ALL } from "@twio/shared";
 
@@ -381,6 +381,7 @@ function AssetTile({
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const isImage = isImageFileName(asset.filename);
+  const isAudio = isAudioFileName(asset.filename);
 
   function handleClick() {
     // Images have no inline player — clicking opens the full file in a tab.
@@ -409,6 +410,8 @@ function AssetTile({
             className="max-h-full max-w-full object-contain"
             loading="lazy"
           />
+        ) : playing && isAudio ? (
+          <audio controls autoPlay src={api.assetFileUrl(asset.assetId)} className="w-11/12" />
         ) : playing ? (
           <video
             ref={videoRef}
@@ -428,7 +431,7 @@ function AssetTile({
               loading="lazy"
             />
             <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/30 transition-colors">
-              <span className="text-3xl text-white/0 group-hover:text-white/90 transition-colors">▶</span>
+              <span className="text-3xl text-white/0 group-hover:text-white/90 transition-colors">{isAudio ? "♫" : "▶"}</span>
             </div>
           </>
         )}
@@ -527,6 +530,7 @@ function AssetListRow({
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const isImage = isImageFileName(asset.filename);
+  const isAudio = isAudioFileName(asset.filename);
 
   useEffect(() => {
     if (playing && videoRef.current) {
@@ -546,7 +550,9 @@ function AssetListRow({
           }}
           title={isImage ? "Click to open" : playing ? "" : "Click to play"}
         >
-          {playing && !isImage ? (
+          {playing && isAudio ? (
+            <audio controls autoPlay src={api.assetFileUrl(asset.assetId)} className="w-11/12" />
+          ) : playing && !isImage ? (
             <video
               ref={videoRef}
               src={api.assetFileUrl(asset.assetId)}

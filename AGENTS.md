@@ -34,20 +34,41 @@
 
 - **Per-project asset folders:** each project keeps its media in ONE folder —
   `OUTPUT_ROOT/<slug>/assets/uploads/` — for provider downloads AND drag &
-  drop files (videos AND images — `VIDEO_FILE_EXTENSIONS` +
-  `IMAGE_FILE_EXTENSIONS` in config.ts). Older files may still sit in legacy
+  drop files (videos, images AND audio — `VIDEO_FILE_EXTENSIONS` +
+  `IMAGE_FILE_EXTENSIONS` + `AUDIO_FILE_EXTENSIONS` in config.ts; the audio
+  set is the same one the Music Edit/Visualizer pools accept —
+  `musicEdit/service.ts` `AUDIO_EXTENSIONS` derives from it). Older files may still sit in legacy
   `assets/<query>/` / `assets/unknown/` subdirs or user-made subfolders;
   sync tracks them wherever they are. `local_path` stays relative to
   `OUTPUT_ROOT` (so `<slug>/assets/...`). Build dirs via
   `projectAssetDir(slug, subdir)`, never `OUTPUT_ROOT/<query>` directly
   (that global layout is legacy; `migrateAssetsToProjectFolders` moves old
-  files). Uploads: `POST /api/assets/upload?project=<id>&name=` (raw body) →
-  `routes/uploads.ts` `saveUploadedFile` → `provider_id='local'` asset row —
-  the `project` param is the ACTIVE project id so drops always land in that
-  project's uploads/; videos validate via ffprobe `isPlayableVideo`, images
-  via `sharp().metadata()` — never trust the extension. The frontend drop
-  zone is global in `App.tsx` and fires `ASSETS_CHANGED_EVENT` so
-  Folders/Music Edit refresh. **Folder = source of truth:**
+  files). Uploads: `POST /api/assets/upload?project=<id>&name=<file>[&folder=<sub>]`
+  (raw body) → `routes/uploads.ts` `saveUploadedFile` → `provider_id='local'`
+  asset row — the `project` param is the ACTIVE project id. Drops land in
+  `<slug>/assets/<folder>/` — `folder` is sanitized by
+  `assetSync.ts#sanitizeAssetFolder` ("" rejected here) and defaults to
+  `DEFAULT_UPLOAD_FOLDER` = **`uploads/unknown`** (unfiled drops); videos
+  validate via ffprobe `isPlayableVideo`, images via `sharp().metadata()`,
+  audio via ffprobe `probeAudio` (real audio stream + duration) — never trust
+  the extension. Audio assets get a waveform thumbnail
+  (`thumbnails.ts#generateAudioThumbnail`, ffmpeg `showwavespic`) and play in
+  Library/Folders via `<audio>`; `mediaMimeForFile` maps audio extensions to
+  `audio/*` so `/api/assets/:id/file` streams correctly. Library audio is
+  usable in the audio pools without re-upload: `POST
+  /api/music-edit/songs/import` `{assetId}` → `importSongFromAsset` copies
+  into `<slug>/music_edit/songs/`; `POST /api/visualizer/stems/import`
+  `{assetId}` → `importStemFromAsset` copies into `<slug>/visualizer/stems/`
+  (both probeAudio-validate the copy; the pool keeps its own file). The
+  frontend drop zone is global in `App.tsx`
+  and fires `ASSETS_CHANGED_EVENT` so Folders/Music Edit refresh. While the
+  Library page is open it publishes its selected sidebar folder via the
+  `libraryDropTarget` singleton (api.ts) so the global drop zone uploads into
+  it; folder sidebar rows are themselves drop targets (OS files → upload
+  into that folder, `ASSET_DRAG_TYPE` card drags →
+  `POST /api/assets/:id/move` `{folder}` → `assetSync.ts#moveAssetToFolder`
+  renames the file inside `<slug>/assets/` — "" = assets root — and repoints
+  `local_path`, suffixing `_N` on collision). **Folder = source of truth:**
   `db/assetSync.ts#syncProjectAssets` + `POST
   /api/assets/sync?project=<id>` walks `<slug>/assets/` recursively: files
   with no DB row are registered, files that MOVED are repointed to the new
@@ -59,6 +80,18 @@
   out of video-only surfaces via `isImageFileName(local_path)` (Music Edit
   source library filters them; Folders/Library render `<img>` instead of a
   player). `/api/assets/:id/file` sets Content-Type via `mediaMimeForFile`.
+  **Library folder nav:** users create nested subfolders inside
+  `<slug>/assets/` (e.g. `uploads/nature/birds/`) — the Library shows the real
+  disk tree in a sidebar. `db/assetSync.ts#listAssetFolders` +
+  `GET /api/assets/folder-tree?project=<id>` walk every directory (empty ones
+  included; the tree mirrors disk, not the DB) and return a DFS-flattened
+  list `{path, name, depth, fileCount, subtreeCount}`. The structured search
+  accepts `folder=<path-relative-to-assets>` as a SUBTREE match —
+  `local_path LIKE '%/assets/<folder>/%' ESCAPE '\'` (slug-agnostic via the
+  `/assets/` boundary; LIKE metachars escaped). `__ALL__` has no single tree
+  → the endpoint 400s and the sidebar hides. The Library defaults to
+  `downloadedOnly` (undownloaded candidates hidden — flip "Download state" in
+  + Filters to see them) and sorts `newest_downloaded` by default.
 
 - **Imports:** Source files use `.js` extensions in relative imports (Node ESM
   convention). Tests use `.ts` extensions (tsx resolves those). The
@@ -173,7 +206,7 @@
   **Several visuals rows may coexist** — each draws its own mode geometry at
   its stack position: `row.visuals` is a complete `VizWaveParams`
   (`vizWaveParamsSchema`: mode + waveformLengthSec + globalAmplitude +
-  glowIntensity/autoGlow + autoCenter + innerRadius + layout +
+  glowIntensity/autoGlow + autoCenter + innerRadius + arcDegrees + layout +
   centerConvergence — i.e. the whole per-row Look control set minus
   background/video/dancer); absent `visuals`, the row inherits the global
   look (what old configs and the default row do). In the UI every ◈ row

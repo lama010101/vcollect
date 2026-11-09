@@ -171,6 +171,9 @@ export function ProjectsPanel({
                     <span className="flex shrink-0 flex-col items-end gap-0.5 text-[10px] leading-none text-slate-200">
                       <span title={`${p.counts?.imageCount ?? 0} images`}>▤ {p.counts?.imageCount ?? 0}</span>
                       <span title={`${p.counts?.videoCount ?? 0} videos`}>▶ {p.counts?.videoCount ?? 0}</span>
+                      {(p.counts?.audioCount ?? 0) > 0 && (
+                        <span title={`${p.counts?.audioCount ?? 0} audio`}>♫ {p.counts?.audioCount ?? 0}</span>
+                      )}
                     </span>
                   </span>
                 </button>

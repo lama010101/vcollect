@@ -129,6 +129,43 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
 
+### 2026-11-09 — Audio drag & drop: mp3/wav land in the project folder
+
+- **Audio is a third asset kind.** `AUDIO_FILE_EXTENSIONS` in `config.ts`
+  (`.mp3 .wav .m4a .aac .flac .ogg .oga .opus` — same set the song/stem pools
+  accept; `musicEdit/service.ts` `AUDIO_EXTENSIONS` now derives from it).
+  `mediaKindForExt` classifies `"audio"`; `saveUploadedFile` validates via
+  ffprobe `probeAudio` (real audio stream + duration), stores
+  `duration_seconds`, and generates a waveform thumbnail
+  (`generateAudioThumbnail` — ffmpeg `showwavespic`). Folder sync
+  (`walkMedia`/`walkFolderTree`/`syncProjectAssets`) registers manually-copied
+  audio the same way; `mediaMimeForFile` maps `audio/*` so
+  `/api/assets/:id/file` streams correctly; `mediaType=audio` added to the
+  structured asset search; `projectCounts` gained `audioCount`.
+- **Library/Folders playback:** cards render `<audio controls>` for audio
+  assets (♫ badge/hover glyph); Library "Type" filter gained an "audio"
+  option; ProjectsPanel shows the audio count. The Visualizer media-layer
+  picker now excludes audio (it feeds the stems import list instead).
+- **Audio pools bridge:** `POST /api/music-edit/songs/import` `{assetId}` →
+  `importSongFromAsset` and `POST /api/visualizer/stems/import` `{assetId}` →
+  `importStemFromAsset` copy a downloaded audio asset into the songs/stems
+  pool (probeAudio-validated, `_N` suffix on name collision, signal-cache
+  warmup for stems). Music Edit's song select gained a "Library audio — pick
+  to import" optgroup; the Visualizer stems section gained an "Import from
+  library" list. The global drop zone + Library folder drops accept audio
+  (`isMediaFile`), landing in `<slug>/assets/<folder>/` like any media file.
+- **Files touched:** config.ts, routes/uploads.ts (+`^audio/` content-type
+  parser), routes/musicEdit.ts, routes/visualizer.ts, musicEdit/service.ts,
+  visualizer/service.ts, video/thumbnails.ts, db/assetSync.ts,
+  db/repository.ts, db/projectRepository.ts, web api.ts, App.tsx, Library.tsx,
+  Folders.tsx, MusicEdit.tsx, Visualizer.tsx, ProjectsPanel.tsx,
+  test/uploads.node.test.ts.
+- **Verified:** typecheck ✅ all workspaces; server tests 110/110 ✅
+  (uploads + library-folders + music-edit + visualizer); E2E smoke on temp
+  OUTPUT_DIR ✅ — WAV upload → asset row + file in `assets/uploads/unknown/`
+  + probed duration, `mediaType=audio` search hit, song + stem imports
+  landed in their pools, bad asset id rejected.
+
 ### 2026-10-10 — API hardening: CORS lockdown, path traversal guards, 404s, candidate validation
 
 - **CORS** (`src/index.ts`): `origin: true` reflected ANY origin — now

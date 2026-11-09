@@ -69,6 +69,13 @@ export const IMAGE_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
   ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".tif", ".tiff", ".svg",
 ]);
 
+/** Audio file extensions accepted for uploads and folder sync — the same set
+ *  the Music Edit song pool and Visualizer stem pool accept (single source of
+ *  truth; musicEdit/service.ts re-exports it as AUDIO_EXTENSIONS). */
+export const AUDIO_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus",
+]);
+
 /** Content-Type for a stored asset file, derived from its extension. Falls
  *  back to octet-stream so unknown types still download instead of 500ing. */
 export function mediaMimeForFile(filename: string): string {
@@ -87,6 +94,12 @@ export function mediaMimeForFile(filename: string): string {
     case ".avif": return "image/avif";
     case ".tif": case ".tiff": return "image/tiff";
     case ".svg": return "image/svg+xml";
+    case ".mp3": return "audio/mpeg";
+    case ".wav": return "audio/wav";
+    case ".m4a": return "audio/mp4";
+    case ".aac": return "audio/aac";
+    case ".flac": return "audio/flac";
+    case ".ogg": case ".oga": case ".opus": return "audio/ogg";
     default: return "application/octet-stream";
   }
 }

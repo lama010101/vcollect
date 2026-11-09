@@ -30,6 +30,7 @@ import {
   type AssetSortKey,
 } from "../db/repository.js";
 import { PROJECT_ID_ALL } from "@twio/shared";
+import { moveAssetToFolder } from "../db/assetSync.js";
 import { assetAbsolutePath, getFolders, getProjectRow, revealInExplorer } from "./folders.js";
 import { clampInt, projectOfQuery } from "./helpers.js";
 
@@ -41,7 +42,7 @@ export async function registerAssetRoutes(app: FastifyInstance): Promise<void> {
   //      maxDuration/minWidth/minHeight/maxWidth/maxHeight/orientation/
   //      downloadedOnly/discoveredOnly/commercialStatus/rightsReviewStatus/
   //      sourceLicense/minRating/maxRating/minScore/maxScore/discoveredAfter/
-  //      discoveredBefore/downloadedAfter/downloadedBefore/sort/limit/project
+  //      discoveredBefore/downloadedAfter/downloadedBefore/folder/mediaType/sort/limit/project
   //
   // When any structured filter (other than q/limit/project) is present, the
   // structured path is used; otherwise the legacy free-text path runs.
@@ -60,7 +61,7 @@ export async function registerAssetRoutes(app: FastifyInstance): Promise<void> {
       "commercialStatus", "rightsReviewStatus", "sourceLicense",
       "minRating", "maxRating", "minScore", "maxScore",
       "discoveredAfter", "discoveredBefore", "downloadedAfter", "downloadedBefore",
-      "sort",
+      "folder", "mediaType", "sort",
     ];
     const hasStructured = structuredKeys.some((k) => query[k] != null && query[k] !== "");
 
@@ -111,6 +112,8 @@ export async function registerAssetRoutes(app: FastifyInstance): Promise<void> {
       discoveredBefore: str(query.discoveredBefore),
       downloadedAfter: str(query.downloadedAfter),
       downloadedBefore: str(query.downloadedBefore),
+      folder: str(query.folder),
+      mediaType: str(query.mediaType),
       sort: str(query.sort) as AssetSortKey | undefined,
       limit,
     };
@@ -156,6 +159,21 @@ export async function registerAssetRoutes(app: FastifyInstance): Promise<void> {
     if (!a?.local_path) return reply.code(404).send({ ok: false, error: "no local file" });
     const abs = assetAbsolutePath(a.local_path);
     return revealInExplorer(abs);
+  });
+
+  // Move the asset's file into another folder inside the project's assets
+  // dir — the Library's drag-onto-folder gesture. Body: { folder } where
+  // folder is relative to <slug>/assets/ ("" = the assets root).
+  app.post("/api/assets/:id/move", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = req.body as { folder?: string } | null;
+    if (body?.folder == null) return reply.code(400).send({ error: "folder required" });
+    try {
+      return moveAssetToFolder(id, body.folder);
+    } catch (e) {
+      const err = e as Error & { statusCode?: number };
+      return reply.code(err.statusCode ?? 500).send({ error: err.message });
+    }
   });
 
   app.post("/api/assets/:id/ready", async (req, reply) => {

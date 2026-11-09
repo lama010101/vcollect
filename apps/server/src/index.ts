@@ -23,6 +23,7 @@ import { registerMusicEditRoutes } from "./routes/musicEdit.js";
 import { registerUploadRoutes } from "./routes/uploads.js";
 import { registerVisualizerRoutes } from "./routes/visualizer.js";
 import { registerWorldRoutes } from "./routes/world.js";
+import { registerFormatRoutes } from "./routes/format.js";
 import { registerEngineRoutes } from "./routes/engine.js";
 import { registerProjectRoutes } from "./routes/projects.js";
 import { registerManifestRoutes } from "./routes/manifests.js";
@@ -76,6 +77,9 @@ export async function buildServer() {
 
   // --- World Cam (camera-path re-render via remote InSpatio worker) -----------
   await registerWorldRoutes(app);
+
+  // --- Format (aspect-ratio reframe of a downloaded asset) --------------------
+  await registerFormatRoutes(app);
 
   // --- Python engine (analysis worker: librosa/numpy/scipy/opencv) ------------
   await registerEngineRoutes(app);

@@ -73,6 +73,42 @@ export async function generateImageThumbnail(file: string, assetId: string): Pro
 }
 
 /**
+ * Generate the representative thumbnail for an audio file — a waveform
+ * overview via ffmpeg's showwavespic filter (no video stream needed),
+ * flattened to the same bounded JPEG the video/image thumbs use. Audio has
+ * no "best frame", so the whole-file waveform IS the representative image.
+ * @returns absolute path to the JPEG, or null on failure.
+ */
+export async function generateAudioThumbnail(file: string, assetId: string): Promise<string | null> {
+  try {
+    const thumbDir = THUMBNAILS_DIR;
+    mkdirSync(thumbDir, { recursive: true });
+    const bin = ffmpegService.ffmpegPath();
+    const png = await new Promise<Buffer>((resolve, reject) => {
+      const child = spawn(
+        bin,
+        ["-i", file, "-filter_complex", "showwavespic=s=640x240:split_channels=0", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+        { windowsHide: true },
+      );
+      const chunks: Buffer[] = [];
+      child.stdout.on("data", (d: Buffer) => chunks.push(d));
+      child.on("error", reject);
+      child.on("close", (code) => (code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`waveform thumb exit ${code}`))));
+    });
+    if (!png.length) return null;
+    const dest = join(thumbDir, `${assetId}.jpg`);
+    await sharp(png)
+      .resize(THUMB_MAX_DIM, THUMB_MAX_DIM, { fit: "inside", withoutEnlargement: true })
+      .jpeg(THUMB_JPEG)
+      .toFile(dest);
+    return dest;
+  } catch (err) {
+    console.warn(`[thumbnails] audio thumb failed for ${assetId}: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+/**
  * Generate the representative thumbnail for a video file.
  * Thumbnails are stored in the global THUMBNAILS_DIR (shared across projects).
  * @returns absolute path to the generated JPEG, or null on failure.

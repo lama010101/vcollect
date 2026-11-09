@@ -281,7 +281,7 @@ describe("visualizer — modes + dancer", () => {
     assert.ok(g0.sparks.length > 0); // sine level → sparks are active
     // EQ bars radial: stride-9 bright quads radiating from the hub radius
     // R0 = 12% of minDim, extending at most 36% of minDim outward; tip caps
-    // are stride-8 quads, sparks drift outward, one luminous hub ring.
+    // are stride-8 quads, sparks drift outward.
     const er = computeFrame(f, globalsFor("eqradial"), 320, 240, t);
     assert.equal(er.eqradial.length, 1);
     const rg = er.eqradial[0]!;
@@ -290,14 +290,10 @@ describe("visualizer — modes + dancer", () => {
     assert.equal(rg.tips.length % 8, 0);
     assert.ok(rg.tips.length > 0);
     assert.equal(rg.sparks.length % 3, 0);
-    assert.equal(rg.ring.length, 4);
     const rcx = 160; // center at default convergence (320*0.5, 240*0.5)
     const rcy = 120;
-    assert.ok(Math.abs(rg.ring[0]! - rcx) < 1e-3);
-    assert.ok(Math.abs(rg.ring[1]! - rcy) < 1e-3);
     const R0 = Math.min(320, 240) * 0.12;
     const maxLen = Math.min(320, 240) * 0.36;
-    assert.ok(Math.abs(rg.ring[2]! - R0) < 1e-3);
     // Every segment vertex sits inside the [R0, R0+maxLen] annulus.
     for (let i = 0; i + 7 < rg.segs.length; i += 9) {
       for (let k = 0; k < 8; k += 2) {
@@ -310,11 +306,38 @@ describe("visualizer — modes + dancer", () => {
     const qy = (rg.segs[1]! + rg.segs[3]! + rg.segs[5]! + rg.segs[7]!) / 4;
     assert.ok(Math.abs(qx - rcx) < R0 * 0.1 && qy < rcy - R0 * 0.5);
     // The hub radius is user-controlled: 0 → bars start at the exact center.
+    const minVertexR = (segs: Float32Array) => {
+      let m = Infinity;
+      for (let i = 0; i + 7 < segs.length; i += 9) {
+        for (let k = 0; k < 8; k += 2) m = Math.min(m, Math.hypot(segs[i + k]! - rcx, segs[i + k + 1]! - rcy));
+      }
+      return m;
+    };
     const er0 = computeFrame(f, globalsFor("eqradial", false, { innerRadius: 0 }), 320, 240, t);
-    assert.ok(Math.abs(er0.eqradial[0]!.ring[2]!) < 1e-3);
     assert.ok(er0.eqradial[0]!.segs.length > 0); // still emits geometry
+    assert.ok(minVertexR(er0.eqradial[0]!.segs) < 1e-3);
     const er3 = computeFrame(f, globalsFor("eqradial", false, { innerRadius: 0.3 }), 320, 240, t);
-    assert.ok(Math.abs(er3.eqradial[0]!.ring[2]! - 240 * 0.3) < 1e-2);
+    assert.ok(Math.abs(minVertexR(er3.eqradial[0]!.segs) - 240 * 0.3) < 1e-2);
+    // arcDegrees: a 180° span packs the bars into a dome over the center —
+    // every segment vertex stays above the center line and the emitted bars
+    // cover the whole top half.
+    const er180 = computeFrame(f, globalsFor("eqradial", false, { arcDegrees: 180 }), 320, 240, t);
+    const rg180 = er180.eqradial[0]!;
+    assert.ok(rg180.segs.length > 0);
+    let aMin = Infinity;
+    let aMax = -Infinity;
+    for (let i = 0; i + 7 < rg180.segs.length; i += 9) {
+      for (let k = 0; k < 8; k += 2) {
+        assert.ok(rg180.segs[i + k + 1]! <= rcy + 1e-3, `y ${rg180.segs[i + k + 1]}`);
+      }
+      const mx = (rg180.segs[i]! + rg180.segs[i + 2]! + rg180.segs[i + 4]! + rg180.segs[i + 6]!) / 4 - rcx;
+      const my = (rg180.segs[i + 1]! + rg180.segs[i + 3]! + rg180.segs[i + 5]! + rg180.segs[i + 7]!) / 4 - rcy;
+      const a = Math.atan2(my, mx);
+      if (a < aMin) aMin = a;
+      if (a > aMax) aMax = a;
+    }
+    assert.ok(aMin >= -Math.PI - 1e-3 && aMax <= 1e-3); // all within the top half
+    assert.ok(aMax - aMin > Math.PI - 0.3); // dome is fully populated end to end
     // Stereo: fills hug the vertical center line; mono → mirrored right side.
     const st = computeFrame(f, globalsFor("stereo"), 320, 240, t);
     assert.equal(st.stereos.length, 1);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ASSETS_CHANGED_EVENT, isImageFileName, type AcquireBatchProgress, type Asset, type AssetCandidate, type AssetSearchFilters, type AssetSortKey, type Provider, type Task } from "../api.js";
+import { api, ASSET_DRAG_TYPE, ASSETS_CHANGED_EVENT, assetFolderPath, isAudioFileName, isImageFileName, isMediaFile, libraryDropTarget, type AcquireBatchProgress, type Asset, type AssetCandidate, type AssetFolderEntry, type AssetSearchFilters, type AssetSortKey, type Provider, type Task } from "../api.js";
+import { PROJECT_ID_ALL } from "@twio/shared";
 import { RatingSlider } from "../components/RatingSlider.js";
 import { Button, Badge, ProgressBar, EmptyState, Spinner } from "../components/ui.js";
 
@@ -33,19 +34,25 @@ function parseTags(tagsJson: string | null): string[] {
 }
 
 const SORT_OPTIONS: Array<{ value: AssetSortKey; label: string }> = [
-  { value: "final_score_desc", label: "Score ↓" },
-  { value: "final_score_asc", label: "Score ↑" },
-  { value: "rating_desc", label: "Rating ↓" },
-  { value: "rating_asc", label: "Rating ↑" },
-  { value: "duration_desc", label: "Duration ↓" },
-  { value: "duration_asc", label: "Duration ↑" },
-  { value: "newest_downloaded", label: "Newest downloaded" },
-  { value: "oldest_downloaded", label: "Oldest downloaded" },
-  { value: "newest_discovered", label: "Newest discovered" },
-  { value: "oldest_discovered", label: "Oldest discovered" },
+  { value: "newest_downloaded", label: "Newest" },
+  { value: "oldest_downloaded", label: "Oldest" },
   { value: "title_asc", label: "Title A–Z" },
   { value: "title_desc", label: "Title Z–A" },
+  { value: "rating_desc", label: "Rating ↓" },
+  { value: "rating_asc", label: "Rating ↑" },
+  { value: "newest_discovered", label: "Newest discovered" },
+  { value: "oldest_discovered", label: "Oldest discovered" },
+  { value: "duration_desc", label: "Duration ↓" },
+  { value: "duration_asc", label: "Duration ↑" },
+  { value: "final_score_desc", label: "Score ↓" },
+  { value: "final_score_asc", label: "Score ↑" },
 ];
+
+/** Short date for asset cards — locale short form ("10/11/2026" en-US). */
+function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso.slice(0, 10) : d.toLocaleDateString();
+}
 
 const ORIENTATION_OPTIONS = ["landscape", "portrait", "square"] as const;
 
@@ -134,7 +141,10 @@ export function LibraryPage({ projectId }: { projectId: string }) {
   const [maxWidth, setMaxWidth] = useState("");
   const [maxHeight, setMaxHeight] = useState("");
   const [orientation, setOrientation] = useState("");
-  const [downloadState, setDownloadState] = useState<"" | "downloaded" | "discovered">("");
+  const [mediaType, setMediaType] = useState<"" | "video" | "image" | "audio">("");
+  // Library defaults to downloaded-only so undownloaded candidates stay out
+  // of the grid — flip this filter in + Filters to see them again.
+  const [downloadState, setDownloadState] = useState<"" | "downloaded" | "discovered">("downloaded");
   const [commercialStatus, setCommercialStatus] = useState("");
   const [rightsReviewStatus, setRightsReviewStatus] = useState("");
   const [sourceLicense, setSourceLicense] = useState("");
@@ -146,9 +156,34 @@ export function LibraryPage({ projectId }: { projectId: string }) {
   const [discoveredBefore, setDiscoveredBefore] = useState("");
   const [downloadedAfter, setDownloadedAfter] = useState("");
   const [downloadedBefore, setDownloadedBefore] = useState("");
-  const [sort, setSort] = useState<AssetSortKey>("final_score_desc");
+  const [sort, setSort] = useState<AssetSortKey>("newest_downloaded");
   const [limit, setLimit] = useState("500");
   const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Folder nav — the selected subfolder under <slug>/assets/ ("" = all
+  // files). Remembered per project so switching projects restores each
+  // project's last-viewed folder.
+  const [folderByProject, setFolderByProject] = useState<Map<string, string>>(new Map());
+  const folder = folderByProject.get(projectId) ?? "";
+  const setFolder = (f: string) =>
+    setFolderByProject((m) => {
+      const n = new Map(m);
+      if (f) n.set(projectId, f);
+      else n.delete(projectId);
+      return n;
+    });
+  // The real directory list of <slug>/assets/ (null while loading / __ALL__).
+  const [folderTree, setFolderTree] = useState<AssetFolderEntry[] | null>(null);
+
+  const loadFolderTree = useCallback(async () => {
+    if (projectId === PROJECT_ID_ALL) { setFolderTree(null); return; }
+    try {
+      const r = await api.folderTree(projectId);
+      setFolderTree(r.folders);
+    } catch {
+      setFolderTree(null);
+    }
+  }, [projectId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -179,6 +214,7 @@ export function LibraryPage({ projectId }: { projectId: string }) {
       maxWidth: num(maxWidth),
       maxHeight: num(maxHeight),
       orientation: str(orientation),
+      mediaType: mediaType || undefined,
       downloadedOnly: downloadState === "downloaded" ? true : undefined,
       discoveredOnly: downloadState === "discovered" ? true : undefined,
       commercialStatus: str(commercialStatus),
@@ -192,15 +228,16 @@ export function LibraryPage({ projectId }: { projectId: string }) {
       discoveredBefore: str(discoveredBefore),
       downloadedAfter: str(downloadedAfter),
       downloadedBefore: str(downloadedBefore),
+      folder: folder || undefined,
       sort,
       limit: num(limit),
     };
     return filters;
   }, [
     q, provider, creator, tag, title, minDuration, maxDuration, minWidth, minHeight,
-    maxWidth, maxHeight, orientation, downloadState, commercialStatus, rightsReviewStatus,
+    maxWidth, maxHeight, orientation, mediaType, downloadState, commercialStatus, rightsReviewStatus,
     sourceLicense, minRating, maxRating, minScore, maxScore, discoveredAfter,
-    discoveredBefore, downloadedAfter, downloadedBefore, sort, limit,
+    discoveredBefore, downloadedAfter, downloadedBefore, folder, sort, limit,
   ]);
 
   /** Persist a query to the recent-searches list (deduped, most-recent first). */
@@ -245,7 +282,7 @@ export function LibraryPage({ projectId }: { projectId: string }) {
         // When the sync registers/repoints files, refresh the results once.
         if (!opts?.skipSync) {
           void api.syncProjectAssets(projectId)
-            .then((r) => { if (r.added + r.moved + r.missing > 0) void runSearch({ skipSync: true }); })
+            .then((r) => { if (r.added + r.moved + r.missing > 0) void runSearchRef.current?.({ skipSync: true }); })
             .catch(() => {});
         }
         const r = await api.searchAssetsAdvanced(buildFilters(), projectId);
@@ -253,13 +290,22 @@ export function LibraryPage({ projectId }: { projectId: string }) {
         setCount(r.count);
         setRatingOverrides(new Map());
         setHasSearched(true);
+        // Refresh the folder tree alongside results — a sync/acquire/delete
+        // may have changed the directory listing or its file counts.
+        void loadFolderTree();
       }
     } catch (e) {
       setErr(`Search failed: ${(e as Error).message}`);
     } finally {
       setSearching(false);
     }
-  }, [buildFilters, projectId, searchMode, q, orientation, minWidth, minHeight, provider]);
+  }, [buildFilters, projectId, searchMode, q, orientation, minWidth, minHeight, provider, loadFolderTree]);
+
+  // Latest runSearch — a callback fired from an older async context (the
+  // background disk-sync refresh above) must use the freshest filters, not
+  // the closure it was created with, or it would overwrite newer results.
+  const runSearchRef = useRef<typeof runSearch>();
+  runSearchRef.current = runSearch;
 
   // Run an initial empty-filter search on mount / project change so the user
   // sees the whole pool immediately (sorted by final_score desc by default).
@@ -285,14 +331,95 @@ export function LibraryPage({ projectId }: { projectId: string }) {
     return () => window.removeEventListener(ASSETS_CHANGED_EVENT, onChanged);
   }, [projectId, searchMode, runSearch]);
 
+  // Sorting and folder selection are server-side, so changing either re-runs
+  // the library search immediately — no extra Search click. Skips the
+  // background disk sync since only the query changed, and skips the
+  // project-change render (the mount effect above already searches).
+  const autoSearchInitRef = useRef(true);
+  const prevProjectRef = useRef(projectId);
+  useEffect(() => {
+    const projectChanged = prevProjectRef.current !== projectId;
+    prevProjectRef.current = projectId;
+    if (autoSearchInitRef.current) { autoSearchInitRef.current = false; return; }
+    if (projectChanged || searchMode !== "local") return;
+    runSearch({ skipSync: true }).catch(console.error);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sort, folder, mediaType, projectId]);
+
+  /** Sidebar "↻ rescan" — re-walk the assets folder on disk, then refresh
+   *  the tree and the results (manual explorer changes need a sync first). */
+  async function refreshFolders() {
+    try {
+      await api.syncProjectAssets(projectId).catch(() => {});
+      await loadFolderTree();
+      await runSearch({ skipSync: true });
+    } catch (e) {
+      console.error(`[library] folder refresh failed: ${(e as Error).message}`);
+    }
+  }
+
+  // Publish the selected folder as the global drop target — while the
+  // Library is open, OS file drops upload into this folder instead of the
+  // default uploads/unknown.
+  useEffect(() => {
+    libraryDropTarget.projectId = projectId;
+    libraryDropTarget.folder = folder || null;
+    return () => {
+      libraryDropTarget.projectId = null;
+      libraryDropTarget.folder = null;
+    };
+  }, [projectId, folder]);
+
+  // Which sidebar folder row the pointer is dragging over (for highlight).
+  const [dragOverPath, setDragOverPath] = useState<string | null>(null);
+
+  /** Drop on a folder row: an internal asset drag → move the file on disk;
+   *  OS files → upload into that folder. stopPropagation keeps the window-
+   *  level drop zone from also handling the same drop. */
+  async function handleFolderDrop(e: React.DragEvent, target: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverPath(null);
+    const assetId = e.dataTransfer?.getData(ASSET_DRAG_TYPE);
+    if (assetId) {
+      try {
+        await api.moveAssetToFolder(assetId, target);
+        await loadFolderTree();
+        await runSearch({ skipSync: true });
+      } catch (err) {
+        setErr(`Move failed: ${(err as Error).message}`);
+      }
+      return;
+    }
+    const files = [...(e.dataTransfer?.files ?? [])].filter(isMediaFile);
+    if (files.length === 0) return;
+    try {
+      let failed = 0;
+      for (const f of files) {
+        try {
+          await api.uploadProjectAsset(projectId, f, target || undefined);
+        } catch (err) {
+          failed++;
+          console.error(`[upload] ${f.name}: ${(err as Error).message}`);
+        }
+      }
+      if (failed > 0) setErr(`${failed} of ${files.length} upload(s) failed`);
+      window.dispatchEvent(new Event(ASSETS_CHANGED_EVENT));
+      await loadFolderTree();
+      await runSearch({ skipSync: true });
+    } catch (err) {
+      setErr(`Upload failed: ${(err as Error).message}`);
+    }
+  }
+
   function clearAll() {
     setQ(""); setProvider(""); setCreator(""); setTag(""); setTitle("");
     setMinDuration(""); setMaxDuration(""); setMinWidth(""); setMinHeight("");
-    setMaxWidth(""); setMaxHeight(""); setOrientation(""); setDownloadState("");
+    setMaxWidth(""); setMaxHeight(""); setOrientation(""); setMediaType(""); setDownloadState("downloaded");
     setCommercialStatus(""); setRightsReviewStatus(""); setSourceLicense("");
     setMinRating(""); setMaxRating(""); setMinScore(""); setMaxScore("");
     setDiscoveredAfter(""); setDiscoveredBefore(""); setDownloadedAfter(""); setDownloadedBefore("");
-    setSort("final_score_desc"); setLimit("500");
+    setSort("newest_downloaded"); setLimit("500");
   }
 
   async function setRating(assetId: string, prev: number | null, next: number | null) {
@@ -482,7 +609,9 @@ export function LibraryPage({ projectId }: { projectId: string }) {
           <div className="text-xs text-slate-400">
             {hasSearched && !searching && searchMode === "local" && (() => {
               const downloaded = results.filter((a) => a.local_path).length;
-              return <><Badge tone="good">{downloaded}</Badge> downloaded / <Badge tone="info">{count}</Badge> match{count === 1 ? "" : "es"}</>;
+              return downloaded === count
+                ? <><Badge tone="info">{count}</Badge> asset{count === 1 ? "" : "s"}</>
+                : <><Badge tone="good">{downloaded}</Badge> downloaded / <Badge tone="info">{count}</Badge> match{count === 1 ? "" : "es"}</>;
             })()}
             {hasSearched && !searching && searchMode === "providers" && <><Badge tone="info">{count}</Badge> candidate{count === 1 ? "" : "s"}</>}
             {searching && <span className="flex items-center gap-1"><Spinner className="w-3 h-3 text-sky-500" /> searching…</span>}
@@ -568,10 +697,37 @@ export function LibraryPage({ projectId }: { projectId: string }) {
         {/* Always-visible quick filters: orientation + limit + recent queries */}
         <div className="flex items-center gap-3 flex-wrap mb-2">
           <div className="flex items-center gap-1">
+            <span className={labelCls}>Type</span>
+            <select
+              value={mediaType}
+              onChange={(e) => setMediaType(e.target.value as "" | "video" | "image" | "audio")}
+              className={inputCls + " w-auto"}
+              disabled={searchMode === "providers"}
+              title="Filter by media type"
+            >
+              <option value="">all</option>
+              <option value="video">videos</option>
+              <option value="image">images</option>
+              <option value="audio">audio</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-1">
             <span className={labelCls}>Orientation</span>
             <select value={orientation} onChange={(e) => setOrientation(e.target.value)} className={inputCls + " w-auto"}>
               <option value="">any</option>
               {ORIENTATION_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </div>
+          <div className="flex items-center gap-1">
+            <span className={labelCls}>Sort</span>
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value as AssetSortKey)}
+              className={inputCls + " w-auto"}
+              disabled={searchMode === "providers"}
+              title={searchMode === "providers" ? "Sorting applies to library results" : "Sort library results"}
+            >
+              {SORT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </div>
           <div className="flex items-center gap-1">
@@ -697,12 +853,6 @@ export function LibraryPage({ projectId }: { projectId: string }) {
             <div className={labelCls}>Downloaded before</div>
             <input type="date" value={downloadedBefore} onChange={(e) => setDownloadedBefore(e.target.value)} className={inputCls} />
           </div>
-          <div className="space-y-1">
-            <div className={labelCls}>Sort</div>
-            <select value={sort} onChange={(e) => setSort(e.target.value as AssetSortKey)} className={inputCls}>
-              {SORT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
-          </div>
         </div>
         <div className="flex gap-2 mt-3">
           <button onClick={clearAll} className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm">
@@ -713,23 +863,87 @@ export function LibraryPage({ projectId }: { projectId: string }) {
         )}
       </div>
 
-      {/* Results — local pool mode */}
-      {searchMode === "local" && hasSearched && results.length === 0 && !searching && (
-        <EmptyState icon="⌕" title="No assets match these filters" description="Try adjusting your search query or clearing some filters." />
-      )}
-      {searchMode === "local" && results.length > 0 && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-          {results.map((a) => {
-            return (
-              <SearchAssetCard
-                key={a.id}
-                asset={a}
-                rating={ratingOverrides.has(a.id) ? ratingOverrides.get(a.id) ?? null : a.rating ?? null}
-                onSetRating={setRating}
-                onAcquired={runSearch}
+      {/* Results — local pool mode, with the physical folder tree as a
+          left sidebar (users can create subfolders inside uploads/). */}
+      {searchMode === "local" && (
+        <div className="flex gap-3 items-start">
+          {projectId !== PROJECT_ID_ALL && folderTree && (
+            <aside className="ui-card p-2 w-52 shrink-0 self-start">
+              <div className="flex items-center justify-between px-1 pb-1 mb-1 border-b border-slate-800">
+                <span className={labelCls}>Folders</span>
+                <button
+                  onClick={() => refreshFolders()}
+                  className="text-slate-500 hover:text-sky-400 text-[11px]"
+                  title="Rescan the assets folder (new files/folders on disk)"
+                >
+                  ↻ rescan
+                </button>
+              </div>
+              <div className="max-h-[70vh] overflow-y-auto space-y-0.5">
+                {folderTree.map((f) => {
+                  const active = folder === f.path;
+                  const isDrop = dragOverPath === f.path;
+                  return (
+                    <button
+                      key={f.path || "__root__"}
+                      onClick={() => setFolder(f.path)}
+                      onDragOver={(e) => {
+                        const t = e.dataTransfer?.types ?? [];
+                        if (!t.includes("Files") && !t.includes(ASSET_DRAG_TYPE)) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = t.includes(ASSET_DRAG_TYPE) ? "move" : "copy";
+                        setDragOverPath(f.path);
+                      }}
+                      onDragLeave={() => setDragOverPath((p) => (p === f.path ? null : p))}
+                      onDrop={(e) => handleFolderDrop(e, f.path)}
+                      className={`w-full text-left py-1 pr-1 rounded text-xs flex items-center justify-between gap-1 ${isDrop ? "bg-emerald-700/40 text-emerald-200 ring-1 ring-emerald-500" : active ? "bg-sky-600/30 text-sky-200" : "text-slate-300 hover:bg-slate-800"}`}
+                      style={{ paddingLeft: `${6 + f.depth * 14}px` }}
+                      title={f.path ? `${f.path} — ${f.fileCount} here, ${f.subtreeCount} incl. subfolders · drop files or assets to move them here` : "All files · drop assets here to unfile them"}
+                    >
+                      <span className="truncate">{f.path === "" ? "All files" : f.name}</span>
+                      <span className={`shrink-0 ${active ? "text-sky-300" : "text-slate-500"}`}>{f.subtreeCount}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </aside>
+          )}
+          <div className="flex-1 min-w-0 space-y-2">
+            {folder !== "" && (
+              <div className="text-xs text-slate-400 flex items-center gap-2">
+                <span>Folder: <code className="text-sky-400">{folder}</code></span>
+                <button
+                  onClick={() => setFolder("")}
+                  className="px-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800"
+                  title="Show all files"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+            {hasSearched && results.length === 0 && !searching && (
+              <EmptyState
+                icon="⌕"
+                title="No assets match these filters"
+                description={folder ? `Nothing in "${folder}" — try another folder or clear the folder filter.` : "Try adjusting your search query or clearing some filters."}
               />
-            );
-          })}
+            )}
+            {results.length > 0 && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+                {results.map((a) => {
+                  return (
+                    <SearchAssetCard
+                      key={a.id}
+                      asset={a}
+                      rating={ratingOverrides.has(a.id) ? ratingOverrides.get(a.id) ?? null : a.rating ?? null}
+                      onSetRating={setRating}
+                      onAcquired={runSearch}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -790,6 +1004,7 @@ function SearchAssetCard({
 
   const downloaded = !!asset.local_path;
   const isImage = isImageFileName(asset.local_path ?? asset.title);
+  const isAudio = isAudioFileName(asset.local_path ?? asset.title);
 
   async function startAcquire() {
     if (acquireState === "acquiring") return;
@@ -841,7 +1056,9 @@ function SearchAssetCard({
         }}
         title={!downloaded ? "Not downloaded" : isImage ? "Click to open" : playing ? "" : "Click to play"}
       >
-        {playing && downloaded && !isImage ? (
+        {playing && downloaded && isAudio ? (
+          <audio controls autoPlay src={api.assetFileUrl(asset.id)} className="w-11/12" />
+        ) : playing && downloaded && !isImage ? (
           <video
             ref={videoRef}
             src={api.assetFileUrl(asset.id)}
@@ -860,7 +1077,7 @@ function SearchAssetCard({
               loading="lazy"
             />
             <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/30 transition-colors">
-              <span className="text-3xl text-white/0 group-hover:text-white/90 transition-colors">{isImage ? "↗" : "▶"}</span>
+              <span className="text-3xl text-white/0 group-hover:text-white/90 transition-colors">{isImage ? "↗" : isAudio ? "♫" : "▶"}</span>
             </div>
           </>
         ) : (
@@ -872,12 +1089,30 @@ function SearchAssetCard({
       </div>
       <div className="p-2 space-y-1">
         <div className="flex items-center justify-between gap-2">
+          {downloaded && (
+            <span
+              draggable
+              onDragStart={(e) => {
+                e.dataTransfer.setData(ASSET_DRAG_TYPE, asset.id);
+                e.dataTransfer.effectAllowed = "move";
+                const card = e.currentTarget.closest(".asset-card");
+                if (card) e.dataTransfer.setDragImage(card, 24, 24);
+              }}
+              className="cursor-grab text-slate-600 hover:text-slate-300 shrink-0 select-none"
+              title="Drag onto a folder to move this file"
+            >
+              ⠿
+            </span>
+          )}
           <span className="font-mono text-xs text-sky-400 truncate" title={asset.title ?? asset.id}>
             {asset.title ?? asset.id}
           </span>
           <span className="flex items-center gap-1 shrink-0">
             {isImage && (
               <span className="text-[10px] px-1 rounded bg-violet-700/60 text-violet-200 border border-violet-600/60">image</span>
+            )}
+            {isAudio && (
+              <span className="text-[10px] px-1 rounded bg-amber-700/60 text-amber-200 border border-amber-600/60">audio</span>
             )}
             <span className="text-[10px] text-slate-500">{asset.provider_id}</span>
           </span>
@@ -892,6 +1127,22 @@ function SearchAssetCard({
           {asset.orientation ? ` · ${asset.orientation}` : ""}
           {asset.final_score != null ? ` · score ${asset.final_score.toFixed(2)}` : ""}
         </div>
+        {(() => {
+          const added = asset.discovered_at ? fmtDate(asset.discovered_at) : null;
+          const dl = asset.downloaded_at ? fmtDate(asset.downloaded_at) : null;
+          const dir = assetFolderPath(asset.local_path);
+          const parts = [
+            added ? `added ${added}` : null,
+            dl && dl !== added ? `downloaded ${dl}` : null,
+            dir != null ? (dir ? `in ${dir}` : "in assets/") : null,
+          ].filter(Boolean);
+          if (parts.length === 0) return null;
+          return (
+            <div className="text-[10px] text-slate-500 truncate" title={dir || undefined}>
+              {parts.join(" · ")}
+            </div>
+          );
+        })()}
         <div className="text-xs">
           <StatusPill status={asset.commercial_status} />
           {downloaded && <span className="ml-2 text-emerald-500">downloaded</span>}

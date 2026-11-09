@@ -4,20 +4,22 @@
 // =============================================================================
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
 import type { BeatAnalysis, EditPlan, MusicEditSettings } from "@twio/shared";
-import { OUTPUT_ROOT, projectPaths } from "../config.js";
+import { AUDIO_FILE_EXTENSIONS, OUTPUT_ROOT, projectPaths } from "../config.js";
 import { getProject } from "../db/projectRepository.js";
 import { getAsset } from "../db/repository.js";
 import { assetAbsolutePath } from "../routes/folders.js";
-import { probe } from "../video/ffprobe.js";
+import { probe, probeAudio } from "../video/ffprobe.js";
 import { analyzeSong, type AnalyzedSong } from "./beatAnalysis.js";
 import { planEdit, type PlanSource } from "./edl.js";
 import { MusicEditError } from "./errors.js";
 import { renderEdit, type RenderProgress, type RenderSource } from "./render.js";
 
-export const AUDIO_EXTENSIONS = [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus"];
+/** Canonical audio-extension list lives in config.ts (AUDIO_FILE_EXTENSIONS)
+ *  so uploads/folder-sync and the song/stem pools can never drift apart. */
+export const AUDIO_EXTENSIONS = [...AUDIO_FILE_EXTENSIONS];
 export const MAX_SONG_BYTES = 300 * 1024 * 1024;
 
 export interface ResolvedSource extends PlanSource {
@@ -79,6 +81,52 @@ export function songPath(projectId: string, name: string): string {
   const p = join(projectMusicDir(projectId, "songs"), sanitizeSongName(name));
   if (!existsSync(p)) throw new MusicEditError(404, "AUDIO_NOT_FOUND", `Song not found: ${name}`);
   return p;
+}
+
+/** First non-existing path inside `dir` for `filename` — the plain name when
+ *  free, else _1, _2, … suffixed before the extension (same convention as
+ *  uploads' uniqueDest). Shared with the Visualizer stem pool. */
+export function uniqueFilePath(dir: string, filename: string): string {
+  const first = join(dir, filename);
+  if (!existsSync(first)) return first;
+  const ext = extname(filename);
+  const stem = filename.slice(0, filename.length - ext.length);
+  for (let i = 1; ; i++) {
+    const cand = join(dir, `${stem}_${i}${ext}`);
+    if (!existsSync(cand)) return cand;
+  }
+}
+
+/** Copy a downloaded audio asset (drag & drop / folder sync / provider KEEP)
+ *  from the project's assets folder into the songs pool — the bridge that
+ *  makes library audio usable as a Video Cutter song without re-uploading.
+ *  The copy is validated with probeAudio (never trust the extension) and the
+ *  pool keeps its own file, so deleting the asset later doesn't break songs. */
+export async function importSongFromAsset(projectId: string, assetId: string): Promise<SongInfo> {
+  const a = getAsset(assetId);
+  if (!a || a.project_id !== projectId) {
+    throw new MusicEditError(404, "ASSET_NOT_FOUND", `Asset not found in this project: ${assetId}`);
+  }
+  if (!a.local_path) {
+    throw new MusicEditError(422, "ASSET_NOT_DOWNLOADED", `Asset "${a.title ?? assetId}" has no local file.`);
+  }
+  const abs = assetAbsolutePath(a.local_path);
+  if (!existsSync(abs)) {
+    throw new MusicEditError(404, "ASSET_FILE_MISSING", `The asset's file is missing on disk: ${a.local_path}`);
+  }
+  // sanitizeSongName rejects non-audio extensions with 415.
+  const safe = sanitizeSongName(basename(abs));
+  const dir = projectMusicDir(projectId, "songs");
+  const dest = uniqueFilePath(dir, safe);
+  copyFileSync(abs, dest);
+  try {
+    await probeAudio(dest);
+  } catch {
+    rmSync(dest, { force: true });
+    throw new MusicEditError(422, "CORRUPT_AUDIO", `"${safe}" is not a readable audio file.`);
+  }
+  const st = statSync(dest);
+  return { name: basename(dest), sizeBytes: st.size, url: fileUrl(dest), modifiedAt: st.mtime.toISOString() };
 }
 
 /** Probe one video file into a planner source. */

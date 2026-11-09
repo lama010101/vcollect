@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sanitizeFilename, uniqueDest, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, mediaKindForExt } from "../src/routes/uploads.ts";
+import { sanitizeFilename, uniqueDest, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, AUDIO_EXTENSIONS, mediaKindForExt } from "../src/routes/uploads.ts";
 
 describe("uploads — sanitizeFilename", () => {
   it("keeps a normal filename unchanged", () => {
@@ -64,11 +64,24 @@ describe("uploads — IMAGE_EXTENSIONS", () => {
   });
 });
 
+describe("uploads — AUDIO_EXTENSIONS", () => {
+  it("covers the song/stem pool formats", () => {
+    for (const ext of [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus"]) {
+      assert.ok(AUDIO_EXTENSIONS.has(ext), ext);
+    }
+    assert.ok(!AUDIO_EXTENSIONS.has(".mp4"));
+    assert.ok(!AUDIO_EXTENSIONS.has(".txt"));
+  });
+});
+
 describe("uploads — mediaKindForExt", () => {
-  it("classifies videos and images, case-insensitive", () => {
+  it("classifies videos, images and audio, case-insensitive", () => {
     assert.equal(mediaKindForExt(".mp4"), "video");
     assert.equal(mediaKindForExt(".PNG"), "image");
     assert.equal(mediaKindForExt(".jpeg"), "image");
+    assert.equal(mediaKindForExt(".mp3"), "audio");
+    assert.equal(mediaKindForExt(".WAV"), "audio");
+    assert.equal(mediaKindForExt(".flac"), "audio");
     assert.equal(mediaKindForExt(".exe"), null);
     assert.equal(mediaKindForExt(""), null);
   });

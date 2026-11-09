@@ -229,11 +229,6 @@ function modeVisualsSvg(vis: VizModeVisuals, parts: string[], gradPrefix: string
       const d = quadsPath(buckets[b]!);
       if (d) parts.push(`<path d="${d}" fill="${g.color}" opacity="${f(g.alpha * ((b + 0.5) / EQ_BUCKETS))}"/>`);
     }
-    for (let i = 0; i + 3 < g.ring.length; i += 4) {
-      parts.push(
-        `<circle cx="${f(g.ring[i]!)}" cy="${f(g.ring[i + 1]!)}" r="${f(g.ring[i + 2]!)}" fill="none" stroke="${g.tipColor}" stroke-width="${f(g.ring[i + 3]!)}" opacity="${f(Math.min(1, g.glowAlpha + 0.3))}"/>`,
-      );
-    }
     const gd = circlesPath(g.tipGlow);
     if (gd) parts.push(`<path d="${gd}" fill="${g.tipColor}" opacity="${f(g.glowAlpha * 0.6)}"/>`);
     const td = quadsPath(g.tips);

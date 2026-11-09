@@ -7,6 +7,7 @@
 
 import type { AssetCandidate, ProviderName } from "@twio/shared";
 import { providerLicenseStatus, PROJECT_ID_ALL } from "@twio/shared";
+import { AUDIO_FILE_EXTENSIONS, IMAGE_FILE_EXTENSIONS, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { db } from "../db/client.js";
 import type { AssetRow, ShotAssetRow, ShotRow, ShotWithKeptRow, TimelineRow } from "../db/schema.js";
 import { classifyLicense } from "../state/machine.js";
@@ -738,6 +739,16 @@ export interface AssetSearchFilters {
   downloadedAfter?: string;
   /** ISO date string; keeps assets downloaded on/before this date. */
   downloadedBefore?: string;
+  /** Physical subfolder under <slug>/assets/ (e.g. "uploads/nature"), matched
+   *  as a subtree — a folder filter keeps files in that folder AND any nested
+   *  subfolders. Undefined/empty = every folder. Only affects rows with a
+   *  local_path (downloaded assets). */
+  folder?: string;
+  /** "image" | "video" | "audio" — matched by file extension on local_path
+   *  (falling back to title when there's no local file), same rule as the
+   *  client's isImageFileName/isVideoFileName/isAudioFileName. Undefined or
+   *  anything else = every type. */
+  mediaType?: string;
   /** Sort key (defaults to final_score_desc). */
   sort?: AssetSortKey;
   /** Result cap (1..500, default 50). */
@@ -865,6 +876,30 @@ export function searchAssetsAdvanced(
   if (filters.downloadedBefore) {
     where.push("downloaded_at <= ?");
     params.push(filters.downloadedBefore);
+  }
+  // Folder subtree match. local_path is "<slug>/assets/<sub…>/<file>" — the
+  // "/assets/" boundary is unique per path (slugs are single-segment), so a
+  // LIKE on "/assets/<folder>/" matches that folder's whole subtree regardless
+  // of which project/slug the row belongs to. LIKE metachars in the folder
+  // name are escaped so "my_clips" doesn't match "myXclips".
+  const folder = filters.folder?.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (folder) {
+    const esc = folder.replace(/[\\%_]/g, (c) => `\\${c}`);
+    where.push(`local_path LIKE ? ESCAPE '\\'`);
+    params.push(`%/assets/${esc}/%`);
+  }
+  // Media type by extension — the client's isImageFileName uses
+  // local_path ?? title, mirrored here via COALESCE.
+  if (filters.mediaType === "image" || filters.mediaType === "video" || filters.mediaType === "audio") {
+    const exts = [
+      ...(filters.mediaType === "image"
+        ? IMAGE_FILE_EXTENSIONS
+        : filters.mediaType === "audio"
+          ? AUDIO_FILE_EXTENSIONS
+          : VIDEO_FILE_EXTENSIONS),
+    ];
+    where.push(`(${exts.map(() => `lower(COALESCE(local_path, title, '')) LIKE ?`).join(" OR ")})`);
+    params.push(...exts.map((e) => `%${e}`));
   }
 
   const sortKey: AssetSortKey = filters.sort ?? "final_score_desc";

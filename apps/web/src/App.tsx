@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { api, ASSETS_CHANGED_EVENT, isMediaFile, type Project, type Task } from "./api.js";
+import { api, ASSETS_CHANGED_EVENT, isMediaFile, libraryDropTarget, type Project, type Task } from "./api.js";
 import { Dashboard } from "./pages/Dashboard.js";
 import { TimelinePage } from "./pages/Timeline.js";
 import { ShotReview } from "./pages/ShotReview.js";
@@ -8,6 +8,7 @@ import { Folders } from "./pages/Folders.js";
 import { LibraryPage } from "./pages/Library.js";
 import { ImportScript } from "./pages/ImportScript.js";
 import { MusicEdit } from "./pages/MusicEdit.js";
+import { Format } from "./pages/Format.js";
 import { Visualizer } from "./pages/Visualizer.js";
 import { WorldCam } from "./pages/WorldCam.js";
 import { TasksPanel } from "./components/TasksPanel.js";
@@ -23,6 +24,7 @@ type View =
   | { name: "library" }
   | { name: "import" }
   | { name: "music" }
+  | { name: "format" }
   | { name: "visualizer" }
   | { name: "world" }
   | { name: "help" };
@@ -35,6 +37,7 @@ const NAV_ITEMS: Array<{ key: View["name"]; label: string; icon: string; desc: s
   { key: "dashboard", label: "Dashboard", icon: "▣", desc: "Overview & actions" },
   { key: "library", label: "Library", icon: "⌕", desc: "Browse all assets — videos & images" },
   { key: "music", label: "Video Cutter", icon: "✂", desc: "Cut footage to a song's beats" },
+  { key: "format", label: "Format", icon: "◫", desc: "Reframe a video — 16:9, 9:16 or 1:1" },
   { key: "visualizer", label: "4D timeline", icon: "∿", desc: "Multi-stem waveform video renderer" },
   { key: "timeline", label: "3D timeline", icon: "▬", desc: "Shot schedule" },
   { key: "import", label: "Import Script", icon: "♪", desc: "Paste script to create shots + timeline" },
@@ -148,19 +151,24 @@ export default function App() {
     if (!files || files.length === 0) return;
     const media = [...files].filter(isMediaFile);
     if (media.length === 0) {
-      push("No video or image files in that drop (mp4, mov, webm, mkv, avi, m4v, jpg, png, webp…).", "error");
+      push("No video, image or audio files in that drop (mp4, mov, webm, mkv, avi, m4v, jpg, png, webp, mp3, wav…).", "error");
       return;
     }
     if (isAllProjects) {
       push("Select a specific project before dropping files — each project has its own assets folder.", "error");
       return;
     }
+    // When the Library is open, its selected sidebar folder is the drop
+    // target (published via libraryDropTarget); otherwise files are unfiled
+    // and land in uploads/unknown (the server-side default).
+    const dropFolder =
+      libraryDropTarget.projectId === activeProjectId ? libraryDropTarget.folder : null;
     setUploading({ done: 0, total: media.length, failed: 0 });
     let ok = 0;
     let failed = 0;
     for (const f of media) {
       try {
-        await api.uploadProjectAsset(activeProjectId, f);
+        await api.uploadProjectAsset(activeProjectId, f, dropFolder ?? undefined);
         ok++;
       } catch (e) {
         failed++;
@@ -171,7 +179,7 @@ export default function App() {
     setUploading(null);
     window.dispatchEvent(new Event(ASSETS_CHANGED_EVENT));
     if (failed === 0) {
-      push(`${ok} file${ok === 1 ? "" : "s"} added to ${activeProject?.name ?? "the project"}.`, "success");
+      push(`${ok} file${ok === 1 ? "" : "s"} added to ${dropFolder ? `${dropFolder} · ` : ""}${activeProject?.name ?? "the project"}.`, "success");
     } else {
       push(`${ok} uploaded, ${failed} failed — check the files and try again.`, failed === media.length ? "error" : "info");
     }
@@ -405,6 +413,13 @@ export default function App() {
                 <p>Select a specific project to use Video Cutter.</p>
               </div>
             )}
+            {view.name === "format" && !isAllProjects && <Format projectId={activeProjectId} onToast={push} />}
+            {view.name === "format" && isAllProjects && (
+              <div className="text-center py-20 text-slate-500">
+                <div className="text-4xl mb-3 opacity-40">◇</div>
+                <p>Select a specific project to use Format.</p>
+              </div>
+            )}
             {view.name === "visualizer" && !isAllProjects && <Visualizer projectId={activeProjectId} onToast={push} />}
             {view.name === "visualizer" && isAllProjects && (
               <div className="text-center py-20 text-slate-500">
@@ -432,10 +447,10 @@ export default function App() {
             <div className="text-lg font-semibold text-sky-300">
               {isAllProjects
                 ? "Select a project first"
-                : `Drop videos or images to add to ${activeProject?.name ?? "the project"}`}
+                : `Drop videos, images or audio to add to ${activeProject?.name ?? "the project"}`}
             </div>
             <div className="text-xs text-slate-400 mt-1">
-              Files land in the project's assets/uploads folder
+              Files land in assets/{libraryDropTarget.projectId === activeProjectId && libraryDropTarget.folder ? libraryDropTarget.folder : "uploads/unknown"}
             </div>
           </div>
         </div>

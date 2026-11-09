@@ -2,6 +2,8 @@
 // Visualizer routes — /api/visualizer/*
 //   GET    stems?project=            list project audio stems
 //   POST   stems?project=&name=      upload a stem (raw body)
+//   POST   stems/import?project=     { assetId } — copy a library audio asset
+//                                    into the stems pool (drag & drop files)
 //   DELETE stems/:name?project=      remove a stem
 //   POST   render?project=           { renderSettings, globalVisuals, stems }
 //   GET    render/:id                job progress / result
@@ -42,6 +44,7 @@ import {
   deleteStem,
   getRenderJob,
   getSplitJob,
+  importStemFromAsset,
   listRenders,
   listStems,
   MAX_SONG_BYTES,
@@ -86,6 +89,15 @@ export async function registerVisualizerRoutes(app: FastifyInstance): Promise<vo
       }
       return { job: await startSplitJob(projectOf(req.query), name, req.body, quality as VizSplitQuality) };
     });
+  });
+
+  // Copy a downloaded audio asset into the stems pool (JSON { assetId }) —
+  // lets a dragged-in mp3/wav become a Visualizer stem without a re-upload.
+  app.post("/api/visualizer/stems/import", async (req) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const assetId = typeof body.assetId === "string" ? body.assetId.trim() : "";
+    if (!assetId) throw new VisualizerError(400, "MISSING_ASSET", "assetId is required.");
+    return { stem: await importStemFromAsset(projectOf(req.query), assetId) };
   });
 
   app.delete("/api/visualizer/stems/:name", async (req) => {

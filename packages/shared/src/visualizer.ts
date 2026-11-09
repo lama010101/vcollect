@@ -183,7 +183,7 @@ function foldChromaKey<T extends { chromaKey?: VizChromaKeyConfig; key: VizVideo
 export const vizWaveParamsSchema = z.object({
   mode: vizModeSchema.default("ribbons"),
   waveformLengthSec: z.number().min(0.1).max(2).default(0.5),
-  globalAmplitude: z.number().min(0.1).max(3).default(1),
+  globalAmplitude: z.number().min(0.1).max(6).default(1),
   glowIntensity: z.number().min(0).max(40).default(14),
   /** Beat-randomized glow: when enabled, `glowIntensity` is overridden per
    *  beat cell by a deterministic hash → random value in [min,max]. */
@@ -207,12 +207,19 @@ export const vizWaveParamsSchema = z.object({
   /** `eqradial` hub radius as a fraction of min(w,h); 0 = bars start at
    *  the exact center point. */
   innerRadius: z.number().min(0).max(0.5).default(0.12),
+  /** `eqradial` arc span in degrees (1–360): the radial bars tile across
+   *  this much of the circle, centered on the top — 360 = full circle,
+   *  180 = a semi-circular dome over the center. */
+  arcDegrees: z.number().min(1).max(360).default(360),
   layout: vizLayoutSchema.default("radial"),
   centerConvergence: z
     .object({
       x: z.number().min(0).max(1).default(0.5),
       y: z.number().min(0).max(1).default(0.5),
       pulseSensitivity: z.number().min(0).max(2).default(0.8),
+      /** The pulsing light at the convergence point — users can switch it
+       *  off without losing the center position. */
+      star: z.boolean().default(true),
     })
     .default({}),
 });
@@ -230,6 +237,7 @@ export function waveParamsFromGlobals(g: VizWaveParams): VizWaveParams {
     autoGlow: { ...g.autoGlow },
     autoCenter: { ...g.autoCenter },
     innerRadius: g.innerRadius,
+    arcDegrees: g.arcDegrees,
     layout: g.layout,
     centerConvergence: { ...g.centerConvergence },
   };
@@ -1000,7 +1008,7 @@ export interface VizEqGroup {
 /** EQ-bars-radial mode: the same segmented LED columns as `eqbars`, bent
  *  around the convergence point — constant-angular-width quads radiating
  *  outward from the hub radius, brightening toward the outer tip, hot tip
- *  caps + glow flares, sparks drifting outward, luminous hub ring. */
+ *  caps + glow flares, sparks drifting outward. */
 export interface VizEqRadialGroup {
   /** Lit column segments — stride 9: quad [x,y]×4 + bright (0..1, 1 = tip
    *  end). Quads are polar cells [rA,rB]×[θ±ha], emitted inner-L, inner-R,
@@ -1012,8 +1020,6 @@ export interface VizEqRadialGroup {
   tipGlow: Float32Array;
   /** Sparks [x,y,r]×n drifting outward past the tips. */
   sparks: Float32Array;
-  /** Luminous hub ring at radius R0 — [cx,cy,r,lineWidth]. */
-  ring: Float32Array;
   color: string;
   tipColor: string;
   alpha: number;
@@ -2059,8 +2065,8 @@ function computeEqBars(
  *  constant-angular-width stack of segment quads from the hub radius R0
  *  outward (amplitude × maxLen), brightening toward the outer tip, ending
  *  in a hot cap with a glow flare and shedding sparks that drift outward.
- *  A luminous ring marks R0. Levels/colors/glow/activity are the exact
- *  `eqbars` math — only the placement changes. */
+ *  Levels/colors/glow/activity are the exact `eqbars` math — only the
+ *  placement changes. */
 function computeEqRadial(
   stems: FrameStem[],
   globals: VizWaveParams,
@@ -2077,12 +2083,17 @@ function computeEqRadial(
   const segH = Math.max(3, minDim * 0.011);
   const segGap = Math.max(1.4, segH * 0.32);
   const pitch = Math.max(9, minDim * 0.03); // tangential pitch (arc px at rMid)
-  const ringW = Math.max(1.5, segH * 0.22); // hub ring stroke width
   const rMid = R0 + maxLen / 2; // arc-length reference radius
-  const circ = Math.PI * 2 * rMid;
-  const cols = Math.max(6, Math.floor(circ / Math.max(1, stems.length) / pitch));
+  // Arc span: 360° keeps the historic full-circle tiling; smaller arcs are
+  // centered on the top of the circle (180° → a semi-circular dome).
+  const arcDeg = Math.min(360, Math.max(1, globals.arcDegrees));
+  const arc = (arcDeg * Math.PI) / 180;
+  const full = arcDeg >= 360;
+  const arcLen = arc * rMid;
+  const th0 = full ? -Math.PI / 2 : -Math.PI / 2 - arc / 2; // sweep start angle
+  const cols = Math.max(6, Math.floor(arcLen / Math.max(1, stems.length) / pitch));
   const total = cols * Math.max(1, stems.length);
-  const step = circ / total; // arc px per bar at rMid
+  const step = arcLen / total; // arc px per bar at rMid
   const colW = step * 0.72;
   const ha = colW / 2 / rMid; // angular half-width of a bar (radians)
   const maxSegs = Math.max(1, Math.floor(maxLen / (segH + segGap)));
@@ -2105,7 +2116,9 @@ function computeEqRadial(
       const h = lvl * amp;
       if (h < segH * 0.4) continue;
       const g = i * cols + c;
-      const th = -Math.PI / 2 + (g / total) * Math.PI * 2;
+      // Full circle: bars tile from the top exactly like before. Partial
+      // arc: centers are inset half a slot so both ends land symmetric.
+      const th = th0 + ((g + (full ? 0 : 0.5)) / total) * arc;
       const dx = Math.cos(th);
       const dy = Math.sin(th);
       const aL = th - ha;
@@ -2166,7 +2179,6 @@ function computeEqRadial(
       tips: Float32Array.from(tips),
       tipGlow: Float32Array.from(tipGlow),
       sparks: Float32Array.from(sparks),
-      ring: Float32Array.from([center.x, center.y, R0, ringW]),
       color: cfg.color,
       tipColor: mixHex(cfg.color, "#FFFFFF", 0.55),
       alpha: (audible ? 0.92 : 0.15) * act,
@@ -2478,7 +2490,10 @@ export function computeFrame(
     silks: primary?.silks ?? [],
     particles: primary?.particles ?? [],
     dancer: null,
-    star: { x: center.x, y: center.y, r: starR, alpha: Math.min(1, 0.55 + masterRms * 2.5) * envActivity(masterRms) },
+    // star.r = 0 → renderers skip the center light entirely (they only
+    // draw when r > 0.5); the anchor row's `centerConvergence.star` is the
+    // user-facing show/hide switch.
+    star: { x: center.x, y: center.y, r: anchor.centerConvergence.star ? starR : 0, alpha: Math.min(1, 0.55 + masterRms * 2.5) * envActivity(masterRms) },
     t,
   };
 

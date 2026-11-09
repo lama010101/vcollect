@@ -1,24 +1,56 @@
 // Thin fetch wrapper for the backend API.
 // Same-origin "/api" in dev (Vite proxy) and when the backend serves the SPA.
 // Set VITE_API_URL to point the deployed frontend at a hosted backend.
-import type { BeatAnalysis, EditPlan, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VisualizerSessionPayload, VizSession, VizSessionMeta, VizVideoKeyConfig, WorldCamRequest } from "@twio/shared";
+import type { BeatAnalysis, EditPlan, FormatAspect, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VisualizerSessionPayload, VizSession, VizSessionMeta, VizVideoKeyConfig, WorldCamRequest } from "@twio/shared";
 const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
 /** Fired on `window` after local uploads complete so asset lists (Folders,
  *  Music Edit library) refresh without a page reload. */
 export const ASSETS_CHANGED_EVENT = "twio:assets-changed";
 
+/** Custom drag MIME identifying a library asset being dragged between
+ *  folders — distinguishes internal drags from OS file drops ("Files"). */
+export const ASSET_DRAG_TYPE = "application/x-twio-asset-id";
+
+/** The Library's selected sidebar folder, published while the page is open
+ *  (mutable singleton — the window-level drop zone reads it at drop time).
+ *  When set and matching the active project, OS file drops upload into that
+ *  subfolder under <slug>/assets/ instead of the default uploads/unknown. */
+export const libraryDropTarget: { projectId: string | null; folder: string | null } = {
+  projectId: null,
+  folder: null,
+};
+
 // File-type helpers for drag & drop — mirror the server's accepted extension
-// sets (VIDEO_FILE_EXTENSIONS / IMAGE_FILE_EXTENSIONS in apps/server config).
+// sets (VIDEO_/IMAGE_/AUDIO_FILE_EXTENSIONS in apps/server config).
 export const VIDEO_FILE_RE = /\.(mp4|mov|webm|mkv|avi|m4v|mpg|mpeg)$/i;
 export const IMAGE_FILE_RE = /\.(jpe?g|png|webp|gif|avif|tiff?|svg)$/i;
+export const AUDIO_FILE_RE = /\.(mp3|wav|m4a|aac|flac|ogg|oga|opus)$/i;
 export const isVideoFile = (f: File) => f.type.startsWith("video/") || VIDEO_FILE_RE.test(f.name);
 export const isImageFile = (f: File) => f.type.startsWith("image/") || IMAGE_FILE_RE.test(f.name);
-export const isMediaFile = (f: File) => isVideoFile(f) || isImageFile(f);
+export const isAudioFile = (f: File) => f.type.startsWith("audio/") || AUDIO_FILE_RE.test(f.name);
+export const isMediaFile = (f: File) => isVideoFile(f) || isImageFile(f) || isAudioFile(f);
 /** True when a stored filename/path (e.g. asset.local_path) is an image —
  *  used to keep stills out of video-only surfaces (Music Edit sources,
  *  inline players). */
 export const isImageFileName = (name: string | null | undefined): boolean => !!name && IMAGE_FILE_RE.test(name);
+/** Same idea for video/audio — video-only surfaces (edit sources, layer
+ *  pickers) must exclude BOTH images and audio. */
+export const isVideoFileName = (name: string | null | undefined): boolean => !!name && VIDEO_FILE_RE.test(name);
+export const isAudioFileName = (name: string | null | undefined): boolean => !!name && AUDIO_FILE_RE.test(name);
+
+/** Folder an asset file lives in, relative to the project's assets/ dir —
+ *  derived from local_path ("<slug>/assets/<sub…>/file"). "" = the file sits
+ *  directly in assets/; null = no local file. */
+export function assetFolderPath(localPath: string | null | undefined): string | null {
+  if (!localPath) return null;
+  const rel = localPath.replace(/\\/g, "/");
+  const i = rel.indexOf("/assets/");
+  if (i < 0) return null;
+  const sub = rel.slice(i + "/assets/".length);
+  const slash = sub.lastIndexOf("/");
+  return slash >= 0 ? sub.slice(0, slash) : "";
+}
 
 /** Extract a human-readable error message from a failed fetch response. */
 async function errorMessage(r: Response, url: string): Promise<string> {
@@ -310,6 +342,11 @@ export interface AssetSearchFilters {
   discoveredBefore?: string;
   downloadedAfter?: string;
   downloadedBefore?: string;
+  /** Physical subfolder under <slug>/assets/ (e.g. "uploads/nature") — matches
+   *  the whole subtree. Undefined/empty = every folder. */
+  folder?: string;
+  /** "image" | "video" — by file extension. Undefined = every type. */
+  mediaType?: string;
   sort?: AssetSortKey;
   limit?: number;
 }
@@ -463,6 +500,24 @@ export interface FoldersResponse {
   projectId: string;
 }
 
+// Physical folder tree of a project's assets folder (<slug>/assets/) — from
+// GET /api/assets/folder-tree. Flat DFS list, parents before children.
+export interface AssetFolderEntry {
+  /** Path relative to <slug>/assets/ using "/" ("" = the assets root). */
+  path: string;
+  name: string;
+  depth: number;
+  /** Media files directly in this folder. */
+  fileCount: number;
+  /** Media files in this folder + all descendant folders. */
+  subtreeCount: number;
+}
+export interface AssetFolderTree {
+  projectId: string;
+  assetsRoot: string;
+  folders: AssetFolderEntry[];
+}
+
 // --- Projects (multi-project) ---
 export interface ProjectCounts {
   shotCount: number;
@@ -470,6 +525,7 @@ export interface ProjectCounts {
   downloadedCount: number;
   videoCount: number;
   imageCount: number;
+  audioCount?: number;
 }
 export interface Project {
   id: string;
@@ -546,6 +602,22 @@ export interface MusicEditRequest {
   song: string;
   assetIds: string[];
   settings: Partial<MusicEditSettings>;
+}
+
+// --- Format (aspect-ratio reframe) ---------------------------------------------
+export interface FormatResult {
+  name: string;
+  url: string;
+  sizeBytes: number;
+  width: number;
+  height: number;
+  durationSeconds: number | null;
+}
+export interface FormatRenderedFile {
+  name: string;
+  url: string;
+  sizeBytes: number;
+  createdAt: string;
 }
 
 // --- Visualizer (multi-stem waveform renderer) --------------------------------
@@ -787,6 +859,8 @@ export const api = {
     if (filters.discoveredBefore) params.set("discoveredBefore", filters.discoveredBefore);
     if (filters.downloadedAfter) params.set("downloadedAfter", filters.downloadedAfter);
     if (filters.downloadedBefore) params.set("downloadedBefore", filters.downloadedBefore);
+    if (filters.folder) params.set("folder", filters.folder);
+    if (filters.mediaType) params.set("mediaType", filters.mediaType);
     if (filters.sort) params.set("sort", filters.sort);
     if (filters.limit != null) params.set("limit", String(filters.limit));
     if (projectId) params.set("project", projectId);
@@ -821,18 +895,27 @@ export const api = {
   revealAssetsFolder: (projectId?: string) =>
     postJson<{ ok: boolean; error?: string }>(withProject("/api/folders/reveal", projectId)),
   // --- Local video upload (drag & drop) — the file lands in the project's
-  // own assets folder (OUTPUT_ROOT/<slug>/assets/uploads/). ---
-  uploadProjectAsset: (projectId: string, file: File) =>
+  // own assets folder (default OUTPUT_ROOT/<slug>/assets/uploads/unknown/;
+  // `folder` — a path relative to that assets dir — overrides it). ---
+  uploadProjectAsset: (projectId: string, file: File, folder?: string) =>
     postBinary<{ assetId: string; filename: string; localPath: string; sizeBytes: number; alreadyUploaded: boolean; asset: Asset | null }>(
-      `/api/assets/upload?project=${encodeURIComponent(projectId)}&name=${encodeURIComponent(file.name)}`,
+      `/api/assets/upload?project=${encodeURIComponent(projectId)}&name=${encodeURIComponent(file.name)}${folder ? `&folder=${encodeURIComponent(folder)}` : ""}`,
       file,
     ),
+  // Move an asset's file into another folder inside the project's assets dir
+  // ("" = the assets root) — the Library's drag-onto-folder gesture.
+  moveAssetToFolder: (assetId: string, folder: string) =>
+    postJson<{ assetId: string; localPath: string; folder: string }>(`/api/assets/${encodeURIComponent(assetId)}/move`, { folder }),
   // Register video files found on disk inside the project's assets folder —
   // everything in <slug>/assets/ must be visible no matter how it got there.
   syncProjectAssets: (projectId: string) =>
     postJson<{ scanned: number; added: number; moved: number; missing: number; known: number; skipped: number }>(
       `/api/assets/sync?project=${encodeURIComponent(projectId)}`,
     ),
+  // Real folder tree of the project's assets folder — every directory on disk
+  // (incl. user-made/empty subfolders) with media file counts. Library nav.
+  folderTree: (projectId: string) =>
+    getJson<AssetFolderTree>(withProject("/api/assets/folder-tree", projectId)),
   setAssetReady: (id: string, ready: boolean) =>
     postJson<{ ok: boolean; id: string; ready: boolean }>(`/api/assets/${id}/ready`, { ready }),
   setAssetRating: (id: string, rating: number | null) =>
@@ -872,6 +955,9 @@ export const api = {
   musicSongs: (projectId: string) => getJson<{ songs: MusicSong[] }>(withProject("/api/music-edit/songs", projectId)),
   uploadMusicSong: (projectId: string, file: File) =>
     postBinary<{ song: MusicSong }>(withProject(`/api/music-edit/songs?name=${encodeURIComponent(file.name)}`, projectId), file),
+  // Copy a library audio asset (drag & drop / folder sync) into the song pool.
+  importMusicSong: (projectId: string, assetId: string) =>
+    postJson<{ song: MusicSong }>(withProject("/api/music-edit/songs/import", projectId), { assetId }),
   analyzeMusicSong: (projectId: string, song: string) =>
     postJson<{ analysis: MusicAnalysis }>(withProject("/api/music-edit/analyze", projectId), { song }),
   planMusicEdit: (projectId: string, req: MusicEditRequest) =>
@@ -887,10 +973,30 @@ export const api = {
     postJson<{ ok: boolean; error?: string }>(
       withProject(`/api/music-edit/reveal${name ? `?name=${encodeURIComponent(name)}` : ""}`, projectId),
     ),
+  // Reuse a saved 4D-timeline session: restores its media, copies its stems
+  // into the songs pool and returns the layer videos as an ordered list.
+  musicEditImportSession: (projectId: string, sessionId: string) =>
+    postJson<{ session: VizSessionMeta; songs: string[]; assets: Asset[]; warnings: string[] }>(
+      withProject("/api/music-edit/import-session", projectId),
+      { sessionId },
+    ),
+  // --- Format (aspect-ratio reframe: 16:9 / 9:16 / 1:1) ---
+  formatConvert: (projectId: string, body: { assetId: string; aspect: FormatAspect; start?: number; end?: number }) =>
+    postJson<{ file: FormatResult }>(withProject("/api/format/convert", projectId), body),
+  formatRenders: (projectId: string) => getJson<{ renders: FormatRenderedFile[] }>(withProject("/api/format/renders", projectId)),
+  // Open the format folder (a converted file selected when `name` is given)
+  // in the OS file explorer.
+  formatReveal: (projectId: string, name?: string) =>
+    postJson<{ ok: boolean; error?: string }>(
+      withProject(`/api/format/reveal${name ? `?name=${encodeURIComponent(name)}` : ""}`, projectId),
+    ),
   // --- Visualizer ---
   vizStems: (projectId: string) => getJson<{ stems: VizStem[] }>(withProject("/api/visualizer/stems", projectId)),
   vizUploadStem: (projectId: string, file: File) =>
     postBinary<{ stem: VizStem }>(withProject(`/api/visualizer/stems?name=${encodeURIComponent(file.name)}`, projectId), file),
+  // Copy a library audio asset (drag & drop / folder sync) into the stems pool.
+  vizImportStem: (projectId: string, assetId: string) =>
+    postJson<{ stem: VizStem }>(withProject("/api/visualizer/stems/import", projectId), { assetId }),
   vizDeleteStem: (projectId: string, name: string) =>
     deleteJson<{ ok: boolean; name: string }>(withProject(`/api/visualizer/stems/${encodeURIComponent(name)}`, projectId)),
   vizRender: (projectId: string, req: VisualizerRenderRequest) =>

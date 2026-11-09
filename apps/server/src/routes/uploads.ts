@@ -1,18 +1,22 @@
 // =============================================================================
-// Local media uploads — drag & drop files (videos AND images) onto the webapp
-// land here.
+// Local media uploads — drag & drop files (videos, images AND audio) onto the
+// webapp land here.
 //
-// POST /api/assets/upload?project=<id>&name=<filename> with the raw file as
-// the request body (Content-Type: application/octet-stream, video/* or
-// image/*). The request body is STREAMED to a temp file (hashed in-flight,
-// byte-capped) — multi-hundred-MB uploads never sit in memory. The file is
-// then validated (extension + real content — ffprobe for videos, sharp
-// metadata for images) and moved into the target project's dedicated assets
-// folder:
-//   OUTPUT_ROOT/<slug>/assets/uploads/<filename>
+// POST /api/assets/upload?project=<id>&name=<filename>[&folder=<sub>] with
+// the raw file as the request body (Content-Type: application/octet-stream,
+// video/*, image/* or audio/*). The request body is STREAMED to a temp file
+// (hashed in-flight, byte-capped) — multi-hundred-MB uploads never sit in
+// memory. The file is then validated (extension + real content — ffprobe for
+// videos, sharp metadata for images, ffprobe audio stream for audio) and moved
+// into the target project's dedicated assets folder:
+//   OUTPUT_ROOT/<slug>/assets/<folder>/<filename>
+// where <folder> defaults to uploads/unknown (unfiled drops). The optional
+// `folder` param is a path relative to <slug>/assets/ — the Library sends its
+// selected sidebar folder so drops land exactly where the user targeted.
 // A 'local'-provider asset row is created so the upload shows up in Folders
 // (Uploads section); video uploads also appear in the Music Edit source
-// library.
+// library, and audio uploads can be imported into the Music Edit song pool
+// or the Visualizer stem pool from their pages.
 // =============================================================================
 
 import type { FastifyInstance } from "fastify";
@@ -23,13 +27,13 @@ import { basename, dirname, extname, join, resolve } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import sharp from "sharp";
-import { config, IMAGE_FILE_EXTENSIONS, OUTPUT_ROOT, projectAssetDir, VIDEO_FILE_EXTENSIONS } from "../config.js";
+import { AUDIO_FILE_EXTENSIONS, config, IMAGE_FILE_EXTENSIONS, OUTPUT_ROOT, projectPaths, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { getProject } from "../db/projectRepository.js";
 import { db } from "../db/client.js";
 import { getAsset, insertLocalAsset } from "../db/repository.js";
-import { syncProjectAssets } from "../db/assetSync.js";
-import { isPlayableVideo, probe } from "../video/ffprobe.js";
-import { generateImageThumbnail, generateThumbnail } from "../video/thumbnails.js";
+import { listAssetFolders, sanitizeAssetFolder, syncProjectAssets } from "../db/assetSync.js";
+import { isPlayableVideo, probe, probeAudio } from "../video/ffprobe.js";
+import { generateAudioThumbnail, generateImageThumbnail, generateThumbnail } from "../video/thumbnails.js";
 import { PROJECT_ID_ALL, DEFAULT_PROJECT_ID } from "@twio/shared";
 
 /** Video file extensions accepted for upload (canonical set in config.ts). */
@@ -38,13 +42,18 @@ export const VIDEO_EXTENSIONS: ReadonlySet<string> = VIDEO_FILE_EXTENSIONS;
 /** Image file extensions accepted for upload (canonical set in config.ts). */
 export const IMAGE_EXTENSIONS: ReadonlySet<string> = IMAGE_FILE_EXTENSIONS;
 
-export type MediaKind = "video" | "image";
+/** Audio file extensions accepted for upload (canonical set in config.ts —
+ *  the same list the Music Edit / Visualizer audio pools accept). */
+export const AUDIO_EXTENSIONS: ReadonlySet<string> = AUDIO_FILE_EXTENSIONS;
 
-/** Classify an extension (with leading dot, any case) as video/image. */
+export type MediaKind = "video" | "image" | "audio";
+
+/** Classify an extension (with leading dot, any case) as video/image/audio. */
 export function mediaKindForExt(ext: string): MediaKind | null {
   const e = ext.toLowerCase();
   if (VIDEO_FILE_EXTENSIONS.has(e)) return "video";
   if (IMAGE_FILE_EXTENSIONS.has(e)) return "image";
+  if (AUDIO_FILE_EXTENSIONS.has(e)) return "audio";
   return null;
 }
 
@@ -100,6 +109,10 @@ function isStagedUpload(body: unknown): body is StagedUpload {
   );
 }
 
+/** Default drop folder (relative to <slug>/assets/) — unfiled files land
+ *  here; drops that target a specific folder pass `?folder=` instead. */
+export const DEFAULT_UPLOAD_FOLDER = "uploads/unknown";
+
 /**
  * Persist an uploaded video or image into a project's dedicated assets
  * folder. `data` is either a Buffer (tests / in-memory callers — hashed and
@@ -112,6 +125,7 @@ export async function saveUploadedFile(
   projectId: string,
   rawName: string,
   data: Buffer | StagedUpload,
+  folder?: string,
 ): Promise<UploadResult> {
   const err = (statusCode: number, message: string): Error =>
     Object.assign(new Error(message), { statusCode });
@@ -133,7 +147,7 @@ export async function saveUploadedFile(
   const kind = mediaKindForExt(ext);
   if (!kind) {
     cleanupTmp();
-    throw err(415, `unsupported file type "${ext || "(none)"}" — allowed: ${[...VIDEO_EXTENSIONS, ...IMAGE_EXTENSIONS].join(", ")}`);
+    throw err(415, `unsupported file type "${ext || "(none)"}" — allowed: ${[...VIDEO_EXTENSIONS, ...IMAGE_EXTENSIONS, ...AUDIO_EXTENSIONS].join(", ")}`);
   }
   const sizeBytes = Buffer.isBuffer(data) ? data.length : data.sizeBytes;
   if (sizeBytes === 0) {
@@ -145,7 +159,15 @@ export async function saveUploadedFile(
   // staged path reuses the digest computed while streaming — no re-hash.
   const sha256 = Buffer.isBuffer(data) ? createHash("sha256").update(data).digest("hex") : data.sha256;
   const assetId = `LOCAL_${project.id}_${sha256.slice(0, 16)}`;
-  const uploadsDir = projectAssetDir(project.slug, "uploads");
+
+  // Destination: the requested subfolder under <slug>/assets/, or the default
+  // unfiled folder (uploads/unknown). Invalid folder input → 400, never a
+  // silent escape outside the assets dir.
+  const relFolder = folder == null ? DEFAULT_UPLOAD_FOLDER : sanitizeAssetFolder(folder);
+  if (relFolder == null || relFolder === "") {
+    throw err(400, `invalid folder "${folder}"`);
+  }
+  const destDir = resolve(projectPaths(project.slug).assets, relFolder);
 
   const existing = getAsset(assetId);
   if (existing?.local_path) {
@@ -165,18 +187,18 @@ export async function saveUploadedFile(
   let destAbs: string;
   if (existing?.local_path) {
     const base = basename(existing.local_path);
-    destAbs = join(uploadsDir, base);
+    destAbs = join(destDir, base);
     if (destAbs !== resolve(OUTPUT_ROOT, existing.local_path) && existsSync(destAbs)) {
-      destAbs = uniqueDest(uploadsDir, base);
+      destAbs = uniqueDest(destDir, base);
     }
-    localPath = `${project.slug}/assets/uploads/${basename(destAbs)}`;
+    localPath = `${project.slug}/assets/${relFolder}/${basename(destAbs)}`;
     if (localPath !== existing.local_path) {
       db.prepare(`UPDATE assets SET local_path = ? WHERE id = ?`).run(localPath, assetId);
     }
   } else {
-    destAbs = join(uploadsDir, filename);
-    if (existsSync(destAbs)) destAbs = uniqueDest(uploadsDir, filename);
-    localPath = `${project.slug}/assets/uploads/${basename(destAbs)}`;
+    destAbs = join(destDir, filename);
+    if (existsSync(destAbs)) destAbs = uniqueDest(destDir, filename);
+    localPath = `${project.slug}/assets/${relFolder}/${basename(destAbs)}`;
   }
   mkdirSync(dirname(destAbs), { recursive: true });
   if (Buffer.isBuffer(data)) {
@@ -218,6 +240,15 @@ export async function saveUploadedFile(
       try { rmSync(destAbs, { force: true }); } catch { /* ignore */ }
       throw err(422, `"${filename}" is not a readable image file`);
     }
+  } else if (kind === "audio") {
+    // Never trust the extension — verify ffprobe finds a real audio stream.
+    try {
+      const a = await probeAudio(destAbs);
+      durationSeconds = a.durationSeconds;
+    } catch {
+      try { rmSync(destAbs, { force: true }); } catch { /* ignore */ }
+      throw err(422, `"${filename}" is not a readable audio file`);
+    }
   } else {
     // Never trust the extension — verify it's a real video container.
     if (!(await isPlayableVideo(destAbs))) {
@@ -255,7 +286,12 @@ export async function saveUploadedFile(
   });
 
   // Thumbnail is best-effort — never fail the upload over it.
-  await (kind === "image" ? generateImageThumbnail(destAbs, assetId) : generateThumbnail(destAbs, assetId)).catch(() => null);
+  await (kind === "image"
+    ? generateImageThumbnail(destAbs, assetId)
+    : kind === "audio"
+      ? generateAudioThumbnail(destAbs, assetId)
+      : generateThumbnail(destAbs, assetId)
+  ).catch(() => null);
 
   return { assetId, filename: basename(destAbs), localPath, sizeBytes, alreadyUploaded: false };
 }
@@ -288,18 +324,33 @@ export async function registerUploadRoutes(app: FastifyInstance): Promise<void> 
     return syncProjectAssets(projectId);
   });
 
+  // Real folder tree of the project's assets folder (<slug>/assets/) — every
+  // directory on disk (including empty user-made subfolders) with media file
+  // counts. Drives the Library's folder nav; combined with the `folder`
+  // search filter (subtree match) to show one branch of the library.
+  app.get("/api/assets/folder-tree", async (req, reply) => {
+    const q = req.query as Record<string, unknown>;
+    const projectId = String(q.project ?? DEFAULT_PROJECT_ID).trim();
+    if (projectId === PROJECT_ID_ALL) {
+      return reply.code(400).send({ error: "folder tree needs a specific project" });
+    }
+    const project = getProject(projectId);
+    if (!project || project.isVirtual) return reply.code(404).send({ error: "project not found" });
+    return listAssetFolders(projectId);
+  });
+
   await app.register(async (scope) => {
     // Raw file body, streamed to a temp file. No `parseAs` — Fastify hands the
     // parser the raw request stream, so multi-hundred-MB uploads never sit in
     // memory. The size cap (same limit as provider downloads) is enforced by
     // the byte-counting transform below — Fastify's `bodyLimit` option only
     // applies to string/buffer parsers. The webapp always sends
-    // application/octet-stream; video/* + image/* are matched by RegExp
-    // (Fastify doesn't treat "video/*" strings as wildcards) so direct API
-    // callers can send a proper media type.
+    // application/octet-stream; video/* + image/* + audio/* are matched by
+    // RegExp (Fastify doesn't treat "video/*" strings as wildcards) so direct
+    // API callers can send a proper media type.
     const uploadByteLimit = config.maxDownloadMb * 1024 * 1024;
     scope.addContentTypeParser(
-      /^application\/octet-stream$|^video\/|^image\//,
+      /^application\/octet-stream$|^video\/|^image\/|^audio\//,
       (_req, body, done) => {
         const tmpPath = join(tmpdir(), `twio-upload-${randomUUID()}`);
         const hash = createHash("sha256");
@@ -335,6 +386,7 @@ export async function registerUploadRoutes(app: FastifyInstance): Promise<void> 
       const q = req.query as Record<string, unknown>;
       const projectId = String(q.project ?? DEFAULT_PROJECT_ID).trim();
       const name = String(q.name ?? "upload.mp4");
+      const folder = typeof q.folder === "string" ? q.folder : undefined;
       const staged = isStagedUpload(req.body) ? req.body : null;
       if (projectId === PROJECT_ID_ALL) {
         if (staged) { try { rmSync(staged.tmpPath, { force: true }); } catch { /* ignore */ } }
@@ -343,7 +395,7 @@ export async function registerUploadRoutes(app: FastifyInstance): Promise<void> 
       if (!staged) {
         return reply.code(400).send({ error: "send the file as the raw request body" });
       }
-      const result = await saveUploadedFile(projectId, name, staged);
+      const result = await saveUploadedFile(projectId, name, staged, folder);
       return reply.code(result.alreadyUploaded ? 200 : 201).send({
         ...result,
         asset: getAsset(result.assetId) ?? null,

@@ -29,10 +29,12 @@ import {
   type VisualizerSessionPayload,
   type VizMediaLayerConfig,
 } from "@twio/shared";
-import { projectAssetDir } from "../config.js";
+import { projectAssetDir, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { sha256File, syncProjectAssets } from "../db/assetSync.js";
 import { db } from "../db/client.js";
 import { getProject } from "../db/projectRepository.js";
+import type { AssetRow } from "../db/schema.js";
+import { projectMusicDir, sanitizeSongName } from "../musicEdit/service.js";
 import {
   addAssetToShot,
   createShot,
@@ -496,4 +498,57 @@ export async function sessionToTimeline(projectId: string, id: string): Promise<
     }
   });
   return { timelineId: tlId, name, shotsCreated, durationSeconds: round(mix) };
+}
+
+export interface SessionMusicEditResult {
+  session: VizSessionMeta;
+  /** Session stems copied into the project's songs pool (song-selectable). */
+  songs: string[];
+  /** Ordered, de-duplicated video assets from the session's media layers. */
+  assets: AssetRow[];
+  warnings: string[];
+}
+
+/**
+ * Reuse a session on the Video Cutter page — restores the session (stems back
+ * into the pool, missing media re-registered via loadSession), then:
+ *  - every payload stem is copied into music_edit/songs/ (skipped when the
+ *    same bytes are already there) so the song dropdown can pick them;
+ *  - the media layers become the ordered source list — top→bottom as listed
+ *    in the layer panel, videos only (images can't be cut sources), each
+ *    asset once (the EDL requires unique ids) and only while the file exists.
+ */
+export async function sessionToMusicEdit(projectId: string, id: string): Promise<SessionMusicEditResult> {
+  const { session, payload, warnings } = await loadSession(projectId, id);
+  const warns = [...warnings];
+
+  const songsDir = projectMusicDir(projectId, "songs");
+  const songs: string[] = [];
+  for (const s of payload.stems) {
+    try {
+      const src = stemPath(projectId, s.name); // pool copy — just restored
+      const name = sanitizeSongName(s.name);
+      const dst = join(songsDir, name);
+      if (!existsSync(dst) || (await sha256File(dst)) !== (await sha256File(src))) {
+        copyFileSync(src, dst);
+      }
+      songs.push(name);
+    } catch (e) {
+      warns.push(`Stem "${s.name}" could not be imported as a song: ${(e as Error).message}`);
+    }
+  }
+
+  const assets: AssetRow[] = [];
+  const seen = new Set<string>();
+  for (const l of [...payload.globalVisuals.video.layers].reverse()) {
+    if (l.kind !== "media" || seen.has(l.assetId)) continue;
+    const a = getAsset(l.assetId);
+    if (!a || a.project_id !== projectId || !a.local_path) continue;
+    if (!VIDEO_FILE_EXTENSIONS.has(extname(a.local_path).toLowerCase())) continue;
+    if (!existsSync(assetAbsolutePath(a.local_path))) continue;
+    seen.add(l.assetId);
+    assets.push(a);
+  }
+  if (assets.length === 0) warns.push(`Session "${session.name}" has no usable video layers.`);
+  return { session, songs, assets, warnings: warns };
 }

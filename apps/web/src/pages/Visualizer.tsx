@@ -8,6 +8,7 @@ import {
   isStemAudible,
   keyVideoFrame,
   resolveStem,
+  STEM_KIND_DEFAULTS,
   STEM_KINDS,
   VIZ_CUTOUT_MODELS,
   VIZ_MAX_VIDEO_LAYERS,
@@ -44,8 +45,11 @@ import {
 import {
   api,
   ASSETS_CHANGED_EVENT,
+  assetFolderPath,
+  isAudioFileName,
   isImageFileName,
   type Asset,
+  type AssetFolderEntry,
   type EngineStatus,
   type VizKeyJob,
   type VizRenderJob,
@@ -87,13 +91,18 @@ const DEFAULT_GLOBALS: VisualizerGlobals = {
   autoCenter: { enabled: false, range: 0.18 },
   backgroundColor: "#050508",
   innerRadius: 0.12,
+  arcDegrees: 360,
   layout: "radial",
   video: { layers: [vizVisualsLayer()] },
   dancer: { enabled: false, style: "neon", scale: 1, intensity: 1, colorMode: "stems", color: "#FFFFFF" },
-  centerConvergence: { x: 0.5, y: 0.5, pulseSensitivity: 0.8 },
+  centerConvergence: { x: 0.5, y: 0.5, pulseSensitivity: 0.8, star: true },
 };
 
 const DEFAULT_RENDER = { width: 1920, height: 1080, fps: 30 };
+
+/** Schema defaults for the wave-param sliders — every slider's ↺ reset
+ *  target, parsed once from `vizWaveParamsSchema` so they can't drift. */
+const WAVE_DEFAULTS = vizWaveParamsSchema.parse({});
 
 const MODES: Array<{ value: VizMode; label: string; needsEngine?: boolean }> = [
   { value: "ribbons", label: "Ribbons — waveforms converging to the center" },
@@ -344,6 +353,22 @@ function DualRange({
   );
 }
 
+/** ↺ reset-to-default button for a slider. Dims while the value already sits
+ *  at its default (still clickable — a harmless no-op). */
+function SliderReset({ atDefault, onReset, disabled, title }: { atDefault: boolean; onReset: () => void; disabled?: boolean; title: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onReset}
+      disabled={disabled}
+      title={title}
+      className={`shrink-0 px-0.5 text-[11px] leading-none disabled:opacity-30 ${atDefault ? "text-slate-700" : "text-slate-500 hover:text-sky-400"}`}
+    >
+      ↺
+    </button>
+  );
+}
+
 // --- Stem strips ---------------------------------------------------------------
 
 const WAVE_COLS = 140;
@@ -521,17 +546,34 @@ function WaveLookControls({ p, onChange, engine }: { p: VizWaveParams; onChange:
         {p.mode === "eqradial" && (
           <>
             <label className="block text-xs text-slate-400 pt-2">Inner radius: {Math.round(p.innerRadius * 100)}%</label>
-            <input type="range" min={0} max={0.5} step={0.01} value={p.innerRadius} className="w-full" onChange={(e) => onChange({ innerRadius: Number(e.target.value) })} />
+            <div className="flex items-center gap-1">
+              <input type="range" min={0} max={0.5} step={0.01} value={p.innerRadius} className="w-full" onChange={(e) => onChange({ innerRadius: Number(e.target.value) })} />
+              <SliderReset atDefault={p.innerRadius === WAVE_DEFAULTS.innerRadius} onReset={() => onChange({ innerRadius: WAVE_DEFAULTS.innerRadius })} title={`Reset to default (${Math.round(WAVE_DEFAULTS.innerRadius * 100)}%)`} />
+            </div>
+            <label className="block text-xs text-slate-400 pt-2">Arc: {Math.round(p.arcDegrees)}°</label>
+            <div className="flex items-center gap-1">
+              <input type="range" min={1} max={360} step={1} value={p.arcDegrees} className="w-full" onChange={(e) => onChange({ arcDegrees: Number(e.target.value) })} />
+              <SliderReset atDefault={p.arcDegrees === WAVE_DEFAULTS.arcDegrees} onReset={() => onChange({ arcDegrees: WAVE_DEFAULTS.arcDegrees })} title={`Reset to default (${WAVE_DEFAULTS.arcDegrees}°)`} />
+            </div>
           </>
         )}
       </div>
       <div className="space-y-2">
         <label className="block text-xs text-slate-400">Waveform window: {p.waveformLengthSec.toFixed(2)} s</label>
-        <input type="range" min={0.1} max={2} step={0.05} value={p.waveformLengthSec} className="w-full" onChange={(e) => onChange({ waveformLengthSec: Number(e.target.value) })} />
+        <div className="flex items-center gap-1">
+          <input type="range" min={0.1} max={2} step={0.05} value={p.waveformLengthSec} className="w-full" onChange={(e) => onChange({ waveformLengthSec: Number(e.target.value) })} />
+          <SliderReset atDefault={p.waveformLengthSec === WAVE_DEFAULTS.waveformLengthSec} onReset={() => onChange({ waveformLengthSec: WAVE_DEFAULTS.waveformLengthSec })} title={`Reset to default (${WAVE_DEFAULTS.waveformLengthSec.toFixed(2)} s)`} />
+        </div>
         <label className="block text-xs text-slate-400">Global amplitude: {p.globalAmplitude.toFixed(2)}×</label>
-        <input type="range" min={0.1} max={3} step={0.05} value={p.globalAmplitude} className="w-full" onChange={(e) => onChange({ globalAmplitude: Number(e.target.value) })} />
+        <div className="flex items-center gap-1">
+          <input type="range" min={0.1} max={6} step={0.05} value={p.globalAmplitude} className="w-full" onChange={(e) => onChange({ globalAmplitude: Number(e.target.value) })} />
+          <SliderReset atDefault={p.globalAmplitude === WAVE_DEFAULTS.globalAmplitude} onReset={() => onChange({ globalAmplitude: WAVE_DEFAULTS.globalAmplitude })} title={`Reset to default (${WAVE_DEFAULTS.globalAmplitude.toFixed(2)}×)`} />
+        </div>
         <label className={`block text-xs ${p.autoGlow.enabled ? "text-slate-600" : "text-slate-400"}`}>Glow: {p.glowIntensity.toFixed(0)}</label>
-        <input type="range" min={0} max={40} step={1} value={p.glowIntensity} disabled={p.autoGlow.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ glowIntensity: Number(e.target.value) })} />
+        <div className="flex items-center gap-1">
+          <input type="range" min={0} max={40} step={1} value={p.glowIntensity} disabled={p.autoGlow.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ glowIntensity: Number(e.target.value) })} />
+          <SliderReset atDefault={p.glowIntensity === WAVE_DEFAULTS.glowIntensity} disabled={p.autoGlow.enabled} onReset={() => onChange({ glowIntensity: WAVE_DEFAULTS.glowIntensity })} title={`Reset to default (${WAVE_DEFAULTS.glowIntensity.toFixed(0)})`} />
+        </div>
         <div className="pt-1 space-y-1.5">
           <div className="flex items-center justify-between gap-2">
             <label className="text-xs text-slate-400">Glow range: {p.autoGlow.min.toFixed(0)}–{p.autoGlow.max.toFixed(0)}</label>
@@ -544,14 +586,23 @@ function WaveLookControls({ p, onChange, engine }: { p: VizWaveParams; onChange:
               Auto
             </Button>
           </div>
-          <DualRange
-            min={0}
-            max={40}
-            step={1}
-            lo={p.autoGlow.min}
-            hi={p.autoGlow.max}
-            onChange={(lo, hi) => onChange({ autoGlow: { ...p.autoGlow, min: lo, max: hi } })}
-          />
+          <div className="flex items-center gap-1">
+            <div className="flex-1">
+              <DualRange
+                min={0}
+                max={40}
+                step={1}
+                lo={p.autoGlow.min}
+                hi={p.autoGlow.max}
+                onChange={(lo, hi) => onChange({ autoGlow: { ...p.autoGlow, min: lo, max: hi } })}
+              />
+            </div>
+            <SliderReset
+              atDefault={p.autoGlow.min === WAVE_DEFAULTS.autoGlow.min && p.autoGlow.max === WAVE_DEFAULTS.autoGlow.max}
+              onReset={() => onChange({ autoGlow: { ...p.autoGlow, min: WAVE_DEFAULTS.autoGlow.min, max: WAVE_DEFAULTS.autoGlow.max } })}
+              title={`Reset to default (${WAVE_DEFAULTS.autoGlow.min.toFixed(0)}–${WAVE_DEFAULTS.autoGlow.max.toFixed(0)})`}
+            />
+          </div>
           {p.autoGlow.enabled && (
             <p className="text-[10px] text-slate-500">Auto is on — glow jumps to a random value in this range on every beat (overrides the slider above).</p>
           )}
@@ -571,16 +622,34 @@ function WaveLookControls({ p, onChange, engine }: { p: VizWaveParams; onChange:
             </Button>
           </div>
           <label className={`block text-xs ${p.autoCenter.enabled ? "text-slate-600" : "text-slate-400"}`}>Center X: {p.centerConvergence.x.toFixed(2)}</label>
-          <input type="range" min={0} max={1} step={0.01} value={p.centerConvergence.x} disabled={p.autoCenter.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ centerConvergence: { ...p.centerConvergence, x: Number(e.target.value) } })} />
+          <div className="flex items-center gap-1">
+            <input type="range" min={0} max={1} step={0.01} value={p.centerConvergence.x} disabled={p.autoCenter.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ centerConvergence: { ...p.centerConvergence, x: Number(e.target.value) } })} />
+            <SliderReset atDefault={p.centerConvergence.x === WAVE_DEFAULTS.centerConvergence.x} disabled={p.autoCenter.enabled} onReset={() => onChange({ centerConvergence: { ...p.centerConvergence, x: WAVE_DEFAULTS.centerConvergence.x } })} title={`Reset to default (${WAVE_DEFAULTS.centerConvergence.x.toFixed(2)})`} />
+          </div>
           <label className={`block text-xs ${p.autoCenter.enabled ? "text-slate-600" : "text-slate-400"}`}>Center Y: {p.centerConvergence.y.toFixed(2)}</label>
-          <input type="range" min={0} max={1} step={0.01} value={p.centerConvergence.y} disabled={p.autoCenter.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ centerConvergence: { ...p.centerConvergence, y: Number(e.target.value) } })} />
+          <div className="flex items-center gap-1">
+            <input type="range" min={0} max={1} step={0.01} value={p.centerConvergence.y} disabled={p.autoCenter.enabled} className="w-full disabled:opacity-40" onChange={(e) => onChange({ centerConvergence: { ...p.centerConvergence, y: Number(e.target.value) } })} />
+            <SliderReset atDefault={p.centerConvergence.y === WAVE_DEFAULTS.centerConvergence.y} disabled={p.autoCenter.enabled} onReset={() => onChange({ centerConvergence: { ...p.centerConvergence, y: WAVE_DEFAULTS.centerConvergence.y } })} title={`Reset to default (${WAVE_DEFAULTS.centerConvergence.y.toFixed(2)})`} />
+          </div>
           {p.autoCenter.enabled && (
             <>
               <label className="block text-xs text-slate-400 pt-1">Motion range: {Math.round(p.autoCenter.range * 100)}%</label>
-              <input type="range" min={0} max={0.35} step={0.01} value={p.autoCenter.range} className="w-full" onChange={(e) => onChange({ autoCenter: { ...p.autoCenter, range: Number(e.target.value) } })} />
+              <div className="flex items-center gap-1">
+                <input type="range" min={0} max={0.35} step={0.01} value={p.autoCenter.range} className="w-full" onChange={(e) => onChange({ autoCenter: { ...p.autoCenter, range: Number(e.target.value) } })} />
+                <SliderReset atDefault={p.autoCenter.range === WAVE_DEFAULTS.autoCenter.range} onReset={() => onChange({ autoCenter: { ...p.autoCenter, range: WAVE_DEFAULTS.autoCenter.range } })} title={`Reset to default (${Math.round(WAVE_DEFAULTS.autoCenter.range * 100)}%)`} />
+              </div>
               <p className="text-[10px] text-slate-500">Auto is on — the center glides to a new spot on every beat (overrides the X/Y sliders).</p>
             </>
           )}
+          <label className="flex items-center gap-1.5 pt-1 text-xs text-slate-400" title="The pulsing light at the convergence point">
+            <input
+              type="checkbox"
+              checked={p.centerConvergence.star}
+              onChange={(e) => onChange({ centerConvergence: { ...p.centerConvergence, star: e.target.checked } })}
+              className="accent-sky-600"
+            />
+            Center light
+          </label>
         </div>
       </div>
     </div>
@@ -746,14 +815,6 @@ function drawVisuals(ctx: CanvasRenderingContext2D, vis: VizModeVisuals): void {
     for (let i = 0; i + 8 < g.segs.length; i += 9) {
       ctx.globalAlpha = Math.min(1, g.alpha * eqAlpha(g.segs[i + 8]!));
       ctx.fill(quadAt(g.segs, i));
-    }
-    ctx.strokeStyle = g.tipColor;
-    ctx.globalAlpha = Math.min(1, g.glowAlpha + 0.3);
-    for (let i = 0; i + 3 < g.ring.length; i += 4) {
-      ctx.lineWidth = g.ring[i + 3]!;
-      ctx.beginPath();
-      ctx.arc(g.ring[i]!, g.ring[i + 1]!, g.ring[i + 2]!, 0, Math.PI * 2);
-      ctx.stroke();
     }
     ctx.fillStyle = g.tipColor;
     ctx.globalAlpha = g.glowAlpha * 0.6;
@@ -968,6 +1029,119 @@ function drawState(
   ctx.globalAlpha = 1;
 }
 
+/** Media-layer thumbnail — hover plays the video inline (muted loop), click
+ *  opens it fullscreen via the parent's overlay (`onPlay`). `dimmed` matches
+ *  a hidden layer's look. The click is stopPropagation'd so thumbs inside
+ *  clickable rows (the add-layer picker) don't trigger the row action. */
+function MediaThumb({
+  assetId,
+  isImage,
+  dimmed = false,
+  onPlay,
+}: {
+  assetId: string;
+  isImage: boolean;
+  dimmed?: boolean;
+  onPlay: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const [thumbOk, setThumbOk] = useState(true);
+  if (!thumbOk && isImage) return null; // a still with no thumb has nothing to show
+  return (
+    <span
+      role="button"
+      tabIndex={-1}
+      className={`relative block w-12 h-8 rounded border border-slate-700/60 bg-slate-800 overflow-hidden shrink-0 cursor-pointer ${dimmed ? "opacity-40 grayscale" : ""}`}
+      draggable={false}
+      title={isImage ? "Click for fullscreen" : "Hover to preview · click for fullscreen"}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onClick={(e) => {
+        e.stopPropagation();
+        onPlay();
+      }}
+    >
+      {thumbOk ? (
+        <img
+          src={api.assetThumbUrl(assetId)}
+          alt=""
+          draggable={false}
+          loading="lazy"
+          className="absolute inset-0 w-full h-full object-cover"
+          onError={() => setThumbOk(false)}
+        />
+      ) : (
+        // No generated thumb — the video's first frame stands in.
+        <video src={api.assetFileUrl(assetId)} muted playsInline preload="metadata" className="absolute inset-0 w-full h-full object-cover pointer-events-none" />
+      )}
+      {hover && !isImage && (
+        <video
+          src={api.assetFileUrl(assetId)}
+          poster={api.assetThumbUrl(assetId)}
+          muted
+          loop
+          autoPlay
+          playsInline
+          className="absolute inset-0 w-full h-full object-cover"
+        />
+      )}
+    </span>
+  );
+}
+
+/** Fullscreen player for one asset — opened from a click so the fullscreen
+ *  request counts as a user gesture; ESC / leaving fullscreen closes it.
+ *  Videos play with controls; images just show the still. */
+function FullscreenMedia({
+  assetId,
+  isImage,
+  title,
+  onClose,
+}: {
+  assetId: string;
+  isImage: boolean;
+  title: string | null;
+  onClose: () => void;
+}) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    boxRef.current?.requestFullscreen().catch(() => {});
+    return () => {
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    };
+  }, []);
+  // Leaving fullscreen (ESC, browser UI) closes the player.
+  useEffect(() => {
+    const onFs = () => {
+      if (!document.fullscreenElement) onClose();
+    };
+    document.addEventListener("fullscreenchange", onFs);
+    return () => document.removeEventListener("fullscreenchange", onFs);
+  }, [onClose]);
+  const close = () => (document.fullscreenElement ? document.exitFullscreen().catch(() => {}) : onClose());
+  return (
+    <div ref={boxRef} className="fixed inset-0 z-50 bg-black flex items-center justify-center" onClick={close}>
+      {isImage ? (
+        <img src={api.assetFileUrl(assetId)} alt={title ?? ""} className="max-w-full max-h-full object-contain" />
+      ) : (
+        <video
+          src={api.assetFileUrl(assetId)}
+          poster={api.assetThumbUrl(assetId)}
+          autoPlay
+          controls
+          playsInline
+          className="w-full h-full object-contain"
+          onClick={(e) => e.stopPropagation()}
+        />
+      )}
+      {title && <div className="absolute top-3 left-3 text-xs text-slate-300 bg-black/60 rounded px-2 py-1 truncate max-w-[80vw]">{title}</div>}
+      <button className="absolute top-3 right-3 px-2 py-1 rounded bg-black/60 hover:bg-black/80 text-white text-xs" title="Exit (Esc)">
+        ✕
+      </button>
+    </div>
+  );
+}
+
 // --- Component -------------------------------------------------------------------
 
 export function Visualizer({
@@ -983,6 +1157,7 @@ export function Visualizer({
 
   const [engine, setEngine] = useState<EngineStatus | null>(null);
   const [stems, setStems] = useState<VizStem[]>([]);
+  const [importingStem, setImportingStem] = useState<string | null>(null);
   const [stemInputs, setStemInputs] = useState<VisualizerStemInput[]>(initial?.stems ?? []);
   const [globals, setGlobals] = useState<VisualizerGlobals>(initial?.globals ?? DEFAULT_GLOBALS);
   const [renderSettings, setRenderSettings] = useState(initial?.render ?? DEFAULT_RENDER);
@@ -1052,30 +1227,52 @@ export function Visualizer({
     return () => window.removeEventListener("mouseup", up);
   }, []);
 
-  // Add-layer picker popover: open state, name filter, kind toggles.
+  // Add-layer picker popover: open state, name filter, kind toggles, and
+  // the selected assets-folder subtree ("" = all folders).
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerQ, setPickerQ] = useState("");
   const [pickerVideo, setPickerVideo] = useState(true);
   const [pickerImage, setPickerImage] = useState(true);
+  const [pickerFolder, setPickerFolder] = useState("");
+  // Fullscreen single-asset player — opened by clicking a layer/picker thumb.
+  const [fsMedia, setFsMedia] = useState<{ assetId: string; isImage: boolean; title: string | null } | null>(null);
 
-  // Downloaded project assets eligible as media layers (videos and images).
+  // Downloaded project assets eligible as media layers (videos and images),
+  // plus the on-disk folder tree under <slug>/assets/ for picker navigation.
   const [videoAssets, setVideoAssets] = useState<Asset[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      api
-        .searchAssetsAdvanced({ downloadedOnly: true, sort: "newest_downloaded", limit: 200 }, projectId)
-        .then((r) => {
-          if (!cancelled) setVideoAssets(r.assets);
-        })
-        .catch(() => {});
-    load();
-    window.addEventListener(ASSETS_CHANGED_EVENT, load);
-    return () => {
-      cancelled = true;
-      window.removeEventListener(ASSETS_CHANGED_EVENT, load);
-    };
+  // Downloaded audio assets — the stems section's "import from library" list
+  // (drag & drop / folder-sync files become stems without a second upload).
+  const [audioAssets, setAudioAssets] = useState<Asset[]>([]);
+  const [assetFolders, setAssetFolders] = useState<AssetFolderEntry[]>([]);
+  const [pickerSyncing, setPickerSyncing] = useState(false);
+  // Refresh the picker's data — always syncs the assets folder first so the
+  // list mirrors the real disk contents: files deleted outside the app drop
+  // out (local_path cleared → no longer "downloaded"), files copied in or
+  // moved register/re-point before the search runs.
+  const refreshMedia = useCallback(() => {
+    setPickerSyncing(true);
+    api
+      .syncProjectAssets(projectId)
+      .catch(() => {}) // sync failure must not hide existing assets
+      .then(() => api.searchAssetsAdvanced({ downloadedOnly: true, sort: "newest_downloaded", limit: 200 }, projectId))
+      .then((r) => {
+        // Media layers are video/image only — audio assets feed the stems
+        // import list instead of the layer picker.
+        setVideoAssets(r.assets.filter((a) => !isAudioFileName(a.local_path ?? a.title ?? "")));
+        setAudioAssets(r.assets.filter((a) => isAudioFileName(a.local_path ?? a.title ?? "")));
+      })
+      .catch(() => {})
+      .finally(() => setPickerSyncing(false));
+    api
+      .folderTree(projectId)
+      .then((r) => setAssetFolders(r.folders))
+      .catch(() => {});
   }, [projectId]);
+  useEffect(() => {
+    refreshMedia();
+    window.addEventListener(ASSETS_CHANGED_EVENT, refreshMedia);
+    return () => window.removeEventListener(ASSETS_CHANGED_EVENT, refreshMedia);
+  }, [refreshMedia]);
 
   const loadStems = useCallback(async () => {
     const r = await api.vizStems(projectId);
@@ -1682,6 +1879,27 @@ export function Visualizer({
     }
   };
 
+  /** Import a library audio asset into the stems pool and add it to the
+   *  render set — mirrors what a fresh upload does. */
+  const importLibraryStem = async (assetId: string) => {
+    setImportingStem(assetId);
+    setError(null);
+    try {
+      const r = await api.vizImportStem(projectId, assetId);
+      await loadStems();
+      setStemInputs((cur) =>
+        cur.some((s) => s.name === r.stem.name)
+          ? cur
+          : [...cur, { name: r.stem.name, muted: false, solo: false } satisfies VisualizerStemInput],
+      );
+      onToast(`Imported ${r.stem.name}`, "success");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setImportingStem(null);
+    }
+  };
+
   /** Upload a full song → the engine splits it into stems (a split job). */
   const splitSong = async (f: File | null | undefined) => {
     if (!f) return;
@@ -2003,10 +2221,16 @@ export function Visualizer({
     return videoAssets.filter((a) => {
       const isImg = isImageFileName(a.local_path ?? a.title ?? "");
       if (isImg ? !pickerImage : !pickerVideo) return false;
+      // Folder filter is a subtree match — picking "uploads/nature" also
+      // lists files nested deeper under it (mirrors the Library sidebar).
+      if (pickerFolder !== "") {
+        const af = assetFolderPath(a.local_path);
+        if (af !== pickerFolder && !(af !== null && af.startsWith(pickerFolder + "/"))) return false;
+      }
       if (!q) return true;
       return (a.title ?? "").toLowerCase().includes(q) || (a.local_path ?? "").toLowerCase().includes(q);
     });
-  }, [videoAssets, pickerQ, pickerVideo, pickerImage]);
+  }, [videoAssets, pickerQ, pickerVideo, pickerImage, pickerFolder]);
   const rendering = job?.status === "running";
   const canvasH = Math.round((640 * renderSettings.height) / renderSettings.width);
 
@@ -2067,6 +2291,7 @@ export function Visualizer({
               className="ui-input w-full text-left text-slate-300 flex items-center justify-between gap-2"
               disabled={globals.video.layers.length >= VIZ_MAX_VIDEO_LAYERS}
               onClick={() => {
+                if (!pickerOpen) refreshMedia(); // rescan the folder so the list is current
                 setPickerQ("");
                 setPickerOpen((o) => !o);
               }}
@@ -2083,7 +2308,7 @@ export function Visualizer({
                 {/* Click-away overlay + Esc close. */}
                 <div className="fixed inset-0 z-40" onClick={() => setPickerOpen(false)} />
                 <div
-                  className="absolute z-50 mt-1 w-96 max-w-[90vw] rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden"
+                  className="absolute z-50 mt-1 w-[30rem] max-w-[90vw] rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden"
                   onKeyDown={(e) => {
                     if (e.key === "Escape") setPickerOpen(false);
                   }}
@@ -2111,6 +2336,7 @@ export function Visualizer({
                       placeholder="Filter by name…"
                       className="ui-input !py-1 flex-1 text-xs"
                     />
+                    {pickerSyncing && <Spinner />}
                     {(
                       [
                         { id: "video" as const, on: pickerVideo, set: setPickerVideo, label: "▶ videos" },
@@ -2128,49 +2354,71 @@ export function Visualizer({
                       </button>
                     ))}
                   </div>
-                  <div className="max-h-64 overflow-y-auto">
-                    {pickerResults.map((a) => {
-                      const isImg = isImageFileName(a.local_path ?? a.title ?? "");
-                      const inStack = globals.video.layers.filter((x) => x.kind === "media" && x.assetId === a.id).length;
-                      return (
-                        <button
-                          key={a.id}
-                          type="button"
-                          onClick={() => addLayer(a.id)}
-                          className="w-full flex items-center gap-2 px-2 py-1.5 text-left text-xs text-slate-200 hover:bg-slate-800/60"
-                        >
-                          <img
-                            src={api.assetThumbUrl(a.id)}
-                            alt=""
-                            loading="lazy"
-                            className="w-12 h-8 rounded object-cover border border-slate-700/60 bg-slate-800 shrink-0"
-                            onError={(e) => (e.currentTarget.style.display = "none")}
-                          />
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate" title={a.title ?? a.id}>
-                              {a.title ?? a.id}
-                            </span>
-                            <span className="flex items-center gap-1.5 text-[10px] text-slate-500">
-                              <Badge tone={isImg ? "violet" : "info"}>{isImg ? "image" : "video"}</Badge>
-                              {a.duration_seconds ? <span>{a.duration_seconds.toFixed(0)}s</span> : null}
-                              {a.width && a.height ? (
-                                <span>
-                                  {a.width}×{a.height}
-                                </span>
-                              ) : null}
-                            </span>
-                          </span>
-                          {inStack > 0 && <span className="text-[10px] text-slate-500 shrink-0">in stack{inStack > 1 ? ` ×${inStack}` : ""}</span>}
-                        </button>
-                      );
-                    })}
-                    {pickerResults.length === 0 && (
-                      <p className="px-3 py-3 text-xs text-slate-500">
-                        {videoAssets.length === 0
-                          ? "No downloaded media in this project — KEEP assets on Library/Folders or drop files onto the app first."
-                          : "No matches — adjust the name filter or the media-kind toggles."}
-                      </p>
+                  <div className="flex max-h-64">
+                    {assetFolders.length > 0 && (
+                      <div className="w-32 shrink-0 overflow-y-auto border-r border-slate-800 p-1 space-y-0.5">
+                        {assetFolders.map((f) => {
+                          const active = pickerFolder === f.path;
+                          return (
+                            <button
+                              key={f.path || "__root__"}
+                              type="button"
+                              onClick={() => setPickerFolder(f.path)}
+                              className={`w-full text-left py-1 pr-1 rounded text-[11px] flex items-center justify-between gap-1 ${active ? "bg-sky-600/30 text-sky-200" : "text-slate-300 hover:bg-slate-800"}`}
+                              style={{ paddingLeft: `${4 + f.depth * 10}px` }}
+                              title={f.path ? `${f.path} — ${f.fileCount} here, ${f.subtreeCount} incl. subfolders` : "All files"}
+                            >
+                              <span className="truncate">{f.path === "" ? "All files" : f.name}</span>
+                              <span className={`shrink-0 ${active ? "text-sky-300" : "text-slate-500"}`}>{f.subtreeCount}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
                     )}
+                    <div className="flex-1 min-w-0 overflow-y-auto">
+                      {pickerResults.map((a) => {
+                        const isImg = isImageFileName(a.local_path ?? a.title ?? "");
+                        const inStack = globals.video.layers.filter((x) => x.kind === "media" && x.assetId === a.id).length;
+                        return (
+                          <button
+                            key={a.id}
+                            type="button"
+                            onClick={() => addLayer(a.id)}
+                            className="w-full flex items-center gap-2 px-2 py-1.5 text-left text-xs text-slate-200 hover:bg-slate-800/60"
+                          >
+                            <MediaThumb
+                              assetId={a.id}
+                              isImage={isImg}
+                              onPlay={() => setFsMedia({ assetId: a.id, isImage: isImg, title: a.title ?? a.id })}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate" title={a.title ?? a.id}>
+                                {a.title ?? a.id}
+                              </span>
+                              <span className="flex items-center gap-1.5 text-[10px] text-slate-500">
+                                <Badge tone={isImg ? "violet" : "info"}>{isImg ? "image" : "video"}</Badge>
+                                {a.duration_seconds ? <span>{a.duration_seconds.toFixed(0)}s</span> : null}
+                                {a.width && a.height ? (
+                                  <span>
+                                    {a.width}×{a.height}
+                                  </span>
+                                ) : null}
+                              </span>
+                            </span>
+                            {inStack > 0 && <span className="text-[10px] text-slate-500 shrink-0">in stack{inStack > 1 ? ` ×${inStack}` : ""}</span>}
+                          </button>
+                        );
+                      })}
+                      {pickerResults.length === 0 && (
+                        <p className="px-3 py-3 text-xs text-slate-500">
+                          {videoAssets.length === 0
+                            ? "No downloaded media in this project — KEEP assets on Library/Folders or drop files onto the app first."
+                            : pickerFolder !== ""
+                              ? `Nothing in "${pickerFolder}" — pick another folder or "All files".`
+                              : "No matches — adjust the name filter or the media-kind toggles."}
+                        </p>
+                      )}
+                    </div>
                   </div>
                 </div>
               </>
@@ -2299,12 +2547,11 @@ export function Visualizer({
                         ◈
                       </span>
                     ) : l.kind === "media" ? (
-                      <img
-                        src={api.assetThumbUrl(l.assetId)}
-                        alt=""
-                        draggable={false}
-                        className={`w-12 h-8 rounded object-cover border border-slate-700/60 shrink-0 ${l.hidden ? "opacity-40 grayscale" : ""}`}
-                        onError={(e) => (e.currentTarget.style.display = "none")}
+                      <MediaThumb
+                        assetId={l.assetId}
+                        isImage={isImg}
+                        dimmed={l.hidden}
+                        onPlay={() => setFsMedia({ assetId: l.assetId, isImage: isImg, title: asset?.title ?? l.assetId })}
                       />
                     ) : null}
                     <div className={`min-w-0 flex-1 ${l.hidden ? "opacity-40" : ""}`}>
@@ -2333,6 +2580,7 @@ export function Visualizer({
                       </div>
                     </div>
                     <label className="flex items-center gap-1.5 text-[11px] text-slate-400 shrink-0" title="Layer opacity">
+                      <span className="text-slate-500">Transparency</span>
                       <input
                         type="range"
                         min={0}
@@ -2343,6 +2591,7 @@ export function Visualizer({
                         onChange={(e) => patchLayer(i, { opacity: Number(e.target.value) })}
                       />
                       <span className="w-8 text-right">{Math.round(l.opacity * 100)}%</span>
+                      <SliderReset atDefault={l.opacity === 1} onReset={() => patchLayer(i, { opacity: 1 })} title="Reset to default (100%)" />
                     </label>
                     <button className="text-slate-500 hover:text-slate-200 disabled:opacity-30 shrink-0" disabled={i === globals.video.layers.length - 1} onClick={() => moveLayer(i, i + 1)} title="Move up (toward the top layer)">
                       ↑
@@ -2372,11 +2621,13 @@ export function Visualizer({
                         <span className="w-3 text-slate-500">X</span>
                         <input type="range" min={0} max={1} step={0.01} value={l.x} className="w-20" onChange={(e) => patchLayer(i, { x: Number(e.target.value) })} />
                         <span className="w-8 text-right">{Math.round(l.x * 100)}%</span>
+                        <SliderReset atDefault={l.x === 0.5} onReset={() => patchLayer(i, { x: 0.5 })} title="Reset to default (50%)" />
                       </label>
                       <label className="flex items-center gap-1" title="Layer center — vertical position in the frame">
                         <span className="w-3 text-slate-500">Y</span>
                         <input type="range" min={0} max={1} step={0.01} value={l.y} className="w-20" onChange={(e) => patchLayer(i, { y: Number(e.target.value) })} />
                         <span className="w-8 text-right">{Math.round(l.y * 100)}%</span>
+                        <SliderReset atDefault={l.y === 0.5} onReset={() => patchLayer(i, { y: 0.5 })} title="Reset to default (50%)" />
                       </label>
                     </div>
                     <div className={LAYER_CARD}>
@@ -2384,6 +2635,7 @@ export function Visualizer({
                       <label className="flex items-center gap-1" title="Layer size — 100% fills the frame, smaller shrinks to an inset, larger zooms in">
                         <input type="range" min={0.1} max={2} step={0.05} value={l.scale} className="w-20" onChange={(e) => patchLayer(i, { scale: Number(e.target.value) })} />
                         <span className="w-9 text-right">{Math.round(l.scale * 100)}%</span>
+                        <SliderReset atDefault={l.scale === 1} onReset={() => patchLayer(i, { scale: 1 })} title="Reset to default (100%)" />
                       </label>
                     </div>
                     {l.kind === "media" && (
@@ -2404,16 +2656,19 @@ export function Visualizer({
                         <span className="w-3 text-slate-500">Z</span>
                         <input type="range" min={1} max={8} step={0.05} value={l.zoomPan.zoom} className="w-20" onChange={(e) => setLayerZoomPan(i, { zoom: Number(e.target.value) })} />
                         <span className="w-8 text-right">{Math.round(l.zoomPan.zoom * 100)}%</span>
+                        <SliderReset atDefault={l.zoomPan.zoom === 1} onReset={() => setLayerZoomPan(i, { zoom: 1 })} title="Reset to default (100%)" />
                       </label>
                       <label className="flex items-center gap-1" title="Pan inside the source — which part of the media the crop window looks at">
                         <span className="w-3 text-slate-500">X</span>
                         <input type="range" min={0} max={1} step={0.01} value={l.zoomPan.panX} className="w-20" onChange={(e) => setLayerZoomPan(i, { panX: Number(e.target.value) })} />
                         <span className="w-8 text-right">{Math.round(l.zoomPan.panX * 100)}%</span>
+                        <SliderReset atDefault={l.zoomPan.panX === 0.5} onReset={() => setLayerZoomPan(i, { panX: 0.5 })} title="Reset to default (50%)" />
                       </label>
                       <label className="flex items-center gap-1" title="Pan inside the source — which part of the media the crop window looks at">
                         <span className="w-3 text-slate-500">Y</span>
                         <input type="range" min={0} max={1} step={0.01} value={l.zoomPan.panY} className="w-20" onChange={(e) => setLayerZoomPan(i, { panY: Number(e.target.value) })} />
                         <span className="w-8 text-right">{Math.round(l.zoomPan.panY * 100)}%</span>
+                        <SliderReset atDefault={l.zoomPan.panY === 0.5} onReset={() => setLayerZoomPan(i, { panY: 0.5 })} title="Reset to default (50%)" />
                       </label>
                       <label className="flex items-center gap-1.5" title="Ken Burns — the view starts normal (no zoom, centered) and smoothly reaches these values at the end of the video">
                         <input
@@ -2537,6 +2792,7 @@ export function Visualizer({
                             className="w-20"
                             onChange={(e) => setLayerKey(i, { similarity: Number(e.target.value) })}
                           />
+                          <SliderReset atDefault={l.key.similarity === DEFAULT_VIDEO_KEY.similarity} onReset={() => setLayerKey(i, { similarity: DEFAULT_VIDEO_KEY.similarity })} title={`Reset to default (${Math.round(DEFAULT_VIDEO_KEY.similarity * 100)}%)`} />
                         </span>
                         <span className="flex items-center gap-1">
                           feather {Math.round(l.key.blend * 100)}%
@@ -2549,6 +2805,7 @@ export function Visualizer({
                             className="w-16"
                             onChange={(e) => setLayerKey(i, { blend: Number(e.target.value) })}
                           />
+                          <SliderReset atDefault={l.key.blend === DEFAULT_VIDEO_KEY.blend} onReset={() => setLayerKey(i, { blend: DEFAULT_VIDEO_KEY.blend })} title={`Reset to default (${Math.round(DEFAULT_VIDEO_KEY.blend * 100)}%)`} />
                         </span>
                         {l.key.method === "hsv" && (
                           <span className="flex items-center gap-1">
@@ -2563,6 +2820,7 @@ export function Visualizer({
                               title="Shrink (negative) / grow (positive) the matte edge"
                               onChange={(e) => setLayerKey(i, { choke: Number(e.target.value) })}
                             />
+                            <SliderReset atDefault={l.key.choke === DEFAULT_VIDEO_KEY.choke} onReset={() => setLayerKey(i, { choke: DEFAULT_VIDEO_KEY.choke })} title={`Reset to default (${DEFAULT_VIDEO_KEY.choke}px)`} />
                           </span>
                         )}
                         <label className="flex items-center gap-1" title="Suppress key-color spill on surviving edge pixels">
@@ -2598,6 +2856,7 @@ export function Visualizer({
                             className="w-16"
                             onChange={(e) => setLayerKey(i, { feather: Number(e.target.value) })}
                           />
+                          <SliderReset atDefault={l.key.feather === DEFAULT_VIDEO_KEY.feather} onReset={() => setLayerKey(i, { feather: DEFAULT_VIDEO_KEY.feather })} title={`Reset to default (${DEFAULT_VIDEO_KEY.feather}px)`} />
                         </span>
                         <label className="flex items-center gap-1" title="Clamp green spill on semi-transparent edges (baked into the keyed video)">
                           <input
@@ -2703,10 +2962,16 @@ export function Visualizer({
                 </select>
               </label>
               <label className="space-y-1">Size {globals.dancer.scale.toFixed(2)}×
-                <input type="range" min={0.3} max={2} step={0.05} value={globals.dancer.scale} className="w-full" onChange={(e) => setDancer({ scale: Number(e.target.value) })} />
+                <span className="flex items-center gap-1">
+                  <input type="range" min={0.3} max={2} step={0.05} value={globals.dancer.scale} className="w-full" onChange={(e) => setDancer({ scale: Number(e.target.value) })} />
+                  <SliderReset atDefault={globals.dancer.scale === DEFAULT_GLOBALS.dancer.scale} onReset={() => setDancer({ scale: DEFAULT_GLOBALS.dancer.scale })} title={`Reset to default (${DEFAULT_GLOBALS.dancer.scale.toFixed(2)}×)`} />
+                </span>
               </label>
               <label className="space-y-1">Energy {globals.dancer.intensity.toFixed(2)}×
-                <input type="range" min={0} max={2} step={0.05} value={globals.dancer.intensity} className="w-full" onChange={(e) => setDancer({ intensity: Number(e.target.value) })} />
+                <span className="flex items-center gap-1">
+                  <input type="range" min={0} max={2} step={0.05} value={globals.dancer.intensity} className="w-full" onChange={(e) => setDancer({ intensity: Number(e.target.value) })} />
+                  <SliderReset atDefault={globals.dancer.intensity === DEFAULT_GLOBALS.dancer.intensity} onReset={() => setDancer({ intensity: DEFAULT_GLOBALS.dancer.intensity })} title={`Reset to default (${DEFAULT_GLOBALS.dancer.intensity.toFixed(2)}×)`} />
+                </span>
               </label>
               <label className="space-y-1">Color
                 <div className="flex items-center gap-2">
@@ -2874,6 +3139,25 @@ export function Visualizer({
           </>
         }
       >
+        {audioAssets.length > 0 && (
+          <details className="mb-3 rounded-lg border border-slate-700/60 bg-slate-900/40 px-3 py-2">
+            <summary className="text-xs text-slate-400 cursor-pointer select-none">
+              Import from library — {audioAssets.length} audio file{audioAssets.length === 1 ? "" : "s"}
+            </summary>
+            <div className="mt-2 max-h-40 overflow-y-auto space-y-1">
+              {audioAssets.map((a) => (
+                <div key={a.id} className="flex items-center gap-2 text-xs">
+                  <span className="flex-1 truncate text-slate-300" title={a.local_path ?? a.title ?? a.id}>
+                    {a.title ?? a.local_path}
+                  </span>
+                  <Button size="sm" variant="ghost" disabled={importingStem === a.id} onClick={() => void importLibraryStem(a.id)}>
+                    {importingStem === a.id ? "…" : "Import"}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
         {splitJob && (
           <div className="mb-3 rounded-lg border border-slate-700/60 bg-slate-900/50 px-3 py-2 space-y-1.5">
             <div className="flex items-center gap-2 text-xs">
@@ -3067,10 +3351,20 @@ export function Visualizer({
                         <input type="range" min={0.05} max={4} step={0.05} value={resolved.amplitudeScale} className="w-16"
                           onChange={(e) => patchStem(s.name, { amplitudeScale: Number(e.target.value) })} />
                         <span className="w-8">{resolved.amplitudeScale.toFixed(2)}</span>
+                        <SliderReset
+                          atDefault={resolved.amplitudeScale === STEM_KIND_DEFAULTS[resolved.kind].amplitudeScale}
+                          onReset={() => patchStem(s.name, { amplitudeScale: STEM_KIND_DEFAULTS[resolved.kind].amplitudeScale })}
+                          title={`Reset to the ${resolved.kind} default (${STEM_KIND_DEFAULTS[resolved.kind].amplitudeScale})`}
+                        />
                       </label>
                       <label className="flex items-center gap-1">glow
                         <input type="range" min={0} max={60} step={1} value={resolved.glowRadius} className="w-16"
                           onChange={(e) => patchStem(s.name, { glowRadius: Number(e.target.value) })} />
+                        <SliderReset
+                          atDefault={resolved.glowRadius === STEM_KIND_DEFAULTS[resolved.kind].glowRadius}
+                          onReset={() => patchStem(s.name, { glowRadius: STEM_KIND_DEFAULTS[resolved.kind].glowRadius })}
+                          title={`Reset to the ${resolved.kind} default (${STEM_KIND_DEFAULTS[resolved.kind].glowRadius})`}
+                        />
                       </label>
                       <div className="flex-1" />
                       <button className="text-slate-500 hover:text-slate-200 disabled:opacity-30" disabled={i === 0} onClick={() => moveStem(i, -1)} title="Move up">↑</button>
@@ -3150,6 +3444,7 @@ export function Visualizer({
               if (playing) void startPlayback(t);
             }}
           />
+          <SliderReset atDefault={scrubT <= 0} onReset={stopPlayback} title="Back to the start" />
           <span className="text-xs text-slate-400 w-20 text-right">{mmss(scrubT)}</span>
           <Button size="sm" variant="ghost" onClick={toggleFullscreen} title={fullscreen ? "Exit fullscreen" : "Fullscreen preview (double-click the canvas too)"}>
             {fullscreen ? "✕" : "⛶"}
@@ -3374,6 +3669,11 @@ export function Visualizer({
           </div>
         )}
       </Section>
+
+      {/* Fullscreen asset player — opened by clicking a layer/picker thumb. */}
+      {fsMedia && (
+        <FullscreenMedia assetId={fsMedia.assetId} isImage={fsMedia.isImage} title={fsMedia.title} onClose={() => setFsMedia(null)} />
+      )}
     </div>
   );
 }

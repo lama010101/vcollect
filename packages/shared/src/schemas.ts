@@ -195,3 +195,22 @@ export const musicEditPlanSchema = z.object({
   settings: musicEditSettingsSchema.default({}),
 });
 export type MusicEditPlanInput = z.infer<typeof musicEditPlanSchema>;
+
+/** POST /api/music-edit/import-session — reuse a saved 4D-timeline session:
+ *  its media-layer videos become the ordered source list and its stems are
+ *  copied into the project's songs pool. */
+export const musicEditImportSessionSchema = z.object({
+  sessionId: z.string().min(1).max(64),
+});
+
+// --- Format (aspect-ratio reframe) --------------------------------------------
+export const formatAspectSchema = z.enum(["16:9", "9:16", "1:1"]);
+export type FormatAspect = z.infer<typeof formatAspectSchema>;
+
+export const formatConvertSchema = z.object({
+  assetId: z.string().min(1).max(64),
+  aspect: formatAspectSchema,
+  /** Optional trim window in seconds — export only [start, end). */
+  start: z.number().min(0).optional(),
+  end: z.number().gt(0).optional(),
+});

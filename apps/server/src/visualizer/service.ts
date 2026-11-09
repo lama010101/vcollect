@@ -12,7 +12,7 @@ import { buildPeakSeries, buildStemSignal, isStemAudible, resolveStem, visualize
 import { IMAGE_FILE_EXTENSIONS, projectPaths, VIDEO_FILE_EXTENSIONS } from "../config.js";
 import { getProject } from "../db/projectRepository.js";
 import { getAsset } from "../db/repository.js";
-import { AUDIO_EXTENSIONS, MAX_SONG_BYTES, fileUrl } from "../musicEdit/service.js";
+import { AUDIO_EXTENSIONS, MAX_SONG_BYTES, fileUrl, uniqueFilePath } from "../musicEdit/service.js";
 import { engineClient } from "../python/engineClient.js";
 import { sepStatus } from "../python/pythonService.js";
 import { assetAbsolutePath } from "../routes/folders.js";
@@ -96,6 +96,38 @@ export function stemPath(projectId: string, name: string): string {
   const p = join(visualizerDir(projectId, "stems"), sanitizeStemName(name));
   if (!existsSync(p)) throw new VisualizerError(404, "STEM_NOT_FOUND", `Stem not found: ${name}`);
   return p;
+}
+
+/** Copy a downloaded audio asset (drag & drop / folder sync) from the project's
+ *  assets folder into the stems pool — the bridge that makes library audio
+ *  usable as a Visualizer stem without re-uploading. Same validation +
+ *  signal-cache warmup as saveStem; the pool keeps its own copy. */
+export async function importStemFromAsset(projectId: string, assetId: string): Promise<StemInfo> {
+  const a = getAsset(assetId);
+  if (!a || a.project_id !== projectId) {
+    throw new VisualizerError(404, "ASSET_NOT_FOUND", `Asset not found in this project: ${assetId}`);
+  }
+  if (!a.local_path) {
+    throw new VisualizerError(422, "ASSET_NOT_DOWNLOADED", `Asset "${a.title ?? assetId}" has no local file.`);
+  }
+  const abs = assetAbsolutePath(a.local_path);
+  if (!existsSync(abs)) {
+    throw new VisualizerError(404, "ASSET_FILE_MISSING", `The asset's file is missing on disk: ${a.local_path}`);
+  }
+  // sanitizeStemName rejects non-audio extensions with 415.
+  const safe = sanitizeStemName(basename(abs));
+  const dir = visualizerDir(projectId, "stems");
+  const dest = uniqueFilePath(dir, safe);
+  copyFileSync(abs, dest);
+  try {
+    const probe = await probeAudio(dest);
+    const st = statSync(dest);
+    void stemSignalPayload(dest).catch(() => { /* warmup only — fetches retry */ });
+    return { name: basename(dest), sizeBytes: st.size, url: fileUrl(dest), modifiedAt: st.mtime.toISOString(), durationSec: probe.durationSeconds };
+  } catch {
+    rmSync(dest, { force: true });
+    throw new VisualizerError(422, "CORRUPT_AUDIO", `"${safe}" is not a readable audio file.`);
+  }
 }
 
 export function deleteStem(projectId: string, name: string): void {

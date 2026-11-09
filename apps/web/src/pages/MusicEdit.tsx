@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { EditPlan, MusicEditSettings } from "@twio/shared";
+import type { EditPlan, MusicEditSettings, VizSessionMeta } from "@twio/shared";
 import {
   api,
   ASSETS_CHANGED_EVENT,
+  assetFolderPath,
+  isAudioFileName,
   isImageFileName,
   type Asset,
+  type AssetFolderEntry,
   type MusicAnalysis,
   type MusicEditRequest,
   type MusicEditStatus,
@@ -12,7 +15,7 @@ import {
   type MusicRenderedFile,
   type MusicSong,
 } from "../api.js";
-import { Badge, Button, Card, EmptyState, ProgressBar, SectionTitle, Spinner, StatCard } from "../components/ui.js";
+import { Badge, Button, Card, ProgressBar, SectionTitle, Spinner, StatCard } from "../components/ui.js";
 
 /**
  * Music Edit — beat-aligned music-video editor.
@@ -71,7 +74,6 @@ interface PersistedMusicEdit {
   song: string;
   orderAssets: Asset[];
   settings: Settings;
-  libraryQuery: string;
   analysis: MusicAnalysis | null;
   plan: EditPlan | null;
   /** JSON.stringify(request) that produced `plan` — plan stays valid only
@@ -90,7 +92,6 @@ function loadPersisted(projectId: string): PersistedMusicEdit | null {
       song: typeof p.song === "string" ? p.song : "",
       orderAssets: Array.isArray(p.orderAssets) ? (p.orderAssets as Asset[]) : [],
       settings: { ...DEFAULT_SETTINGS, ...(typeof p.settings === "object" && p.settings ? p.settings : {}) },
-      libraryQuery: typeof p.libraryQuery === "string" ? p.libraryQuery : "",
       analysis: p.analysis ?? null,
       plan: p.plan ?? null,
       planKey: typeof p.planKey === "string" ? p.planKey : null,
@@ -183,8 +184,22 @@ export function MusicEdit({
   const [analysis, setAnalysis] = useState<MusicAnalysis | null>(initial?.analysis ?? null);
   const [analyzing, setAnalyzing] = useState(false);
   const [library, setLibrary] = useState<Asset[]>([]);
-  const [libraryQuery, setLibraryQuery] = useState(initial?.libraryQuery ?? "");
   const [libraryLoading, setLibraryLoading] = useState(false);
+  // Downloaded audio assets — the song picker's "import from library" group
+  // (drag & drop / folder-sync files become songs without a second upload).
+  const [audioAssets, setAudioAssets] = useState<Asset[]>([]);
+  // "+ Add a video…" picker — the same dropdown UX as the 4D timeline's
+  // add-a-layer: name filter + assets-folder sidebar, videos only (the EDL
+  // can't cut to stills).
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerQ, setPickerQ] = useState("");
+  const [pickerFolder, setPickerFolder] = useState("");
+  const [assetFolders, setAssetFolders] = useState<AssetFolderEntry[]>([]);
+  // 4D timeline session reuse — loads the session's layer videos as the
+  // source list and its stems into the song pool in one click.
+  const [vizSessions, setVizSessions] = useState<VizSessionMeta[]>([]);
+  const [vizSel, setVizSel] = useState("");
+  const [vizBusy, setVizBusy] = useState(false);
   const [order, setOrder] = useState<Asset[]>(initial?.orderAssets ?? []);
   const [settings, setSettings] = useState<Settings>(initial?.settings ?? DEFAULT_SETTINGS);
   const [plan, setPlan] = useState<EditPlan | null>(initial?.plan ?? null);
@@ -220,7 +235,6 @@ export function MusicEdit({
     setAnalysis(saved?.analysis ?? null);
     setOrder(saved?.orderAssets ?? []);
     setSettings(saved?.settings ?? DEFAULT_SETTINGS);
-    setLibraryQuery(saved?.libraryQuery ?? "");
     setPlan(saved?.plan ?? null);
     planKeyRef.current = saved?.planKey ?? null;
     setJob(null);
@@ -247,7 +261,6 @@ export function MusicEdit({
       song,
       orderAssets: order,
       settings,
-      libraryQuery,
       analysis,
       plan,
       planKey: planKeyRef.current,
@@ -256,7 +269,7 @@ export function MusicEdit({
     try {
       localStorage.setItem(storageKey(projectId), JSON.stringify(payload));
     } catch { /* quota/serialization — persistence is best-effort */ }
-  }, [projectId, song, order, settings, libraryQuery, analysis, plan, job?.id]);
+  }, [projectId, song, order, settings, analysis, plan, job?.id]);
 
   // Downloaded project assets (debounced search). `libraryRefresh` bumps when
   // files are dropped onto the app so new uploads appear without a reload.
@@ -286,22 +299,46 @@ export function MusicEdit({
   }, []);
   useEffect(() => {
     setLibraryLoading(true);
-    const t = setTimeout(() => {
-      // Sync the project's assets folder first — the source library is every
-      // video on disk, no matter how it got there (downloads, drag & drop, or
-      // files copied in manually outside the app).
-      api
-        .syncProjectAssets(projectId)
-        .catch(() => {}) // sync failure must not hide existing assets
-        .then(() => api.searchAssetsAdvanced({ q: libraryQuery.trim() || undefined, downloadedOnly: true, sort: "newest_downloaded", limit: 200 }, projectId))
-        // Images are project assets too (uploads/sync register them) but they
-        // can't be edit sources — keep the library videos-only.
-        .then((r) => setLibrary(r.assets.filter((a) => a.local_path && !isImageFileName(a.local_path))))
-        .catch((e) => setError((e as Error).message))
-        .finally(() => setLibraryLoading(false));
-    }, 250);
-    return () => clearTimeout(t);
-  }, [libraryQuery, projectId, libraryRefresh]);
+    // Sync the project's assets folder first — the source library is every
+    // video on disk, no matter how it got there (downloads, drag & drop, or
+    // files copied in manually outside the app).
+    api
+      .syncProjectAssets(projectId)
+      .catch(() => {}) // sync failure must not hide existing assets
+      .then(() => api.searchAssetsAdvanced({ downloadedOnly: true, mediaType: "video", sort: "newest_downloaded", limit: 500 }, projectId))
+      // Images are project assets too (uploads/sync register them) but they
+      // can't be edit sources — keep the library videos-only.
+      .then((r) => setLibrary(r.assets.filter((a) => a.local_path && !isImageFileName(a.local_path))))
+      .catch((e) => setError((e as Error).message))
+      .finally(() => setLibraryLoading(false));
+    // Library audio for the song picker's import group — same refresh cadence
+    // as the video library (drops onto the app bump libraryRefresh).
+    api
+      .searchAssetsAdvanced({ downloadedOnly: true, mediaType: "audio", sort: "newest_downloaded", limit: 200 }, projectId)
+      .then((r) => setAudioAssets(r.assets.filter((a) => a.local_path && isAudioFileName(a.local_path))))
+      .catch(() => {});
+    // The picker's folder sidebar mirrors the real disk tree.
+    api
+      .folderTree(projectId)
+      .then((r) => setAssetFolders(r.folders))
+      .catch(() => {});
+  }, [projectId, libraryRefresh]);
+
+  // The 4D-timeline session picker — refetch on mount + project switch.
+  useEffect(() => {
+    let live = true;
+    api
+      .vizSessions(projectId)
+      .then((r) => {
+        if (!live) return;
+        setVizSessions(r.sessions);
+        setVizSel((cur) => (r.sessions.some((s) => s.id === cur) ? cur : (r.sessions[0]?.id ?? "")));
+      })
+      .catch(() => {}); // sessions are optional — keep the picker hidden
+    return () => {
+      live = false;
+    };
+  }, [projectId]);
 
   // Poll the active render.
   useEffect(() => {
@@ -341,6 +378,23 @@ export function MusicEdit({
   }, [plan, requestKey]);
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) => setSettings((s) => ({ ...s, [key]: value }));
+
+  /** Import a library audio asset into the song pool, then select it. */
+  const importLibrarySong = async (assetId: string) => {
+    setUploading(true);
+    setError(null);
+    try {
+      const r = await api.importMusicSong(projectId, assetId);
+      await loadSongs();
+      setSong(r.song.name);
+      setAnalysis(null);
+      onToast(`Imported ${r.song.name} from the library`, "success");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setUploading(false);
+    }
+  };
 
   const upload = async (file: File) => {
     setUploading(true);
@@ -417,6 +471,48 @@ export function MusicEdit({
     });
 
   const inOrder = new Set(order.map((a) => a.id));
+  const addToOrder = (a: Asset) => setOrder((o) => (o.some((x) => x.id === a.id) ? o : [...o, a]));
+
+  // The picker's rows: library filtered by name + the selected assets-folder
+  // subtree ("" = all folders) — same filtering as the 4D timeline picker.
+  const pickerResults = useMemo(() => {
+    const q = pickerQ.trim().toLowerCase();
+    return library.filter((a) => {
+      if (pickerFolder !== "") {
+        const af = assetFolderPath(a.local_path);
+        if (af !== pickerFolder && !(af !== null && af.startsWith(pickerFolder + "/"))) return false;
+      }
+      if (!q) return true;
+      return (a.title ?? "").toLowerCase().includes(q) || (a.local_path ?? "").toLowerCase().includes(q);
+    });
+  }, [library, pickerQ, pickerFolder]);
+
+  /** Load a saved 4D timeline session: its layer videos become the source
+   *  list and its stems are copied into the song pool (first stem selected). */
+  const applyVizSession = async () => {
+    if (!vizSel) return;
+    setVizBusy(true);
+    setError(null);
+    try {
+      const r = await api.musicEditImportSession(projectId, vizSel);
+      if (r.assets.length > 0) setOrder(r.assets);
+      await loadSongs();
+      if (r.songs.length > 0) {
+        setSong(r.songs[0]!);
+        setAnalysis(null);
+      }
+      setLibraryRefresh((n) => n + 1); // restored media may have re-registered
+      if (r.warnings.length > 0) onToast(r.warnings.join(" — "), "info");
+      onToast(
+        `Loaded "${r.session.name}": ${r.assets.length} video${r.assets.length === 1 ? "" : "s"}${r.songs.length > 0 ? ` · song set to ${r.songs[0]}` : ""}`,
+        "success",
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setVizBusy(false);
+    }
+  };
   const manualInvalid = !settings.autoBeats && !(settings.manualBpm && settings.manualBpm > 0);
   const canPlan = !!song && order.length > 0 && !manualInvalid && !planning;
   const rendering = job?.status === "running";
@@ -455,7 +551,14 @@ export function MusicEdit({
             className="ui-input min-w-[16rem]"
             value={song}
             onChange={(e) => {
-              setSong(e.target.value);
+              const v = e.target.value;
+              // "lib:<assetId>" options import the library audio file into the
+              // song pool first, then select the freshly added song.
+              if (v.startsWith("lib:")) {
+                void importLibrarySong(v.slice(4));
+                return;
+              }
+              setSong(v);
               setAnalysis(null);
             }}
             aria-label="Song"
@@ -466,6 +569,15 @@ export function MusicEdit({
                 {s.name}
               </option>
             ))}
+            {audioAssets.length > 0 && (
+              <optgroup label="Library audio — pick to import">
+                {audioAssets.map((a) => (
+                  <option key={a.id} value={`lib:${a.id}`}>
+                    {(a.title ?? a.local_path ?? a.id)} ⤓
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
           <input
             ref={fileRef}
@@ -501,7 +613,10 @@ export function MusicEdit({
       </Card>
 
       {/* 2. Videos */}
-      <Card className="p-5 space-y-4">
+      {/* Raised above the following cards (.ui-card's backdrop-blur makes each
+          card its own stacking context) so the "+ Add a video" picker — which
+          overflows this card downward — paints over the sections below. */}
+      <Card className="p-5 space-y-4 relative z-10">
         <SectionTitle
           icon="▤"
           action={
@@ -512,33 +627,144 @@ export function MusicEdit({
         >
           2. Source videos (used in this order: V1 → V2 → … → V1)
         </SectionTitle>
-        <div className="grid md:grid-cols-2 gap-4">
-          <div className="space-y-2">
-            <input
-              className="ui-input w-full"
-              placeholder="Filter downloaded videos…"
-              value={libraryQuery}
-              onChange={(e) => setLibraryQuery(e.target.value)}
-            />
-            <div className="max-h-80 overflow-y-auto space-y-1 pr-1">
-              {libraryLoading && <Spinner />}
-              {!libraryLoading && library.length === 0 && (
-                <EmptyState icon="▤" title="No downloaded videos" description="Download footage from the 3D timeline or Library pages first." />
-              )}
-              {library.map((a) => (
-                <div key={a.id} className="flex items-center gap-2 text-sm rounded px-2 py-1 hover:bg-slate-700/30">
-                  <img src={api.assetThumbUrl(a.id)} alt="" className="w-16 h-9 object-cover rounded bg-slate-800" loading="lazy" />
-                  <span className="flex-1 truncate" title={a.local_path ?? ""}>
-                    {a.title || a.local_path}
-                  </span>
-                  <span className="text-slate-500 text-xs">{a.duration_seconds ? `${a.duration_seconds.toFixed(1)}s` : ""}</span>
-                  <Button size="sm" disabled={inOrder.has(a.id)} onClick={() => setOrder((o) => [...o, a])}>
-                    Add
-                  </Button>
+        <div className="flex flex-wrap items-center gap-3">
+          {/* + Add a video… — the same picker UX as the 4D timeline's
+              "2. Layers → Add a layer": name filter + folder sidebar, stays
+              open for multiple picks. */}
+          <div className="relative w-80 max-w-full">
+            <button
+              type="button"
+              className="ui-input w-full text-left text-slate-300 flex items-center justify-between gap-2"
+              onClick={() => {
+                if (!pickerOpen) setLibraryRefresh((n) => n + 1); // rescan the folder so the list is current
+                setPickerQ("");
+                setPickerOpen((o) => !o);
+              }}
+            >
+              <span>+ Add a video…</span>
+              <span className="text-slate-500">▾</span>
+            </button>
+            {pickerOpen && (
+              <>
+                {/* Click-away overlay + Esc close. */}
+                <div className="fixed inset-0 z-40" onClick={() => setPickerOpen(false)} />
+                <div
+                  className="absolute z-50 mt-1 w-[30rem] max-w-[90vw] rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden"
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setPickerOpen(false);
+                  }}
+                >
+                  <div className="flex items-center gap-1.5 px-2 py-1.5 border-b border-slate-800">
+                    <input
+                      autoFocus
+                      value={pickerQ}
+                      onChange={(e) => setPickerQ(e.target.value)}
+                      placeholder="Filter by name…"
+                      className="ui-input !py-1 flex-1 text-xs"
+                    />
+                  </div>
+                  <div className="flex max-h-64">
+                    {assetFolders.length > 0 && (
+                      <div className="w-32 shrink-0 overflow-y-auto border-r border-slate-800 p-1 space-y-0.5">
+                        {assetFolders.map((f) => {
+                          const active = pickerFolder === f.path;
+                          return (
+                            <button
+                              key={f.path || "__root__"}
+                              type="button"
+                              onClick={() => setPickerFolder(f.path)}
+                              className={`w-full text-left py-1 pr-1 rounded text-[11px] flex items-center justify-between gap-1 ${active ? "bg-sky-600/30 text-sky-200" : "text-slate-300 hover:bg-slate-800"}`}
+                              style={{ paddingLeft: `${4 + f.depth * 10}px` }}
+                              title={f.path ? `${f.path} — ${f.fileCount} here, ${f.subtreeCount} incl. subfolders` : "All files"}
+                            >
+                              <span className="truncate">{f.path === "" ? "All files" : f.name}</span>
+                              <span className={`shrink-0 ${active ? "text-sky-300" : "text-slate-500"}`}>{f.subtreeCount}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                    <div className="flex-1 min-w-0 overflow-y-auto">
+                      {pickerResults.map((a) => {
+                        const added = inOrder.has(a.id);
+                        return (
+                          <button
+                            key={a.id}
+                            type="button"
+                            disabled={added}
+                            onClick={() => addToOrder(a)}
+                            className="w-full flex items-center gap-2 px-2 py-1.5 text-left text-xs text-slate-200 hover:bg-slate-800/60 disabled:opacity-50"
+                          >
+                            <img
+                              src={api.assetThumbUrl(a.id)}
+                              alt=""
+                              loading="lazy"
+                              className="w-12 h-8 rounded object-cover border border-slate-700/60 bg-slate-800 shrink-0"
+                              onError={(e) => (e.currentTarget.style.display = "none")}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate" title={a.title ?? a.local_path ?? a.id}>
+                                {a.title ?? a.local_path ?? a.id}
+                              </span>
+                              <span className="flex items-center gap-1.5 text-[10px] text-slate-500">
+                                {a.duration_seconds ? <span>{a.duration_seconds.toFixed(0)}s</span> : null}
+                                {a.width && a.height ? (
+                                  <span>
+                                    {a.width}×{a.height}
+                                  </span>
+                                ) : null}
+                              </span>
+                            </span>
+                            {added && <span className="text-[10px] text-sky-400 shrink-0">added ✓</span>}
+                          </button>
+                        );
+                      })}
+                      {pickerResults.length === 0 && (
+                        <p className="px-3 py-3 text-xs text-slate-500">
+                          {library.length === 0
+                            ? "No downloaded videos in this project — KEEP assets on Library/Folders or drop files onto the app first."
+                            : pickerFolder !== ""
+                              ? `Nothing in "${pickerFolder}" — pick another folder or "All files".`
+                              : "No matches — adjust the name filter."}
+                        </p>
+                      )}
+                    </div>
+                  </div>
                 </div>
-              ))}
-            </div>
+              </>
+            )}
           </div>
+          {libraryLoading && <Spinner />}
+          {/* …or reuse a saved 4D timeline session — its layer videos become
+              the source list and its stems join the song pool. */}
+          {vizSessions.length > 0 && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-500">or</span>
+              <select value={vizSel} onChange={(e) => setVizSel(e.target.value)} className="ui-input text-xs min-w-0 max-w-56" aria-label="4D timeline session">
+                {vizSessions.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={!vizSel || vizBusy}
+                onClick={() => void applyVizSession()}
+                title="Load this 4D timeline session — its layer videos become the source list and its stems are added to the song list"
+              >
+                {vizBusy ? "…" : "Use session"}
+              </Button>
+            </div>
+          )}
+        </div>
+        {!libraryLoading && library.length === 0 && (
+          <p className="text-[11px] text-slate-500">
+            No downloaded videos in this project — KEEP assets on Library/Folders or drop files onto the app first.
+          </p>
+        )}
+        <div className="grid gap-4">
           <div className="space-y-1">
             <div className="flex items-center justify-between text-xs text-slate-400">
               <span>{order.length} selected</span>
