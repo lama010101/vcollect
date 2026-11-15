@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { EditPlan, MusicEditSettings, VizSessionMeta } from "@twio/shared";
+import type { CutGridSpec, EditPlan, EdlBoundaryKind, MusicEditSettings, VizSessionMeta } from "@twio/shared";
 import {
   api,
   ASSETS_CHANGED_EVENT,
@@ -14,6 +14,7 @@ import {
   type MusicRenderJob,
   type MusicRenderedFile,
   type MusicSong,
+  type VizStem,
 } from "../api.js";
 import { Badge, Button, Card, ProgressBar, SectionTitle, Spinner, StatCard } from "../components/ui.js";
 
@@ -24,6 +25,10 @@ import { Badge, Button, Card, ProgressBar, SectionTitle, Spinner, StatCard } fro
  * Source videos are the project's downloaded assets, used round-robin in the
  * order listed here.
  */
+
+/** Cut-grid source selector values (mapped to CutGridSpec.source in the
+ *  request builder — "every_n"/"stem" are the UI's shorter names). */
+type CutSource = "beats" | "every_n" | "bars" | "stem" | "sections";
 
 type Settings = Pick<
   MusicEditSettings,
@@ -38,7 +43,30 @@ type Settings = Pick<
   | "fps"
   | "maxOutputHeight"
   | "aspect"
-> & { manualBpm: number | undefined };
+> & {
+  manualBpm: number | undefined;
+  // --- Cut grid (only used while autoBeats is on) -------------------------
+  cutSource: CutSource;
+  cutEvery: number; // every_n: beats between cuts (1, 2, 4, 8, 16)
+  barsMeter: 3 | 4; // bars: beats per bar
+  stemName: string; // stem: file name in the visualizer stem pool
+  stemBand: "full" | "kick" | "snare_hat";
+  stemMinGap: number; // seconds between stem-hit cuts
+  stemThreshold: number; // 0..1 relative onset threshold
+  sectionAuto: boolean; // sections: auto density vs per-class overrides
+  sectionQuiet: number; // beats per cut in quiet sections (1,2,4,8)
+  sectionMedium: number;
+  sectionLoud: number;
+  // --- Intercut (parallel storylines) --------------------------------------
+  mode: "flat" | "intercut";
+  slotsPerSlice: number; // consecutive cut slots one storyline holds
+  endOfMaterial: "loop" | "retire";
+  storylineCount: number; // storyline slots offered in the per-source picker
+  storylineOf: Record<string, number>; // assetId → 1-based storyline number
+  // --- Motion alignment -----------------------------------------------------
+  alignMotion: boolean; // shift in-points so a motion peak lands on the cut
+  motionWindow: number; // ±seconds search around the cursor
+};
 
 const DEFAULT_SETTINGS: Settings = {
   autoBeats: true,
@@ -53,7 +81,28 @@ const DEFAULT_SETTINGS: Settings = {
   fps: 30,
   maxOutputHeight: 1080,
   aspect: "16:9",
+  cutSource: "every_n",
+  cutEvery: 2,
+  barsMeter: 4,
+  stemName: "",
+  stemBand: "full",
+  stemMinGap: 0.25,
+  stemThreshold: 0.12,
+  sectionAuto: true,
+  sectionQuiet: 4,
+  sectionMedium: 2,
+  sectionLoud: 1,
+  mode: "flat",
+  slotsPerSlice: 1,
+  endOfMaterial: "loop",
+  storylineCount: 4,
+  storylineOf: {},
+  alignMotion: false,
+  motionWindow: 0.5,
 };
+
+const CUT_EVERY_OPTIONS = [1, 2, 4, 8, 16];
+const SECTION_DENSITY_OPTIONS = [1, 2, 4, 8];
 
 const CUT_MODES: Array<{ value: Settings["beatsPerCut"]; label: string }> = [
   { value: 1, label: "Every beat" },
@@ -63,6 +112,10 @@ const CUT_MODES: Array<{ value: Settings["beatsPerCut"]; label: string }> = [
 ];
 
 const EDL_PREVIEW_ROWS = 300;
+
+/** Short label for an EDL boundary that isn't a detected-beat index. */
+const boundaryLabel = (kind: EdlBoundaryKind): string =>
+  kind === "audio_start" ? "start" : kind === "audio_end" ? "end" : kind === "manual_grid" ? "grid" : kind;
 
 // --- Per-project session persistence ------------------------------------------
 // All Music Edit work (song choice, clip order, settings, analysis, built EDL,
@@ -200,6 +253,8 @@ export function MusicEdit({
   const [vizSessions, setVizSessions] = useState<VizSessionMeta[]>([]);
   const [vizSel, setVizSel] = useState("");
   const [vizBusy, setVizBusy] = useState(false);
+  // Visualizer stem pool — the "Stem hits" cut-grid source picks one of these.
+  const [vizStemList, setVizStemList] = useState<VizStem[]>([]);
   const [order, setOrder] = useState<Asset[]>(initial?.orderAssets ?? []);
   const [settings, setSettings] = useState<Settings>(initial?.settings ?? DEFAULT_SETTINGS);
   const [plan, setPlan] = useState<EditPlan | null>(initial?.plan ?? null);
@@ -335,6 +390,11 @@ export function MusicEdit({
         setVizSel((cur) => (r.sessions.some((s) => s.id === cur) ? cur : (r.sessions[0]?.id ?? "")));
       })
       .catch(() => {}); // sessions are optional — keep the picker hidden
+    // The stem pool feeds the "Stem hits" cut-grid picker.
+    api
+      .vizStems(projectId)
+      .then((r) => setVizStemList(r.stems))
+      .catch(() => {});
     return () => {
       live = false;
     };
@@ -360,14 +420,72 @@ export function MusicEdit({
     return () => clearInterval(t);
   }, [job, onToast, loadRenders]);
 
-  const request = useMemo<MusicEditRequest>(
-    () => ({
+  const request = useMemo<MusicEditRequest>(() => {
+    // Map the UI's cut-source selection onto the API's CutGridSpec. No grid
+    // is sent while automatic beats are off (manual BPM grid stays legacy).
+    let grid: CutGridSpec | undefined;
+    if (settings.autoBeats) {
+      switch (settings.cutSource) {
+        case "beats":
+          grid = { source: "beats" };
+          break;
+        case "every_n":
+          grid = { source: "every_n_beats", n: settings.cutEvery, offset: settings.beatOffset };
+          break;
+        case "bars":
+          grid = { source: "bars", beatsPerBar: settings.barsMeter };
+          break;
+        case "stem":
+          if (settings.stemName) {
+            grid = {
+              source: "stem_onsets",
+              stem: settings.stemName,
+              band: settings.stemBand,
+              minGap: settings.stemMinGap,
+              threshold: settings.stemThreshold,
+            };
+          }
+          break;
+        case "sections":
+          grid = settings.sectionAuto
+            ? { source: "sections" }
+            : {
+                source: "sections",
+                quietEvery: settings.sectionQuiet as 1 | 2 | 4 | 8,
+                mediumEvery: settings.sectionMedium as 1 | 2 | 4 | 8,
+                loudEvery: settings.sectionLoud as 1 | 2 | 4 | 8,
+              };
+          break;
+      }
+    }
+    // Intercut: group the ordered sources into storylines by their assigned
+    // storyline number (order-list order is preserved inside each storyline).
+    let intercut: MusicEditRequest["intercut"];
+    if (settings.mode === "intercut" && order.length > 0) {
+      const groups = new Map<number, string[]>();
+      for (const a of order) {
+        const n = Math.min(settings.storylineCount, Math.max(1, settings.storylineOf[a.id] ?? 1));
+        const g = groups.get(n);
+        if (g) g.push(a.id);
+        else groups.set(n, [a.id]);
+      }
+      intercut = {
+        slotsPerSlice: settings.slotsPerSlice,
+        endOfMaterial: settings.endOfMaterial,
+        rotation: "roundRobin",
+        storylines: [...groups.keys()]
+          .sort((x, y) => x - y)
+          .map((n) => ({ name: `Storyline ${n}`, assetIds: groups.get(n)! })),
+      };
+    }
+    return {
       song,
       assetIds: order.map((a) => a.id),
       settings: { ...settings, manualBpm: settings.autoBeats ? undefined : settings.manualBpm },
-    }),
-    [song, order, settings],
-  );
+      grid,
+      intercut,
+    };
+  }, [song, order, settings]);
   const requestKey = useMemo(() => JSON.stringify(request), [request]);
 
   // The previewed plan stays valid only while inputs still match the request
@@ -471,7 +589,15 @@ export function MusicEdit({
     });
 
   const inOrder = new Set(order.map((a) => a.id));
-  const addToOrder = (a: Asset) => setOrder((o) => (o.some((x) => x.id === a.id) ? o : [...o, a]));
+  const addToOrder = (a: Asset) => {
+    setSettings((s) => ({
+      ...s,
+      // Default storyline assignment spreads clips round-robin so intercut
+      // is meaningful immediately; explicit picks persist per asset id.
+      storylineOf: { ...s.storylineOf, [a.id]: s.storylineOf[a.id] ?? ((order.length % s.storylineCount) + 1) },
+    }));
+    setOrder((o) => (o.some((x) => x.id === a.id) ? o : [...o, a]));
+  };
 
   // The picker's rows: library filtered by name + the selected assets-folder
   // subtree ("" = all folders) — same filtering as the 4D timeline picker.
@@ -514,7 +640,8 @@ export function MusicEdit({
     }
   };
   const manualInvalid = !settings.autoBeats && !(settings.manualBpm && settings.manualBpm > 0);
-  const canPlan = !!song && order.length > 0 && !manualInvalid && !planning;
+  const stemMissing = settings.autoBeats && settings.cutSource === "stem" && !settings.stemName;
+  const canPlan = !!song && order.length > 0 && !manualInvalid && !stemMissing && !planning;
   const rendering = job?.status === "running";
   const cutLabel = CUT_MODES.find((m) => m.value === settings.beatsPerCut)?.label ?? "";
 
@@ -625,7 +752,7 @@ export function MusicEdit({
             </Button>
           }
         >
-          2. Source videos (used in this order: V1 → V2 → … → V1)
+          2. Source videos{settings.mode === "intercut" ? " (intercut — parallel storylines)" : " (used in this order: V1 → V2 → … → V1)"}
         </SectionTitle>
         <div className="flex flex-wrap items-center gap-3">
           {/* + Add a video… — the same picker UX as the 4D timeline's
@@ -781,6 +908,21 @@ export function MusicEdit({
                   <Badge tone="info">V{i + 1}</Badge>
                   <span className="flex-1 truncate">{a.title || a.local_path}</span>
                   <span className="text-slate-500 text-xs">{a.duration_seconds ? `${a.duration_seconds.toFixed(1)}s` : ""}</span>
+                  {settings.mode === "intercut" && (
+                    <select
+                      className="ui-input !w-auto !py-0.5 text-xs"
+                      value={settings.storylineOf[a.id] ?? 1}
+                      onChange={(e) => set("storylineOf", { ...settings.storylineOf, [a.id]: Number(e.target.value) })}
+                      aria-label={`Storyline for ${a.title || a.local_path}`}
+                      title="Storyline"
+                    >
+                      {Array.from({ length: settings.storylineCount }, (_, i) => i + 1).map((n) => (
+                        <option key={n} value={n}>
+                          SL{n}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                   <Button size="sm" variant="ghost" onClick={() => move(i, -1)} disabled={i === 0} aria-label="Move up">
                     ↑
                   </Button>
@@ -794,6 +936,46 @@ export function MusicEdit({
               ))}
             </ol>
           </div>
+          {/* Intercut mode — group the ordered clips into parallel
+              storylines that rotate on the cut grid. */}
+          <div className="flex flex-wrap items-end gap-4 text-sm border-t border-slate-800 pt-3">
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={settings.mode === "intercut"} onChange={(e) => set("mode", e.target.checked ? "intercut" : "flat")} />
+              <span className="text-slate-300">Intercut — several storylines unfold in parallel</span>
+            </label>
+            {settings.mode === "intercut" && (
+              <>
+                <label className="space-y-1">
+                  <span className="text-slate-400 text-xs">Storylines</span>
+                  <select className="ui-input" value={settings.storylineCount} onChange={(e) => set("storylineCount", Number(e.target.value))}>
+                    {[2, 3, 4, 6, 8].map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400 text-xs">Slots per storyline</span>
+                  <select className="ui-input" value={settings.slotsPerSlice} onChange={(e) => set("slotsPerSlice", Number(e.target.value))}>
+                    {[1, 2, 4].map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400 text-xs">When a storyline runs out</span>
+                  <select className="ui-input" value={settings.endOfMaterial} onChange={(e) => set("endOfMaterial", e.target.value as "loop" | "retire")}>
+                    <option value="loop">Loop it</option>
+                    <option value="retire">Retire it</option>
+                  </select>
+                </label>
+                <p className="text-[11px] text-slate-500 pb-1">Assign each clip a storyline (SL#) above; clips inside a storyline play in order, continuously.</p>
+              </>
+            )}
+          </div>
         </div>
       </Card>
 
@@ -804,22 +986,135 @@ export function MusicEdit({
           <input type="checkbox" checked={settings.autoBeats} onChange={(e) => set("autoBeats", e.target.checked)} />
           Automatic beat detection (cut on beats detected in the waveform)
         </label>
-        <div className="flex flex-wrap gap-4 text-sm" role="radiogroup" aria-label="Cut mode">
-          {CUT_MODES.map((m) => (
-            <label key={m.value} className="flex items-center gap-2">
-              <input type="radio" name="cut-mode" checked={settings.beatsPerCut === m.value} onChange={() => set("beatsPerCut", m.value)} />
-              {m.label}
+        {settings.autoBeats ? (
+          <div className="space-y-3">
+            <label className="flex items-center gap-3 text-sm">
+              <span className="text-slate-400 w-20 shrink-0">Cut on</span>
+              <select
+                className="ui-input"
+                value={settings.cutSource}
+                onChange={(e) => set("cutSource", e.target.value as CutSource)}
+                aria-label="Cut on"
+              >
+                <option value="beats">Beats — every detected beat</option>
+                <option value="every_n">Every N beats</option>
+                <option value="bars">Bars (downbeats)</option>
+                <option value="stem">Stem hits</option>
+                <option value="sections">Auto by section</option>
+              </select>
             </label>
-          ))}
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-          {settings.autoBeats ? (
-            <label className="space-y-1">
-              <span className="text-slate-400">Start offset (beats)</span>
-              <NumberInput min={0} max={7} step={1} value={settings.beatOffset} onCommit={(v) => set("beatOffset", Math.round(v))} />
-            </label>
-          ) : (
-            <>
+
+            {settings.cutSource === "every_n" && (
+              <div className="flex flex-wrap gap-4 text-sm">
+                <label className="space-y-1">
+                  <span className="text-slate-400">Every N beats</span>
+                  <select className="ui-input" value={settings.cutEvery} onChange={(e) => set("cutEvery", Number(e.target.value))}>
+                    {CUT_EVERY_OPTIONS.map((n) => (
+                      <option key={n} value={n}>
+                        {n === 1 ? "Every beat" : `Every ${n} beats`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400">Start offset (beats)</span>
+                  <NumberInput min={0} max={7} step={1} value={settings.beatOffset} onCommit={(v) => set("beatOffset", Math.round(v))} />
+                </label>
+              </div>
+            )}
+
+            {settings.cutSource === "bars" && (
+              <div className="flex flex-wrap items-end gap-4 text-sm">
+                <label className="space-y-1">
+                  <span className="text-slate-400">Meter</span>
+                  <select className="ui-input" value={settings.barsMeter} onChange={(e) => set("barsMeter", Number(e.target.value) as 3 | 4)}>
+                    <option value={4}>4/4</option>
+                    <option value={3}>3/4</option>
+                  </select>
+                </label>
+                <p className="text-xs text-slate-500 pb-1">
+                  Bar phase is picked automatically — the beat position with the strongest summed onset strength starts each bar.
+                </p>
+              </div>
+            )}
+
+            {settings.cutSource === "stem" && (
+              <div className="flex flex-wrap gap-4 text-sm">
+                <label className="space-y-1 min-w-56">
+                  <span className="text-slate-400">Stem</span>
+                  <select className="ui-input w-full" value={settings.stemName} onChange={(e) => set("stemName", e.target.value)}>
+                    <option value="">{vizStemList.length ? "Select a stem…" : "No stems in the pool"}</option>
+                    {vizStemList.map((s) => (
+                      <option key={s.name} value={s.name}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400">Band</span>
+                  <select className="ui-input" value={settings.stemBand} onChange={(e) => set("stemBand", e.target.value as Settings["stemBand"])}>
+                    <option value="full">Full spectrum</option>
+                    <option value="kick">Kick (&lt;150 Hz)</option>
+                    <option value="snare_hat">Snare / hats</option>
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400">Min gap (s)</span>
+                  <NumberInput min={0.05} max={2} step={0.05} value={settings.stemMinGap} onCommit={(v) => set("stemMinGap", v)} />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400">Threshold (0–1)</span>
+                  <NumberInput min={0} max={1} step={0.01} value={settings.stemThreshold} onCommit={(v) => set("stemThreshold", v)} />
+                </label>
+                {vizStemList.length === 0 && (
+                  <p className="text-xs text-slate-500 self-end">No stems yet — upload or split one on the Visualizer page first.</p>
+                )}
+              </div>
+            )}
+
+            {settings.cutSource === "sections" && (
+              <div className="space-y-2 text-sm">
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={settings.sectionAuto} onChange={(e) => set("sectionAuto", e.target.checked)} />
+                  Auto density — the song is split into energy sections; louder sections get more cuts (quiet → every 4 beats, medium → 2, loud → 1)
+                </label>
+                {!settings.sectionAuto && (
+                  <div className="flex flex-wrap gap-4">
+                    {(
+                      [
+                        ["Quiet sections", "sectionQuiet"],
+                        ["Medium sections", "sectionMedium"],
+                        ["Loud sections", "sectionLoud"],
+                      ] as Array<[string, "sectionQuiet" | "sectionMedium" | "sectionLoud"]>
+                    ).map(([label, key]) => (
+                      <label key={key} className="space-y-1">
+                        <span className="text-slate-400">{label} — cut every</span>
+                        <select className="ui-input" value={settings[key]} onChange={(e) => set(key, Number(e.target.value))}>
+                          {SECTION_DENSITY_OPTIONS.map((n) => (
+                            <option key={n} value={n}>
+                              {n} beat{n === 1 ? "" : "s"}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <>
+            <div className="flex flex-wrap gap-4 text-sm" role="radiogroup" aria-label="Cut mode">
+              {CUT_MODES.map((m) => (
+                <label key={m.value} className="flex items-center gap-2">
+                  <input type="radio" name="cut-mode" checked={settings.beatsPerCut === m.value} onChange={() => set("beatsPerCut", m.value)} />
+                  {m.label}
+                </label>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-4 text-sm">
               <label className="space-y-1">
                 <span className="text-slate-400">Manual BPM</span>
                 <input type="number" min={20} max={300} className="ui-input w-full" value={settings.manualBpm ?? ""} onChange={(e) => set("manualBpm", e.target.value === "" ? undefined : Number(e.target.value))} />
@@ -828,8 +1123,10 @@ export function MusicEdit({
                 <span className="text-slate-400">First cut at (s)</span>
                 <NumberInput min={0} max={600} step={0.001} value={settings.manualOffsetSeconds} onCommit={(v) => set("manualOffsetSeconds", v)} />
               </label>
-            </>
-          )}
+            </div>
+          </>
+        )}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
           <label className="space-y-1">
             <span className="text-slate-400">Max speed-up (×)</span>
             <NumberInput min={1} max={4} step={0.05} value={settings.maxSpeedUp} onCommit={(v) => set("maxSpeedUp", v)} />
@@ -876,6 +1173,17 @@ export function MusicEdit({
             <input type="checkbox" checked={settings.allowExtremeRetime} onChange={(e) => set("allowExtremeRetime", e.target.checked)} />
             Allow retiming beyond the limits when nothing fits
           </label>
+          <label className="flex items-center gap-2" title="Shift each clip's in-point so a detected motion peak lands on the cut">
+            <input type="checkbox" checked={settings.alignMotion} onChange={(e) => set("alignMotion", e.target.checked)} />
+            Align motion to cuts
+            {settings.alignMotion && (
+              <span className="flex items-center gap-1 text-slate-400">
+                ±
+                <NumberInput min={0.05} max={2} step={0.05} value={settings.motionWindow} onCommit={(v) => set("motionWindow", v)} />
+                s
+              </span>
+            )}
+          </label>
         </div>
         <p className="text-xs text-slate-500">Output: MP4 · H.264 · original song audio (AAC, never retimed) · never upscaled beyond the largest source.</p>
         <div className="flex flex-wrap gap-3">
@@ -903,12 +1211,52 @@ export function MusicEdit({
         <Card className="p-5 space-y-4">
           <SectionTitle icon="▬">4. Edit decision list</SectionTitle>
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-            <StatCard label="Cut mode" value={plan.timing === "detected_beats" ? cutLabel : `${cutLabel} (manual grid)`} sublabel={plan.timing === "detected_beats" ? "detected beats" : `${plan.bpm} BPM grid`} />
-            <StatCard label="Clips" value={plan.stats.segmentCount} sublabel={`${plan.width}×${plan.height} @ ${plan.fps} fps`} />
+            <StatCard
+              label="Cut mode"
+              value={plan.grid?.label ?? (plan.timing === "detected_beats" ? cutLabel : `${cutLabel} (manual grid)`)}
+              sublabel={
+                plan.grid
+                  ? `${plan.grid.cutCount} cuts · ${plan.grid.source.replace(/_/g, " ")}`
+                  : plan.timing === "detected_beats"
+                    ? "detected beats"
+                    : `${plan.bpm} BPM grid`
+              }
+            />
+            <StatCard
+              label="Clips"
+              value={plan.stats.segmentCount}
+              sublabel={
+                plan.intercut
+                  ? `intercut · ${plan.intercut.storylines.length} storylines · ${plan.intercut.slotsPerSlice} slot${plan.intercut.slotsPerSlice === 1 ? "" : "s"}/slice · ${plan.intercut.endOfMaterial}`
+                  : `${plan.width}×${plan.height} @ ${plan.fps} fps`
+              }
+            />
             <StatCard label="Average clip" value={`${plan.stats.averageClipDuration.toFixed(3)} s`} sublabel={`${plan.stats.minClipDuration.toFixed(3)}–${plan.stats.maxClipDuration.toFixed(3)} s`} />
             <StatCard label="Retimed clips" value={plan.stats.retimedCount} sublabel={`speed ${plan.stats.minSpeed.toFixed(3)}×–${plan.stats.maxSpeed.toFixed(3)}×`} tone={plan.stats.retimedCount ? "warn" : "default"} />
             <StatCard label="Looped clips" value={plan.stats.loopedCount} sublabel={`song ${mmss(plan.audioDuration)}`} />
           </div>
+          {/* Cut-grid preview — a tick per clip start on the song timeline
+              (there's no waveform on this page, so the strip is the preview). */}
+          {plan.grid && (
+            <div className="space-y-1">
+              <div
+                className="relative h-2.5 rounded bg-slate-800 overflow-hidden"
+                title={`${plan.grid.label} — ${plan.grid.cutCount} cuts over ${plan.audioDuration.toFixed(1)}s`}
+              >
+                {plan.entries.map((e) => (
+                  <div
+                    key={e.index}
+                    className="absolute top-0 bottom-0 w-px bg-sky-400/80"
+                    style={{ left: `${Math.min(100, Math.max(0, (e.outputStart / plan.audioDuration) * 100))}%` }}
+                  />
+                ))}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                {plan.grid.label}
+                {plan.grid.detail ? ` — ${plan.grid.detail}` : ""} · {plan.grid.cutCount} cuts
+              </p>
+            </div>
+          )}
           <div className="overflow-x-auto max-h-96 overflow-y-auto">
             <table className="w-full text-xs tabular-nums">
               <thead className="text-slate-400 sticky top-0 bg-slate-900">
@@ -919,6 +1267,7 @@ export function MusicEdit({
                   <th className="p-1">Source</th>
                   <th className="p-1">Source range (s)</th>
                   <th className="p-1">Speed</th>
+                  {plan.intercut && <th className="p-1">Storyline</th>}
                 </tr>
               </thead>
               <tbody>
@@ -929,7 +1278,7 @@ export function MusicEdit({
                       {e.outputStart.toFixed(3)} → {e.outputEnd.toFixed(3)}
                     </td>
                     <td className="p-1 text-slate-400">
-                      {e.startBeat ?? (e.startKind === "audio_start" ? "start" : "grid")} → {e.endBeat ?? (e.endKind === "audio_end" ? "end" : "grid")}
+                      {e.startBeat ?? boundaryLabel(e.startKind)} → {e.endBeat ?? boundaryLabel(e.endKind)}
                     </td>
                     <td className="p-1 truncate max-w-[16rem]" title={e.source}>
                       {e.source}
@@ -940,10 +1289,21 @@ export function MusicEdit({
                       {e.restartedSource && <Badge className="ml-1">restart</Badge>}
                     </td>
                     <td className="p-1">{Math.abs(e.speed - 1) > 1e-4 ? <Badge tone="warn">{e.speed.toFixed(3)}×</Badge> : "1.000×"}</td>
+                    {plan.intercut && (
+                      <td className="p-1 text-slate-400 whitespace-nowrap">
+                        {e.storylineName ?? "—"}
+                        {(e.storylineLoop ?? 0) > 0 && <Badge tone="violet" className="ml-1">↻{e.storylineLoop}</Badge>}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
             </table>
+            {plan.intercut && plan.intercut.shortSlots > 0 && (
+              <p className="text-xs text-amber-400/90 p-2">
+                {plan.intercut.shortSlots} cut{plan.intercut.shortSlots === 1 ? "" : "s"} shorter than 100 ms — the cut grid is very dense for intercut; consider fewer beats per cut or wider slots.
+              </p>
+            )}
             {plan.entries.length > EDL_PREVIEW_ROWS && (
               <p className="text-xs text-slate-500 p-2">Showing the first {EDL_PREVIEW_ROWS} of {plan.entries.length} clips — download the EDL for all.</p>
             )}

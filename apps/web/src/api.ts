@@ -1,7 +1,7 @@
 // Thin fetch wrapper for the backend API.
 // Same-origin "/api" in dev (Vite proxy) and when the backend serves the SPA.
 // Set VITE_API_URL to point the deployed frontend at a hosted backend.
-import type { BeatAnalysis, EditPlan, FormatAspect, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VisualizerSessionPayload, VizSession, VizSessionMeta, VizVideoKeyConfig, WorldCamRequest } from "@twio/shared";
+import type { BeatAnalysis, CutGridSpec, EditPlan, FormatAspect, MusicEditIntercut, MusicEditSettings, StemSignal, StemSignalMeta, VisualizerRenderRequest, VisualizerSessionPayload, VizSession, VizSessionMeta, VizVideoKeyConfig, WorldCamRequest } from "@twio/shared";
 const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
 /** Fired on `window` after local uploads complete so asset lists (Folders,
@@ -602,6 +602,11 @@ export interface MusicEditRequest {
   song: string;
   assetIds: string[];
   settings: Partial<MusicEditSettings>;
+  /** Cut-grid spec — where the EDL's cut marks come from. Absent = the
+   *  legacy beatsPerCut/beatOffset (or manual BPM) behaviour. */
+  grid?: CutGridSpec;
+  /** Intercut mode — parallel storylines. Absent = flat round-robin. */
+  intercut?: MusicEditIntercut;
 }
 
 // --- Format (aspect-ratio reframe) ---------------------------------------------

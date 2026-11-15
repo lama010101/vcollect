@@ -20,11 +20,13 @@
 
 import type { FastifyInstance } from "fastify";
 import { basename, join } from "node:path";
-import { DEFAULT_PROJECT_ID, musicEditAnalyzeSchema, musicEditImportSessionSchema, musicEditPlanSchema } from "@twio/shared";
+import { DEFAULT_PROJECT_ID, musicEditAnalyzeSchema, musicEditImportSessionSchema, musicEditPlanSchema, type CutGridSpec, type MusicEditIntercut, type MusicEditSettings } from "@twio/shared";
 import { analyzeSong, analyzerStatus } from "../musicEdit/beatAnalysis.js";
+import { resolveCutGrid } from "../musicEdit/cutGridService.js";
 import { MusicEditError } from "../musicEdit/errors.js";
 import {
   analysisSummary,
+  attachMotionPeaks,
   buildPlan,
   cancelRenderJob,
   getRenderJob,
@@ -34,6 +36,7 @@ import {
   MAX_SONG_BYTES,
   projectMusicDir,
   resolveAssetSources,
+  resolveIntercut,
   saveSong,
   songPath,
   startRenderJob,
@@ -87,12 +90,33 @@ export async function registerMusicEditRoutes(app: FastifyInstance): Promise<voi
     return { analysis: analysisSummary(await analyzeSong(songPath(projectOf(req.query), song))) };
   });
 
+  // Shared plan/render prep: analyse the song, resolve sources and — when the
+  // request carries a cut-grid spec — turn it into concrete cut marks. The
+  // grid resolution (stem decode / energy sections) runs in parallel with
+  // the source probing; both are cached where expensive.
+  const prepare = async (
+    input: { song: string; assetIds: string[]; settings: MusicEditSettings; grid?: CutGridSpec; intercut?: MusicEditIntercut },
+    projectId: string,
+  ) => {
+    const file = songPath(projectId, input.song);
+    // Intercut probes the union of storyline clips once; flat mode probes
+    // assetIds as before. Both run alongside the (cached) grid resolution.
+    const icP = input.intercut ? resolveIntercut(input.intercut) : Promise.resolve(null);
+    const song = await analyzeSong(file);
+    const [sources, grid, ic] = await Promise.all([
+      icP.then((r) => (r ? r.sources : resolveAssetSources(input.assetIds))),
+      input.grid ? resolveCutGrid(projectId, file, song, input.grid) : Promise.resolve(undefined),
+      icP,
+    ]);
+    if (input.settings.alignMotion) await attachMotionPeaks(sources);
+    return { song, sources, grid, intercut: ic ?? undefined };
+  };
+
   app.post("/api/music-edit/plan", async (req) => {
     const input = parseBody(musicEditPlanSchema, req.body);
     const projectId = projectOf(req.query);
-    const song = await analyzeSong(songPath(projectId, input.song));
-    const sources = await resolveAssetSources(input.assetIds);
-    const plan = buildPlan(song, sources, input.settings);
+    const { song, sources, grid, intercut } = await prepare(input, projectId);
+    const plan = buildPlan(song, sources, input.settings, grid, intercut);
     return {
       analysis: analysisSummary(song),
       sources: sources.map(({ path: _p, ...s }) => s),
@@ -103,11 +127,9 @@ export async function registerMusicEditRoutes(app: FastifyInstance): Promise<voi
   app.post("/api/music-edit/render", async (req) => {
     const input = parseBody(musicEditPlanSchema, req.body);
     const projectId = projectOf(req.query);
-    const file = songPath(projectId, input.song);
-    const song = await analyzeSong(file);
-    const sources = await resolveAssetSources(input.assetIds);
-    const plan = buildPlan(song, sources, input.settings);
-    return { job: startRenderJob(projectId, input.song, { song, sources, plan }, file) };
+    const { song, sources, grid, intercut } = await prepare(input, projectId);
+    const plan = buildPlan(song, sources, input.settings, grid, intercut);
+    return { job: startRenderJob(projectId, input.song, { song, sources, plan }, songPath(projectId, input.song)) };
   });
 
   app.get("/api/music-edit/render/:id", async (req) => ({ job: getRenderJob((req.params as { id: string }).id) }));

@@ -13,8 +13,10 @@ import { getAsset } from "../db/repository.js";
 import { assetAbsolutePath } from "../routes/folders.js";
 import { probe, probeAudio } from "../video/ffprobe.js";
 import { analyzeSong, type AnalyzedSong } from "./beatAnalysis.js";
-import { planEdit, type PlanSource } from "./edl.js";
+import type { ResolvedCutGrid } from "./cutGridService.js";
+import { planEdit, type PlanSource, type PlanStoryline } from "./edl.js";
 import { MusicEditError } from "./errors.js";
+import { analyzeMotionFile } from "./motionProfile.js";
 import { renderEdit, type RenderProgress, type RenderSource } from "./render.js";
 
 /** Canonical audio-extension list lives in config.ts (AUDIO_FILE_EXTENSIONS)
@@ -180,13 +182,86 @@ export interface PreparedEdit {
   plan: EditPlan;
 }
 
-export function buildPlan(song: AnalyzedSong, sources: ResolvedSource[], settings: MusicEditSettings): EditPlan {
+export interface ResolvedIntercut {
+  slotsPerSlice: number;
+  endOfMaterial: "loop" | "retire";
+  rotation: "roundRobin";
+  /** Union of every clip across storylines — used for probing, output size
+   *  and the render source map. */
+  sources: ResolvedSource[];
+  storylines: PlanStoryline[];
+}
+
+/** Resolve an intercut request: probe the union of storyline asset ids once,
+ *  then hand each storyline its ordered clip list (shared ResolvedSource
+ *  objects — read-only, safe to share). */
+export async function resolveIntercut(ic: {
+  slotsPerSlice: number;
+  endOfMaterial: "loop" | "retire";
+  rotation?: "roundRobin";
+  storylines: Array<{ name?: string; assetIds: string[] }>;
+}): Promise<ResolvedIntercut> {
+  const unionIds = [...new Set(ic.storylines.flatMap((s) => s.assetIds))];
+  const sources = await resolveAssetSources(unionIds);
+  const byId = new Map(sources.map((s) => [s.id, s]));
+  const storylines: PlanStoryline[] = ic.storylines.map((s, i) => ({
+    id: `sl${i + 1}`,
+    name: s.name?.trim() || `Storyline ${i + 1}`,
+    clips: s.assetIds.map((id) => {
+      const r = byId.get(id);
+      if (!r) throw new MusicEditError(404, "VIDEO_NOT_FOUND", `Storyline clip not found: ${id}`);
+      return r;
+    }),
+  }));
+  return {
+    slotsPerSlice: ic.slotsPerSlice,
+    endOfMaterial: ic.endOfMaterial,
+    rotation: ic.rotation ?? "roundRobin",
+    sources,
+    storylines,
+  };
+}
+
+/** Fill `motionPeaks` on resolved sources when alignMotion is on — one
+ *  content-hash-cached motion analysis per unique file path. */
+export async function attachMotionPeaks(sources: ResolvedSource[]): Promise<void> {
+  const byPath = new Map<string, ResolvedSource[]>();
+  for (const s of sources) {
+    const g = byPath.get(s.path);
+    if (g) g.push(s);
+    else byPath.set(s.path, [s]);
+  }
+  await Promise.all(
+    [...byPath.entries()].map(async ([path, group]) => {
+      const peaks = (await analyzeMotionFile(path)).peaks;
+      for (const s of group) s.motionPeaks = peaks;
+    }),
+  );
+}
+
+export function buildPlan(
+  song: AnalyzedSong,
+  sources: ResolvedSource[],
+  settings: MusicEditSettings,
+  grid?: ResolvedCutGrid,
+  intercut?: ResolvedIntercut,
+): EditPlan {
   return planEdit({
     beatTimes: song.analysis.beats.map((b) => b.time),
     bpm: song.analysis.bpm,
     audioDuration: song.audio.durationSeconds,
     sources,
     settings,
+    cutMarks: grid?.marks,
+    grid: grid ? { source: grid.source, label: grid.label, detail: grid.detail } : undefined,
+    intercut: intercut
+      ? {
+          slotsPerSlice: intercut.slotsPerSlice,
+          endOfMaterial: intercut.endOfMaterial,
+          rotation: intercut.rotation,
+          storylines: intercut.storylines,
+        }
+      : undefined,
   });
 }
 
@@ -233,7 +308,9 @@ export function startRenderJob(projectId: string, songName: string, prepared: Pr
   }
   const dir = projectMusicDir(projectId, "renders");
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const stem = `${basename(songName, extname(songName))}-${prepared.plan.timing === "detected_beats" ? `${prepared.plan.beatsPerCut}beat` : "grid"}-${stamp}`;
+  const timingTag =
+    prepared.plan.timing === "detected_beats" ? `${prepared.plan.beatsPerCut}beat` : (prepared.plan.grid?.source ?? "grid");
+  const stem = `${basename(songName, extname(songName))}-${timingTag}-${stamp}`;
   const outPath = join(dir, `${stem}.mp4`);
   const edlPath = join(dir, `${stem}.edl.json`);
   writeFileSync(edlPath, JSON.stringify({ song: songName, sources: prepared.sources.map(({ path: _p, ...s }) => s), plan: prepared.plan }, null, 2));

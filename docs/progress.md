@@ -129,6 +129,121 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
 
+### 2026-11-15 — Music Edit: motion-peak cut alignment (VIDEO-BEAT-03)
+
+- **Motion profile.** New `musicEdit/motionProfile.ts`: decodes each clip at
+  64×36 gray ~12 fps through `ffmpegService.ffmpegSpawn` (stdout rawvideo
+  stream — one 2304 B frame at a time, never buffers the file), computes
+  mean-abs frame-diff energy, light 3-tap smoothing, and picks peaks via the
+  existing `pickOnsetPeaks`. Cached by content hash under
+  `OUTPUT_ROOT/cache/motion/` (same convention as cache/beats|cutgrid).
+- **EDL.** `PlanSource.motionPeaks` (service-filled only when
+  `settings.alignMotion`); `motionInPoint()` shifts each segment's in-point
+  so the strongest peak lands at `in-point + motionLead`, searching ±
+  `motionWindow` (defaults 0.5 s / 0 s) around the cursor, clamped to
+  [0, usable−consumed]. Cursor/end bookkeeping unchanged → storyline
+  continuity preserved (the whole segment slides by the shift). Loop-wrapped
+  multi-piece picks are skipped. Entries record `motionShift` (±s delta).
+  Off by default → byte-identical plans.
+- **API/UI.** `alignMotion`/`motionWindow`/`motionLead` on
+  `musicEditSettingsSchema`; `attachMotionPeaks` dedupes by path and runs in
+  `prepare()` for plan+render. MusicEdit §3: "Align motion to cuts" checkbox
+  + ±window input.
+- **Tests:** `test/motion-align.node.test.ts` — 9 cases: off-default
+  identity, strongest-peak selection, lead, window clamp, bounds clamp,
+  empty-peak fallback, intercut path, plus a real ffmpeg test (generated
+  testsrc2 + white flash → peak detected within tolerance).
+- **Honest limits (heuristic):** mean-abs-diff fires on ANY visual change —
+  scene cuts inside clips, flashes, fast pans all count as "motion"; there's
+  no subject tracking so camera shake reads as constant energy (few peaks →
+  mostly falls back to cursor, which is the safe failure). Alignment trades
+  up to ±W seconds of repeated/skip footage for musical feel — noticeable on
+  very short slots. Not verified on real music-video footage.
+- **Verified:** `npm run typecheck` all workspaces ✅; `npm test` —
+  vitest 15/15 ✅, server `tsx --test` all suites ✅ (incl. 9 new).
+
+### 2026-11-15 — Music Edit: intercut storylines (VIDEO-BEAT-02)
+
+- **Intercut mode.** Sources can now be grouped into parallel *storylines*
+  (ordered clip lists + name) that rotate on the cut grid from VIDEO-BEAT-01.
+  With `slotsPerSlice=1` the EDL emits A1 B1 C1 D1 A2 B2… where each
+  storyline's cursor advances through its clips — A2 starts exactly where
+  A1 ended in source time (single forward cursor per storyline, clip order
+  preserved). Flat round-robin remains the default and is byte-identical
+  when `intercut` is absent.
+- **Planner.** `edl.ts` gained `intercutEntries`: per-slot EDL entries,
+  rotation every `slotsPerSlice` slots (`floor(k/S) % active`), same retime
+  clamp 0.80–1.25× and same skip/absorb rules as flat mode. End-of-material:
+  `loop` (default — restart the storyline, `storylineLoop` counted) or
+  `retire` (drop from rotation, others fill in; all-retired →
+  INSUFFICIENT_VIDEO_MATERIAL). `allowExtremeRetime` fallback scans
+  remaining material across storylines. Entries carry
+  `storylineId/Name/Loop`; `plan.intercut` reports params + per-storyline
+  segment counts + `shortSlots` (<100 ms slots warning). "pattern"
+  rotation and "hold last frame" were skipped (roundRobin only; hold
+  needs renderer freeze support).
+- **API/schema.** `musicEditIntercutSchema` on `musicEditPlanSchema`
+  (`intercut?`); `assetIds` relaxed to `.default([])` with a refine
+  requiring assetIds OR intercut.storylines — legacy requests unchanged.
+  `resolveIntercut` probes the union of storyline clips once and shares
+  ResolvedSource objects; render path needs no changes (entries are
+  self-contained).
+- **UI.** MusicEdit §2 has an "Intercut" checkbox, storyline count,
+  slots-per-storyline and end-of-material selects, plus a per-clip SL#
+  picker (defaults round-robin). Plan card shows intercut params, a
+  Storyline column (↻n on loops) and a sub-100 ms warning.
+- **Tests:** new `test/intercut.node.test.ts` — 16 cases: rotation order,
+  cursor continuity, multi-clip order, loop/retire/exhaustion, clamp,
+  contiguous frames = song duration, starved/short clips, flat regression,
+  schema. Caught+fixed a real bug: slowed-fit double-advanced clipIdx and
+  skipped the next clip.
+- **Verified:** `npm run typecheck` all workspaces ✅; `npm test` —
+  vitest 15/15 ✅, server `tsx --test` all suites ✅ (incl. 197 prior +
+  16 new intercut + 24 cut-grid). Real-media render of an intercut plan
+  NOT verified (needs MUSIC_EDIT_SONG/VIDEOS); pattern rotation not
+  implemented.
+
+### 2026-11-15 — Music Edit: selectable cut grid (VIDEO-BEAT-01)
+
+- **New `cutGrid` abstraction.** The EDL builder can now receive cut marks
+  from a selectable source instead of only the global beat grid. New pure,
+  deterministic module `apps/server/src/musicEdit/cutGrid.ts` (no I/O, unit
+  -testable on synthetic data) with five sources:
+  - `beats` — every detected beat; `every_n_beats` — every N beats from a
+    phase offset (same convention as the old beatsPerCut/beatOffset).
+  - `bars` — bar starts; meter 4/4 (default) or 3/4, bar phase auto-picked
+    as the beat residue with the highest summed onset strength.
+  - `stem_onsets` — peak-picked onsets of a stem from the visualizer stem
+    pool; `band` = full / kick (<150 Hz) / snare_hat, min-gap (default
+    0.25 s) + relative threshold enforced by `pickOnsetPeaks`.
+  - `sections` — song segmented into quiet/medium/loud energy sections
+    (windowed RMS vs the song's p90 level, short sections merged); per-class
+    beats-per-cut, auto default quiet→4 / medium→2 / loud→1.
+- **Band-limited spectral flux.** `beatAnalyzer.ts` onset envelope now
+  takes an `OnsetBand` and restricts the mel-flux mean to bands inside a
+  Hz range (`bandOnsetEnvelope`); "full" is bit-identical to before, so the
+  beat tracker is untouched.
+- **Resolution + caching.** New `cutGridService.ts` decodes stems/song via
+  `ffmpegService` (the only spawn path) to 22050 Hz mono f32le and caches
+  onset envelopes / energy sections under `OUTPUT_ROOT/cache/cutgrid/` by
+  sha256 — same convention as `cache/beats`. Wired into `/api/music-edit/
+  plan` + `/render` via optional `grid` on `musicEditPlanSchema`
+  (`cutGridSchema` discriminated union in `@twio/shared`); absent = legacy
+  behaviour exactly. `planEdit` accepts `cutMarks`, stamps
+  `plan.timing="cut_grid"` + `plan.grid{source,label,detail,cutCount}`,
+  and `EdlBoundaryKind` gained `bar`/`stem_onset`/`section`.
+- **UI.** MusicEdit §3 has a "Cut on" selector (Beats / Every N beats /
+  Bars / Stem hits / Auto by section), stem picker (visualizer pool), N
+  input, meter, band, min-gap/threshold and per-section density controls.
+  The plan card shows the grid label + cut count and a tick-strip preview
+  of cut positions on the song timeline (no waveform exists on this page).
+- **Tests:** new `test/cut-grid.node.test.ts` — 24 cases on synthetic
+  signals (click tracks, tone hits, noise energy beds); no real media.
+- **Verified:** `npm run typecheck` all workspaces ✅; `npm test` —
+  vitest 15/15 ✅, server `tsx --test` 197/197 ✅. Real-music grid accuracy
+  (bar phase, stem-onset feel, section boundaries) NOT verified — only
+  synthetic signals were tested.
+
 ### 2026-11-09 — Audio drag & drop: mp3/wav land in the project folder
 
 - **Audio is a third asset kind.** `AUDIO_FILE_EXTENSIONS` in `config.ts`

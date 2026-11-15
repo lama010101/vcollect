@@ -87,6 +87,7 @@ const melToHz = (m: number): number =>
 interface MelBand {
   bin: Uint32Array; // FFT bin indices with nonzero weight
   w: Float32Array; // corresponding weights
+  centerHz: number; // band centre frequency (mel edge midpoint)
 }
 
 let melCache: { sampleRate: number; bands: MelBand[] } | null = null;
@@ -113,7 +114,7 @@ function buildMelBands(sampleRate: number): MelBand[] {
         wts.push(w);
       }
     }
-    bands.push({ bin: Uint32Array.from(idx), w: Float32Array.from(wts) });
+    bands.push({ bin: Uint32Array.from(idx), w: Float32Array.from(wts), centerHz: edges[m + 1]! });
   }
   melCache = { sampleRate, bands };
   return bands;
@@ -122,13 +123,34 @@ function buildMelBands(sampleRate: number): MelBand[] {
 // --- Onset envelope ----------------------------------------------------------
 // Mean over mel bands of the positive first difference of the log-amplitude
 // spectrum (lag = 1), matching librosa.onset.onset_strength's default path.
+// `band` restricts the flux to mel bands whose centre falls inside a
+// frequency range — the cut-grid "stem hits" source analyses kicks
+// (low band) and snare/hats (high band) separately. "full" selects every
+// band and reproduces the beat tracker's envelope exactly.
 
-function onsetEnvelope(samples: Float32Array, sampleRate: number, hop: number): Float32Array {
+export type OnsetBand = "full" | "kick" | "snare_hat";
+
+const BAND_HZ: Record<OnsetBand, { lo: number; hi: number }> = {
+  full: { lo: 0, hi: Number.POSITIVE_INFINITY },
+  kick: { lo: 25, hi: 150 }, // roughly under 150 Hz
+  snare_hat: { lo: 150, hi: 12000 }, // the higher band
+};
+
+function onsetEnvelope(samples: Float32Array, sampleRate: number, hop: number, band: OnsetBand = "full"): Float32Array {
   const n = samples.length;
   const pad = N_FFT >> 1;
   const nFrames = 1 + Math.floor(n / hop);
   const bands = buildMelBands(sampleRate);
-  const mel = new Float32Array(nFrames * N_MELS);
+  const range = BAND_HZ[band];
+  const selIdx: number[] = [];
+  for (let m = 0; m < bands.length; m++) {
+    const c = bands[m]!.centerHz;
+    if (c >= range.lo && c <= range.hi) selIdx.push(m);
+  }
+  // Degenerate range (e.g. exotic sample rate) → fall back to all bands.
+  const useIdx = selIdx.length > 0 ? selIdx : bands.map((_, i) => i);
+  const nSel = useIdx.length;
+  const mel = new Float32Array(nFrames * nSel);
   const re = new Float32Array(N_FFT);
   const im = new Float32Array(N_FFT);
   let globalMax = MIN_POWER;
@@ -147,15 +169,15 @@ function onsetEnvelope(samples: Float32Array, sampleRate: number, hop: number): 
     im.fill(0);
     for (let j = 0; j < N_FFT; j++) re[j] = padded[base + j]! * HANN[j]!;
     fftInPlace(re, im);
-    const row = t * N_MELS;
-    for (let m = 0; m < N_MELS; m++) {
-      const b = bands[m]!;
+    const row = t * nSel;
+    for (let q = 0; q < nSel; q++) {
+      const b = bands[useIdx[q]!]!;
       let p = 0;
-      for (let q = 0; q < b.bin.length; q++) {
-        const k = b.bin[q]!;
-        p += b.w[q]! * (re[k]! * re[k]! + im[k]! * im[k]!);
+      for (let k = 0; k < b.bin.length; k++) {
+        const bin = b.bin[k]!;
+        p += b.w[k]! * (re[bin]! * re[bin]! + im[bin]! * im[bin]!);
       }
-      mel[row + m] = p;
+      mel[row + q] = p;
       if (p > globalMax) globalMax = p;
     }
   }
@@ -164,16 +186,23 @@ function onsetEnvelope(samples: Float32Array, sampleRate: number, hop: number): 
   const db = (p: number): number => Math.max(10 * Math.log10(Math.max(p, MIN_POWER)), floorDb);
   const env = new Float32Array(nFrames);
   for (let t = 1; t < nFrames; t++) {
-    const row = t * N_MELS;
-    const prev = row - N_MELS;
+    const row = t * nSel;
+    const prev = row - nSel;
     let sum = 0;
-    for (let m = 0; m < N_MELS; m++) {
-      const d = db(mel[row + m]!) - db(mel[prev + m]!);
+    for (let q = 0; q < nSel; q++) {
+      const d = db(mel[row + q]!) - db(mel[prev + q]!);
       if (d > 0) sum += d;
     }
-    env[t] = sum / N_MELS;
+    env[t] = sum / nSel;
   }
   return env;
+}
+
+/** Onset-strength envelope restricted to a frequency band — feeds the
+ *  cut-grid "stem hits" source (kick/snare_hat on the drums stem). Same
+ *  spectral-flux code path as the beat tracker; "full" = all mel bands. */
+export function bandOnsetEnvelope(samples: Float32Array, sampleRate: number, hopLength: number, band: OnsetBand): Float32Array {
+  return onsetEnvelope(samples, sampleRate, hopLength, band);
 }
 
 // --- Tempo -------------------------------------------------------------------

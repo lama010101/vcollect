@@ -161,7 +161,35 @@ export interface BeatAnalysis {
   interval: { min: number; max: number; mean: number; stdDev: number };
 }
 
-export type EdlBoundaryKind = "audio_start" | "beat" | "manual_grid" | "audio_end";
+export type EdlBoundaryKind = "audio_start" | "beat" | "bar" | "stem_onset" | "section" | "manual_grid" | "audio_end";
+
+/** Where an EDL's inner cut marks came from (cut-grid feature). */
+export type CutGridSource = "beats" | "every_n_beats" | "bars" | "stem_onsets" | "sections";
+
+/** One precomputed inner cut mark handed to the EDL planner. */
+export interface CutMark {
+  time: number; // seconds on the song timeline
+  beat: number | null; // index into BeatAnalysis.beats, when beat-aligned
+  kind: EdlBoundaryKind;
+}
+
+/** Grid provenance stamped onto a plan built with a cut-grid spec. */
+export interface EditPlanGrid {
+  source: CutGridSource;
+  label: string; // human-readable, e.g. "Bar starts (4/4)"
+  detail?: string; // params summary, e.g. "phase: beat 1 of each bar (auto)"
+  cutCount: number; // inner cut marks that survived merging
+}
+
+/** Intercut (storylines) provenance stamped onto a plan. */
+export interface EditPlanIntercut {
+  slotsPerSlice: number; // consecutive cut slots one storyline holds
+  endOfMaterial: "loop" | "retire";
+  rotation: "roundRobin";
+  storylines: Array<{ id: string; name: string; clips: number; segments: number }>;
+  /** Slots shorter than 100 ms — likely too dense a cut grid for intercut. */
+  shortSlots: number;
+}
 
 export interface EdlEntry {
   index: number;
@@ -184,6 +212,14 @@ export interface EdlEntry {
   startKind: EdlBoundaryKind;
   endKind: EdlBoundaryKind;
   restartedSource: boolean; // cursor wrapped back to 0 before this clip
+  /** Intercut mode only — which storyline this segment belongs to. */
+  storylineId?: string;
+  storylineName?: string;
+  /** How many times the storyline has restarted before this segment (0 = first pass). */
+  storylineLoop?: number;
+  /** alignMotion only — seconds the in-point was shifted to land a motion
+   *  peak on the cut (positive = later, negative = earlier). */
+  motionShift?: number;
 }
 
 export interface EditPlanStats {
@@ -200,7 +236,11 @@ export interface EditPlanStats {
 
 export interface EditPlan {
   version: 1;
-  timing: "detected_beats" | "manual_grid";
+  timing: "detected_beats" | "manual_grid" | "cut_grid";
+  /** Present only when the request carried a cut-grid spec. */
+  grid?: EditPlanGrid;
+  /** Present only in intercut (storylines) mode. */
+  intercut?: EditPlanIntercut;
   beatsPerCut: number;
   bpm: number;
   beatCount: number;

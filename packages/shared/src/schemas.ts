@@ -163,6 +163,66 @@ export type ImportScriptInput = z.infer<typeof importScriptSchema>;
 // --- Music edit (beat-aligned music-video editor) ----------------------------
 export const beatsPerCutSchema = z.union([z.literal(1), z.literal(2), z.literal(4), z.literal(8)]);
 
+// Where the EDL's inner cut marks come from. Absent = legacy behaviour
+// (settings.autoBeats / beatsPerCut / beatOffset, or the manual BPM grid).
+export const cutGridSchema = z.discriminatedUnion("source", [
+  // Every detected beat.
+  z.object({ source: z.literal("beats") }),
+  // Every N detected beats starting from beat `offset` (0 = first beat).
+  z.object({
+    source: z.literal("every_n_beats"),
+    n: z.number().int().min(1).max(16).default(1),
+    offset: z.number().int().min(0).max(31).default(0),
+  }),
+  // Bar starts. beatsPerBar 4 = 4/4 (default), 3 = 3/4. `phase` is the
+  // 0-based beat index inside each bar that starts it — omitted = picked
+  // automatically as the phase with the highest summed onset strength.
+  z.object({
+    source: z.literal("bars"),
+    beatsPerBar: z.union([z.literal(3), z.literal(4)]).default(4),
+    phase: z.number().int().min(0).max(31).optional(),
+  }),
+  // Onsets of a stem from the project's visualizer stem pool. `band` picks
+  // the analysed frequency range (kick = low band ≈ <150 Hz, snare_hat =
+  // higher band — meant for the drums stem but valid for any stem).
+  z.object({
+    source: z.literal("stem_onsets"),
+    stem: z.string().min(1).max(255),
+    band: z.enum(["full", "kick", "snare_hat"]).default("full"),
+    minGap: z.number().min(0.05).max(2).default(0.25),
+    threshold: z.number().min(0).max(1).default(0.12),
+  }),
+  // Energy-section-aware density: the song is segmented by RMS energy and
+  // each section class gets its own beats-per-cut. Omitted densities fall
+  // back to the auto mapping quiet→4, medium→2, loud→1.
+  z.object({
+    source: z.literal("sections"),
+    quietEvery: beatsPerCutSchema.optional(),
+    mediumEvery: beatsPerCutSchema.optional(),
+    loudEvery: beatsPerCutSchema.optional(),
+  }),
+]);
+export type CutGridSpec = z.infer<typeof cutGridSchema>;
+
+// --- Intercut (parallel storylines) ------------------------------------------
+// A storyline is an ordered list of source clips played as one continuous
+// thread; the EDL rotates between storylines every `slotsPerSlice` cut slots.
+export const musicEditIntercutSchema = z.object({
+  slotsPerSlice: z.number().int().min(1).max(16).default(1),
+  endOfMaterial: z.enum(["loop", "retire"]).default("loop"),
+  rotation: z.enum(["roundRobin"]).default("roundRobin"),
+  storylines: z
+    .array(
+      z.object({
+        name: z.string().max(120).optional(),
+        assetIds: z.array(z.string().min(1)).min(1).max(500),
+      }),
+    )
+    .min(1)
+    .max(32),
+});
+export type MusicEditIntercut = z.infer<typeof musicEditIntercutSchema>;
+
 export const musicEditSettingsSchema = z.object({
   // true = cut on beats detected in the waveform; false = manual BPM grid.
   autoBeats: z.boolean().default(true),
@@ -177,6 +237,11 @@ export const musicEditSettingsSchema = z.object({
   maxSlowDown: z.number().min(0.25).max(1).default(0.8),
   // Permit retiming beyond the limits when no source fits (off by default).
   allowExtremeRetime: z.boolean().default(false),
+  // Motion-peak alignment (VIDEO-BEAT-03): shift each segment's in-point so a
+  // detected motion peak lands on the cut. Off = byte-identical behaviour.
+  alignMotion: z.boolean().default(false),
+  motionWindow: z.number().min(0.05).max(2).default(0.5), // ±s search around cursor
+  motionLead: z.number().min(-0.5).max(0.5).default(0), // peak lands this many s after in-point
   loopSource: z.boolean().default(false),
   fps: z.number().int().min(12).max(60).default(30),
   // Output height cap; never exceeds the tallest source (no upscaling).
@@ -189,11 +254,19 @@ export const musicEditAnalyzeSchema = z.object({
   song: z.string().min(1).max(255),
 });
 
-export const musicEditPlanSchema = z.object({
-  song: z.string().min(1).max(255),
-  assetIds: z.array(z.string().min(1)).min(1).max(500),
-  settings: musicEditSettingsSchema.default({}),
-});
+export const musicEditPlanSchema = z
+  .object({
+    song: z.string().min(1).max(255),
+    assetIds: z.array(z.string().min(1)).max(500).default([]),
+    settings: musicEditSettingsSchema.default({}),
+    grid: cutGridSchema.optional(),
+    intercut: musicEditIntercutSchema.optional(),
+  })
+  // Sources come from either the flat assetIds list or the intercut
+  // storylines (the UI still sends the union in assetIds for readability).
+  .refine((v) => v.assetIds.length > 0 || (v.intercut?.storylines.length ?? 0) > 0, {
+    message: "Provide assetIds or intercut.storylines.",
+  });
 export type MusicEditPlanInput = z.infer<typeof musicEditPlanSchema>;
 
 /** POST /api/music-edit/import-session — reuse a saved 4D-timeline session:
