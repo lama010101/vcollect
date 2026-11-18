@@ -255,6 +255,18 @@ export function MusicEdit({
   const [vizBusy, setVizBusy] = useState(false);
   // Visualizer stem pool — the "Stem hits" cut-grid source picks one of these.
   const [vizStemList, setVizStemList] = useState<VizStem[]>([]);
+  // UI-only filter for the stem picker — does not affect the plan request.
+  const [stemExtFilter, setStemExtFilter] = useState<"all" | "wav" | "mp3">("all");
+  const filteredStemList = vizStemList.filter(
+    (s) => stemExtFilter === "all" || s.name.toLowerCase().endsWith(`.${stemExtFilter}`),
+  );
+  const onStemExtFilter = (f: "all" | "wav" | "mp3") => {
+    setStemExtFilter(f);
+    // A hidden stem must not silently stay selected (the plan would still use it).
+    if (f !== "all" && settings.stemName && !settings.stemName.toLowerCase().endsWith(`.${f}`)) {
+      set("stemName", "");
+    }
+  };
   const [order, setOrder] = useState<Asset[]>(initial?.orderAssets ?? []);
   const [settings, setSettings] = useState<Settings>(initial?.settings ?? DEFAULT_SETTINGS);
   const [plan, setPlan] = useState<EditPlan | null>(initial?.plan ?? null);
@@ -1040,11 +1052,19 @@ export function MusicEdit({
 
             {settings.cutSource === "stem" && (
               <div className="flex flex-wrap gap-4 text-sm">
+                <label className="space-y-1">
+                  <span className="text-slate-400">Type</span>
+                  <select className="ui-input" value={stemExtFilter} onChange={(e) => onStemExtFilter(e.target.value as "all" | "wav" | "mp3")} aria-label="Stem type filter">
+                    <option value="all">All</option>
+                    <option value="wav">WAV</option>
+                    <option value="mp3">MP3</option>
+                  </select>
+                </label>
                 <label className="space-y-1 min-w-56">
                   <span className="text-slate-400">Stem</span>
                   <select className="ui-input w-full" value={settings.stemName} onChange={(e) => set("stemName", e.target.value)}>
-                    <option value="">{vizStemList.length ? "Select a stem…" : "No stems in the pool"}</option>
-                    {vizStemList.map((s) => (
+                    <option value="">{filteredStemList.length ? "Select a stem…" : vizStemList.length ? "No matching stems" : "No stems in the pool"}</option>
+                    {filteredStemList.map((s) => (
                       <option key={s.name} value={s.name}>
                         {s.name}
                       </option>
