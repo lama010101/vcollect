@@ -300,7 +300,9 @@ export function buildCutGrid(spec: CutGridSpec, ctx: CutGridContext): BuiltCutGr
       if (!ctx.onsetPeaks) {
         throw new MusicEditError(500, "GRID_CONTEXT_MISSING", "stem_onsets grid requires precomputed onset peaks.");
       }
-      marks = ctx.onsetPeaks.map((p) => ({ time: p.time, beat: null, kind: "stem_onset" as EdlBoundaryKind }));
+      marks = ctx.onsetPeaks
+        .filter((p) => p.time < ctx.audioDuration)
+        .map((p) => ({ time: p.time, beat: null, kind: "stem_onset" as EdlBoundaryKind }));
       label = `Stem hits · ${spec.stem}`;
       detail = `${BAND_LABEL[spec.band] ?? spec.band} · ≥${spec.minGap}s apart · threshold ${spec.threshold}`;
       break;
