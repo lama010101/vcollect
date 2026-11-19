@@ -23,6 +23,7 @@ import { basename, join } from "node:path";
 import { DEFAULT_PROJECT_ID, musicEditAnalyzeSchema, musicEditImportSessionSchema, musicEditPlanSchema, type CutGridSpec, type MusicEditIntercut, type MusicEditSettings } from "@twio/shared";
 import { analyzeSong, analyzerStatus } from "../musicEdit/beatAnalysis.js";
 import { resolveCutGrid } from "../musicEdit/cutGridService.js";
+import { SOURCE_END_GUARD } from "../musicEdit/edl.js";
 import { MusicEditError } from "../musicEdit/errors.js";
 import {
   analysisSummary,
@@ -103,11 +104,29 @@ export async function registerMusicEditRoutes(app: FastifyInstance): Promise<voi
     // assetIds as before. Both run alongside the (cached) grid resolution.
     const icP = input.intercut ? resolveIntercut(input.intercut) : Promise.resolve(null);
     const song = await analyzeSong(file);
-    const [sources, grid, ic] = await Promise.all([
+    // Adaptive grids wait for the sources: without looping, a clip longer
+    // than the longest usable source / maxSlowDown can never be filled, so
+    // maxClipSec is clamped to that footage ceiling (edl.ts stays unchanged).
+    const gridP =
+      input.grid && input.grid.source !== "adaptive"
+        ? resolveCutGrid(projectId, file, song, input.grid)
+        : Promise.resolve(undefined);
+    const [sources, grid0, ic] = await Promise.all([
       icP.then((r) => (r ? r.sources : resolveAssetSources(input.assetIds))),
-      input.grid ? resolveCutGrid(projectId, file, song, input.grid) : Promise.resolve(undefined),
+      gridP,
       icP,
     ]);
+    let grid = grid0;
+    if (input.grid?.source === "adaptive") {
+      let spec = input.grid;
+      if (!input.settings.loopSource) {
+        const longest = Math.max(0, ...sources.map((s) => s.duration - SOURCE_END_GUARD));
+        const cap = longest / input.settings.maxSlowDown;
+        const maxClipSec = spec.maxClipSec === undefined ? cap : Math.min(spec.maxClipSec, cap);
+        spec = { ...spec, maxClipSec: Math.max(0.3, maxClipSec) };
+      }
+      grid = await resolveCutGrid(projectId, file, song, spec);
+    }
     if (input.settings.alignMotion) await attachMotionPeaks(sources);
     return { song, sources, grid, intercut: ic ?? undefined };
   };

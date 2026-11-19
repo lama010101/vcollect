@@ -1538,5 +1538,18 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
   serverless: sqlite file + ffmpeg + python). Without it the UI loads but
   API calls fail.
 
+### 2026-11-19 — VG-001: rhythm-adaptive cut grid ("Follow rhythm")
+- New `adaptive` cut-grid source: continuous musical-intensity signal
+  (full-band onset density+strength blended with windowed RMS, ranked
+  per-song, smoothed, flat-guarded) drives a {1,2,4,8} beats-per-cut ladder;
+  cuts ramp ≤1 rung per cut, prefer bar starts, force quiet↔loud structural
+  hits, clamp to ≥0.3 s / ≤maxClipSec (footage-capped when not looping).
+- Schema variant + EdlBoundaryKind/CutGridSource "adaptive"; UI default +
+  controls (min/max beats, smoothing, contrast, max clip); raw features
+  cached by song sha256 in cache/cutgrid so mapping params never re-decode.
+- Tests: 9 new adaptive cases in cut-grid.node.test.ts (loud-vs-quiet
+  medians, one-rung ramp, beat-exact marks, flat guard, determinism,
+  clamps, schema, EDL integration).
+
 ### 2026-09-29 — docs/progress.md created
 - Established this file as the required development log for the webapp.

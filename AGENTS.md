@@ -166,6 +166,18 @@
   cuts are the detected beat timestamps (`beat[i] → beat[i+N]`), never a BPM
   grid unless `autoBeats` is off. `render.ts` renders one raw H.264 part per
   EDL entry via `ffmpegService`, byte-joins them and muxes the untouched song.
+  Cut-grid sources (`cutGrid.ts` pure builders + `cutGridService.ts`
+  cached resolvers, `OUTPUT_ROOT/cache/cutgrid/`): `beats`,
+  `every_n_beats`, `bars`, `stem_onsets`, `sections` (3-class RMS
+  density) and `adaptive` — "Follow rhythm", the default: a continuous
+  intensity signal (onset density+strength blended with windowed RMS,
+  percentile-ranked per song, smoothed by `smoothSec`, flat-guarded) maps
+  onto a {1,2,4,8} beats-per-cut ladder in [minBeats..maxBeats]; the walk
+  moves ≤1 rung per cut (gradual accel/decel), prefers bar starts for
+  ≥4-beat spans, forces cuts at quiet↔loud section jumps, clamps clips to
+  ≥0.3 s and ≤maxClipSec (the route also caps it to longest-source-usable /
+  maxSlowDown when loopSource is off). Raw features cache by song sha256 so
+  mapping params never re-decode.
   Routes: `routes/musicEdit.ts` (`/api/music-edit/*`); UI: `pages/MusicEdit.tsx`.
   Errors are `MusicEditError` (status + code). Unit tests:
   `apps/server/test/music-edit.node.test.ts`; real-media acceptance:

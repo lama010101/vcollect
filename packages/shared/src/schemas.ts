@@ -204,7 +204,22 @@ export const cutGridSchema = z.discriminatedUnion("source", [
     mediumEvery: beatsPerCutSchema.optional(),
     loudEvery: beatsPerCutSchema.optional(),
   }),
-]);
+  // Rhythm-adaptive: clip length follows musical intensity continuously —
+  // short cuts when busy/loud, long cuts when sparse/quiet, ramped one rung
+  // at a time so acceleration/deceleration is gradual.
+  z.object({
+    source: z.literal("adaptive"),
+    minBeats: beatsPerCutSchema.default(1),
+    maxBeats: beatsPerCutSchema.default(8),
+    smoothSec: z.number().min(0.5).max(8).default(3),
+    contrast: z.number().min(0.5).max(2).default(1),
+    maxClipSec: z.number().min(0.5).max(30).optional(),
+  }),
+]).superRefine((v, ctx) => {
+  if (v.source === "adaptive" && v.minBeats > v.maxBeats) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "minBeats must be <= maxBeats", path: ["minBeats"] });
+  }
+});
 export type CutGridSpec = z.infer<typeof cutGridSchema>;
 
 // --- Intercut (parallel storylines) ------------------------------------------
