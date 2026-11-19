@@ -129,6 +129,30 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
 
+### 2026-11-19 — Music Edit: video ends when non-looped footage runs out
+
+- **End semantics.** The render now stops at whichever comes first: the end
+  of the song (default) or the end of usable source material when looping is
+  off. `edl.ts`: flat mode with `loopSource` off no longer restarts sources
+  from 0 (a restart IS a loop) — each clip plays through once and the EDL
+  truncates at the first slot no source can fill. Intercut
+  `endOfMaterial: "retire"` truncates likewise when every storyline is
+  exhausted/unfillable instead of throwing. `allowExtremeRetime` stays an
+  independent opt-in escape (replay-fill over ending early); under "loop"
+  policies nothing changed.
+- **`EditPlan.videoDuration`** (new optional field) = last entry's
+  `outputEnd`; `< audioDuration` iff the plan truncated. `render.ts` muxes
+  with `-t videoDuration` (song trimmed to video length) and verifies
+  rendered durations against it. Empty plans still throw
+  `INSUFFICIENT_VIDEO_MATERIAL`.
+- **UI** (`MusicEdit.tsx`): loop checkbox relabeled "off = video ends when
+  footage runs out"; plan card shows a warning "Video length" stat when the
+  render will end early. Stem picker gained an All/WAV/MP3 type filter.
+- **Tests:** 6 new/updated cases in `music-edit.node.test.ts` +
+  `intercut.node.test.ts` (truncation, no-restart, empty→error, loop
+  regression, retire end-early). Full suite green (15 shared + 227 server),
+  typecheck clean.
+
 ### 2026-11-15 — Music Edit: motion-peak cut alignment (VIDEO-BEAT-03)
 
 - **Motion profile.** New `musicEdit/motionProfile.ts`: decodes each clip at

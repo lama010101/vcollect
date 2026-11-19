@@ -142,6 +142,9 @@ export async function renderEdit(
       for (const f of partFiles) yield* createReadStream(f);
     }, createWriteStream(videoPath));
     const audioArgs = opts.audioCodec === "aac" ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", "320k"];
+    // The song is trimmed to the video length — shorter than audioDuration
+    // when a non-looped plan ended early on exhausted material.
+    const outDur = plan.videoDuration ?? plan.audioDuration;
     const mux = await ffmpegService.ffmpegExec(
       [
         "-v", "error", "-y",
@@ -149,7 +152,7 @@ export async function renderEdit(
         "-i", resolve(opts.songPath),
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", ...audioArgs,
-        "-t", fmt(plan.audioDuration),
+        "-t", fmt(outDur),
         "-movflags", "+faststart",
         outPath,
       ],
@@ -166,11 +169,11 @@ export async function renderEdit(
     const a = await probeAudio(outPath);
     const videoDur = Number(v.video?.duration ?? v.durationSeconds ?? 0);
     const tolerance = 2 / plan.fps + 0.05;
-    if (Math.abs(a.durationSeconds - plan.audioDuration) > tolerance || Math.abs(videoDur - plan.audioDuration) > tolerance) {
+    if (Math.abs(a.durationSeconds - outDur) > tolerance || Math.abs(videoDur - outDur) > tolerance) {
       throw new MusicEditError(
         500,
         "OUTPUT_DURATION_MISMATCH",
-        `Rendered durations (video ${videoDur.toFixed(3)}s, audio ${a.durationSeconds.toFixed(3)}s) do not match the song (${plan.audioDuration.toFixed(3)}s).`,
+        `Rendered durations (video ${videoDur.toFixed(3)}s, audio ${a.durationSeconds.toFixed(3)}s) do not match the plan output (${outDur.toFixed(3)}s).`,
       );
     }
     return {

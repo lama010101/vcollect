@@ -122,15 +122,23 @@ describe("intercut — end of material", () => {
     assert.equal(p.entries.at(-1)!.outputEnd, DURATION);
   });
 
-  it("all storylines retired → INSUFFICIENT_VIDEO_MATERIAL", () => {
-    const p = () =>
-      plan(
-        [sl("a", "A", [src("tiny", 1)])],
-        [src("tiny", 1)],
-        {},
-        ic([sl("a", "A", [src("tiny", 1)])], { endOfMaterial: "retire" }),
-      );
-    assert.equal(code(p), "INSUFFICIENT_VIDEO_MATERIAL");
+  it("all storylines retired → the video ends early instead of erroring", () => {
+    const p = plan(
+      [sl("a", "A", [src("tiny", 1)])],
+      [src("tiny", 1)],
+      {},
+      ic([sl("a", "A", [src("tiny", 1)])], { endOfMaterial: "retire" }),
+    );
+    assert.ok(p.videoDuration! < DURATION, `expected truncation, got ${p.videoDuration}`);
+    assert.equal(p.videoDuration, p.entries.at(-1)!.outputEnd);
+    for (let i = 1; i < p.entries.length; i++) {
+      assert.equal(p.entries[i]!.frameStart, p.entries[i - 1]!.frameEnd, `gap between clips ${i - 1}→${i}`);
+    }
+  });
+
+  it("retire still errors when nothing can fill the very first slot", () => {
+    const tiny = [sl("a", "A", [src("tiny", 0.3)])];
+    assert.equal(code(() => plan(tiny, [src("tiny", 0.3)], {}, ic(tiny, { endOfMaterial: "retire" }))), "INSUFFICIENT_VIDEO_MATERIAL");
   });
 });
 

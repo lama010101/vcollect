@@ -122,8 +122,40 @@ describe("music edit — EDL planner", () => {
     }
   });
 
+  it("ends the video early when non-looped sources run out (loopSource off)", () => {
+    // two 3 s clips vs an 8 s song — the plan must truncate, not replay.
+    const p = plan({ beatsPerCut: 1 }, [src("a", 3), src("b", 3)]);
+    assert.ok(p.videoDuration! < DURATION, `expected truncation, got videoDuration=${p.videoDuration}`);
+    assert.ok(p.videoDuration! > 3, `expected both sources consumed, got ${p.videoDuration}`);
+    assert.equal(p.videoDuration, p.entries.at(-1)!.outputEnd);
+    for (let i = 1; i < p.entries.length; i++) {
+      assert.equal(p.entries[i]!.frameStart, p.entries[i - 1]!.frameEnd, `gap between clips ${i - 1}→${i}`);
+    }
+    assert.ok(p.entries.every((e) => !e.restartedSource), "non-looped plan must not restart sources");
+    assert.ok(p.entries.every((e) => e.sourceLoops === 0), "non-looped plan must not wrap sources");
+  });
+
+  it("loopSource on still fills the whole song (regression)", () => {
+    const p = plan({ beatsPerCut: 1, loopSource: true }, [src("a", 3), src("b", 3)]);
+    assert.equal(p.videoDuration, DURATION);
+    assert.equal(p.entries.at(-1)!.outputEnd, DURATION);
+  });
+
+  it("videoDuration equals the song when material suffices", () => {
+    const p = plan({ beatsPerCut: 1 });
+    assert.equal(p.videoDuration, DURATION);
+    assert.equal(p.entries.at(-1)!.frameEnd, p.totalFrames);
+  });
+
+  it("allowExtremeRetime still replay-fills with loopSource off (opt-in escape)", () => {
+    const p = plan({ beatsPerCut: 8, allowExtremeRetime: true }, [src("short", 0.6)]);
+    assert.equal(p.videoDuration, DURATION);
+  });
+
   it("reports insufficient material instead of producing a bad edit", () => {
-    assert.equal(code(() => plan({ beatsPerCut: 8 }, [src("short", 0.6)])), "INSUFFICIENT_VIDEO_MATERIAL");
+    // 0.2 s can't even fill the first ~0.21 s slot at max slow-down — the plan
+    // would be empty, so it still errors rather than rendering nothing.
+    assert.equal(code(() => plan({ beatsPerCut: 8 }, [src("short", 0.2)])), "INSUFFICIENT_VIDEO_MATERIAL");
     assert.equal(code(() => plan({}, [])), "NO_SOURCE_VIDEOS");
   });
 
@@ -204,13 +236,16 @@ describe("music edit — analyzer output + ffmpeg args", () => {
   });
 
   it("builds a trim + setpts retime command with an exact frame count", () => {
-    const p = planEdit({ beatTimes: BEATS, bpm: 130, audioDuration: DURATION, sources: [src("a", 0.5), src("c", 30)], settings: settings({ beatsPerCut: 1 }) });
+    // "a" has 0.18 s usable — it fills the first ~0.21 s slot only when slowed,
+    // so the plan contains a retimed entry without any looping.
+    const p = planEdit({ beatTimes: BEATS, bpm: 130, audioDuration: DURATION, sources: [src("a", 0.23), src("c", 30)], settings: settings({ beatsPerCut: 1 }) });
     const e = p.entries.find((x) => x.speed !== 1)!;
-    const args = segmentArgs(e, { path: "/v/a.mp4", duration: 0.5 }, p, "/tmp/out.h264");
+    assert.ok(e, "expected a retimed entry");
+    const args = segmentArgs(e, { path: "/v/a.mp4", duration: 0.23 }, p, "/tmp/out.h264");
     const filter = args[args.indexOf("-filter_complex") + 1]!;
     assert.match(filter, new RegExp(`setpts=\\(PTS-STARTPTS\\)/${e.speed.toFixed(6)}`));
     assert.equal(args[args.indexOf("-frames:v") + 1], String(e.frameEnd - e.frameStart));
     assert.equal(args[args.indexOf("-ss") + 1], e.sourceStart.toFixed(6));
-    assert.ok(Number(args[args.indexOf("-t") + 1]) + e.sourceStart <= 0.5);
+    assert.ok(Number(args[args.indexOf("-t") + 1]) + e.sourceStart <= 0.23);
   });
 });

@@ -245,6 +245,10 @@ export interface EditPlan {
   bpm: number;
   beatCount: number;
   audioDuration: number;
+  /** Seconds of rendered video. Equal to audioDuration unless the plan ended
+   *  early because non-looped source material ran out (loopSource off, or
+   *  intercut endOfMaterial "retire" with all storylines exhausted). */
+  videoDuration?: number;
   fps: number;
   width: number;
   height: number;

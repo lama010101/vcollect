@@ -1187,7 +1187,7 @@ export function MusicEdit({
         <div className="flex flex-wrap gap-6 text-sm">
           <label className="flex items-center gap-2">
             <input type="checkbox" checked={settings.loopSource} onChange={(e) => set("loopSource", e.target.checked)} />
-            Loop source videos (short clips may wrap around)
+            Loop source videos (off = video ends when footage runs out)
           </label>
           <label className="flex items-center gap-2">
             <input type="checkbox" checked={settings.allowExtremeRetime} onChange={(e) => set("allowExtremeRetime", e.target.checked)} />
@@ -1254,6 +1254,9 @@ export function MusicEdit({
             <StatCard label="Average clip" value={`${plan.stats.averageClipDuration.toFixed(3)} s`} sublabel={`${plan.stats.minClipDuration.toFixed(3)}–${plan.stats.maxClipDuration.toFixed(3)} s`} />
             <StatCard label="Retimed clips" value={plan.stats.retimedCount} sublabel={`speed ${plan.stats.minSpeed.toFixed(3)}×–${plan.stats.maxSpeed.toFixed(3)}×`} tone={plan.stats.retimedCount ? "warn" : "default"} />
             <StatCard label="Looped clips" value={plan.stats.loopedCount} sublabel={`song ${mmss(plan.audioDuration)}`} />
+            {plan.videoDuration != null && plan.videoDuration < plan.audioDuration - 0.01 && (
+              <StatCard label="Video length" value={mmss(plan.videoDuration)} sublabel="ended early — footage ran out" tone="warn" />
+            )}
           </div>
           {/* Cut-grid preview — a tick per clip start on the song timeline
               (there's no waveform on this page, so the strip is the preview). */}

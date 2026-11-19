@@ -342,6 +342,7 @@ function intercutEntries(input: PlanInput, bounds: Boundary[], totalFrames: numb
 
     const act = active();
     if (act.length === 0) {
+      if (endOfMaterial === "retire") break; // clips stopped — video ends here
       throw new MusicEditError(
         422,
         "INSUFFICIENT_VIDEO_MATERIAL",
@@ -393,6 +394,7 @@ function intercutEntries(input: PlanInput, bounds: Boundary[], totalFrames: numb
       }
     }
     if (!chosen) {
+      if (endOfMaterial === "retire") break; // nothing usable left — video ends
       const longest = Math.max(
         ...states.flatMap((s) => s.clips.map((c) => c.usable)),
         0,
@@ -485,7 +487,16 @@ export function planEdit(input: PlanInput): EditPlan {
 
   if (input.intercut?.storylines.length) {
     const { entries, info } = intercutEntries(input, bounds, totalFrames);
-    return { ...base, intercut: info, entries, stats: planStats(entries, input.audioDuration) };
+    if (entries.length === 0) {
+      throw new MusicEditError(
+        422,
+        "INSUFFICIENT_VIDEO_MATERIAL",
+        `No storyline can fill the first clip (${bounds[1] ? round6(bounds[1].time) : "?"}s). ` +
+          `Use longer clips, enable "Allow extreme retime", or choose fewer beats per cut.`,
+      );
+    }
+    const videoDuration = round6(entries[entries.length - 1]!.outputEnd);
+    return { ...base, intercut: info, videoDuration, entries, stats: planStats(entries, videoDuration) };
   }
 
   const usable = sources.map((s) => Math.max(0, s.duration - SOURCE_END_GUARD));
@@ -531,12 +542,15 @@ export function planEdit(input: PlanInput): EditPlan {
 
   const pickFor = (i: number, D: number): SourcePick | null => {
     const cursor = cursors[i]!;
-    const fromCursor = cursor > 0 ? fitLinear(i, cursor, D) : null;
+    const fromCursor = fitLinear(i, cursor, D);
     if (fromCursor) return fromCursor;
+    // loopSource off: fresh material only — restarting from 0 IS looping,
+    // and so is the allowExtremeRetime escape below. Exhausted sources make
+    // the plan end early instead of replaying footage.
+    if (!settings.loopSource) return null;
     const fromZero = fitLinear(i, 0, D);
     if (fromZero) return { ...fromZero, restarted: cursor > 0 };
-    if (settings.loopSource) return fitLoop(i, cursor, D);
-    return null;
+    return fitLoop(i, cursor, D);
   };
 
   let rr = 0;
@@ -554,6 +568,9 @@ export function planEdit(input: PlanInput): EditPlan {
 
     let pick: SourcePick | null = null;
     for (let n = 0; n < sources.length && !pick; n++) pick = pickFor((rr + n) % sources.length, D);
+    // allowExtremeRetime is an explicit opt-in to replay a clip at out-of-clamp
+    // speed when nothing fits — it still applies with loopSource off (the user
+    // chose replay-fill over ending early). When it's off too, we truncate.
     if (!pick && settings.allowExtremeRetime) {
       let bestIdx = -1;
       for (let n = 0; n < sources.length; n++) {
@@ -565,6 +582,10 @@ export function planEdit(input: PlanInput): EditPlan {
         const consumed = Math.min(L, D * settings.maxSpeedUp);
         pick = { sourceIndex: bestIdx, start: 0, consumed, pieces: [{ start: 0, end: consumed }], loops: 0, restarted: cursors[bestIdx]! > 0 };
       }
+    }
+    if (!pick && !settings.loopSource) {
+      // Material exhausted with looping off — the video ends at this cut.
+      break;
     }
     if (!pick) {
       const longest = Math.max(...usable);
@@ -618,10 +639,22 @@ export function planEdit(input: PlanInput): EditPlan {
     });
   }
 
+  if (entries.length === 0) {
+    throw new MusicEditError(
+      422,
+      "INSUFFICIENT_VIDEO_MATERIAL",
+      `No source can fill the first clip (${bounds[1] ? round6(bounds[1].time) : "?"}s). ` +
+        `Add longer videos, enable "Loop source videos", or choose fewer beats per cut.`,
+    );
+  }
+  // videoDuration < audioDuration iff the plan truncated on exhausted,
+  // non-looped material — the render trims the song to this length.
+  const videoDuration = round6(entries[entries.length - 1]!.outputEnd);
   return {
     ...base,
+    videoDuration,
     entries,
-    stats: planStats(entries, input.audioDuration),
+    stats: planStats(entries, videoDuration),
   };
 }
 
