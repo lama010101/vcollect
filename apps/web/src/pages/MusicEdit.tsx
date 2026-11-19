@@ -28,7 +28,7 @@ import { Badge, Button, Card, ProgressBar, SectionTitle, Spinner, StatCard } fro
 
 /** Cut-grid source selector values (mapped to CutGridSpec.source in the
  *  request builder — "every_n"/"stem" are the UI's shorter names). */
-type CutSource = "beats" | "every_n" | "bars" | "stem" | "sections";
+type CutSource = "beats" | "every_n" | "bars" | "stem" | "sections" | "adaptive";
 
 type Settings = Pick<
   MusicEditSettings,
@@ -60,6 +60,12 @@ type Settings = Pick<
   sectionQuiet: number; // beats per cut in quiet sections (1,2,4,8)
   sectionMedium: number;
   sectionLoud: number;
+  // --- Adaptive ("Follow rhythm") ------------------------------------------
+  adaptMinBeats: 1 | 2 | 4 | 8; // fastest allowed beats per cut
+  adaptMaxBeats: 1 | 2 | 4 | 8; // slowest allowed beats per cut
+  adaptSmooth: number; // intensity smoothing window, seconds (0.5..8)
+  adaptContrast: number; // >1 exaggerates short/long swings (0.5..2)
+  adaptMaxClip: number; // hard cap on one clip in seconds; 0 = no cap
   // --- Intercut (parallel storylines) --------------------------------------
   mode: "flat" | "intercut";
   slotsPerSlice: number; // consecutive cut slots one storyline holds
@@ -84,7 +90,7 @@ const DEFAULT_SETTINGS: Settings = {
   fps: "auto",
   maxOutputHeight: 1080,
   aspect: "16:9",
-  cutSource: "stem",
+  cutSource: "adaptive",
   cutEvery: 2,
   barsMeter: 4,
   stemName: "Drums.wav",
@@ -96,6 +102,11 @@ const DEFAULT_SETTINGS: Settings = {
   sectionQuiet: 4,
   sectionMedium: 2,
   sectionLoud: 1,
+  adaptMinBeats: 1,
+  adaptMaxBeats: 8,
+  adaptSmooth: 3,
+  adaptContrast: 1,
+  adaptMaxClip: 0,
   mode: "flat",
   slotsPerSlice: 1,
   endOfMaterial: "loop",
@@ -161,7 +172,7 @@ const storageKey = (projectId: string) => `twio.musicEdit.${projectId}`;
 /** Bump when DEFAULT_SETTINGS change — blobs saved by an older version get
  *  the new defaults for keys still holding their OLD default (untouched);
  *  a deliberate pick is kept. */
-const SETTINGS_VERSION = 3;
+const SETTINGS_VERSION = 4;
 
 interface PersistedMusicEdit {
   /** Settings-schema version — absent on pre-v2 blobs. */
@@ -202,6 +213,9 @@ function loadPersisted(projectId: string): PersistedMusicEdit | null {
           settings.stemMinGapUnit = "sec";
         }
       }
+      // v<=3 -> v4: "stem" was the old default cut source — a saved "stem"
+      // is treated as untouched and adopts the new "adaptive" default.
+      if (savedSettings.cutSource === "stem") settings.cutSource = DEFAULT_SETTINGS.cutSource;
     }
     return {
       song: typeof p.song === "string" ? p.song : "",
@@ -536,6 +550,16 @@ export function MusicEdit({
               threshold: settings.stemThreshold,
             };
           }
+          break;
+        case "adaptive":
+          grid = {
+            source: "adaptive",
+            minBeats: settings.adaptMinBeats,
+            maxBeats: settings.adaptMaxBeats,
+            smoothSec: settings.adaptSmooth,
+            contrast: settings.adaptContrast,
+            ...(settings.adaptMaxClip > 0 ? { maxClipSec: settings.adaptMaxClip } : {}),
+          };
           break;
         case "sections":
           grid = settings.sectionAuto
@@ -1096,6 +1120,7 @@ export function MusicEdit({
                 }}
                 aria-label="Cut on"
               >
+                <option value="adaptive">Follow rhythm (adaptive)</option>
                 <option value="beats">Beats — every detected beat</option>
                 <option value="every_n">Every N beats</option>
                 <option value="bars">Bars (downbeats)</option>
@@ -1200,6 +1225,43 @@ export function MusicEdit({
                 {vizStemList.length === 0 && (
                   <p className="text-xs text-slate-500 self-end">No stems yet — upload or split one on the Visualizer page first.</p>
                 )}
+              </div>
+            )}
+
+            {settings.cutSource === "adaptive" && (
+              <div className="flex flex-wrap gap-4 text-sm">
+                <label className="space-y-1">
+                  <span className="text-slate-400">Fastest (beats/cut)</span>
+                  <select className="ui-input" value={settings.adaptMinBeats} onChange={(e) => set("adaptMinBeats", Number(e.target.value) as Settings["adaptMinBeats"])}>
+                    {[1, 2, 4, 8].map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400">Slowest (beats/cut)</span>
+                  <select className="ui-input" value={settings.adaptMaxBeats} onChange={(e) => set("adaptMaxBeats", Number(e.target.value) as Settings["adaptMaxBeats"])}>
+                    {[1, 2, 4, 8].map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400">Smoothing (s)</span>
+                  <NumberInput min={0.5} max={8} step={0.5} value={settings.adaptSmooth} onCommit={(v) => set("adaptSmooth", v)} />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400">Contrast (0.5–2)</span>
+                  <NumberInput min={0.5} max={2} step={0.1} value={settings.adaptContrast} onCommit={(v) => set("adaptContrast", v)} />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-400">Max clip (s, 0 = off)</span>
+                  <NumberInput min={0} max={30} step={0.5} value={settings.adaptMaxClip} onCommit={(v) => set("adaptMaxClip", v)} />
+                </label>
               </div>
             )}
 

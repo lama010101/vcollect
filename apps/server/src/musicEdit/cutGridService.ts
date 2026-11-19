@@ -19,12 +19,16 @@ import type { AnalyzedSong } from "./beatAnalysis.js";
 import { bandOnsetEnvelope, type OnsetBand } from "./beatAnalyzer.js";
 import {
   buildCutGrid,
+  energySectionsFromWindows,
   pickOnsetPeaks,
   segmentByEnergy,
+  windowedRmsSeries,
+  type AdaptiveFeatures,
   type BuiltCutGrid,
   type CutGridContext,
   type EnergySection,
   type OnsetPeak,
+  type RmsWindow,
 } from "./cutGrid.js";
 import { MusicEditError } from "./errors.js";
 
@@ -34,6 +38,7 @@ const GRID_HOP = 256;
 const GRID_CACHE_DIR = resolve(OUTPUT_ROOT, "cache", "cutgrid");
 const ONSET_CACHE_VERSION = 1;
 const SECTION_CACHE_VERSION = 1;
+const ADAPTIVE_CACHE_VERSION = 1;
 
 export interface ResolvedCutGrid extends BuiltCutGrid {
   source: CutGridSpec["source"];
@@ -131,6 +136,48 @@ async function songSections(songFile: string, sha256: string): Promise<EnergySec
   return sections;
 }
 
+interface AdaptiveCacheFile {
+  v: number;
+  sr: number;
+  hop: number;
+  env: number[];
+  windows: RmsWindow[];
+}
+
+/** Raw adaptive-grid features of the song — full-band onset envelope plus the
+ *  windowed-RMS series — cached by song content hash. Every mapping param
+ *  (minBeats/maxBeats/contrast/smoothSec/maxClipSec) is applied afterwards in
+ *  pure code, so tweaking them never re-decodes. */
+async function adaptiveFeatures(songFile: string, sha256: string): Promise<AdaptiveFeatures> {
+  const cachePath = join(GRID_CACHE_DIR, `adaptive-${sha256}-v${ADAPTIVE_CACHE_VERSION}.json`);
+  if (existsSync(cachePath)) {
+    try {
+      const c = JSON.parse(readFileSync(cachePath, "utf8")) as AdaptiveCacheFile;
+      if (c.v === ADAPTIVE_CACHE_VERSION && Array.isArray(c.env) && Array.isArray(c.windows) && c.windows.length > 0) {
+        return {
+          onsetEnv: Float32Array.from(c.env),
+          envSampleRate: c.sr || GRID_SAMPLE_RATE,
+          envHop: c.hop || GRID_HOP,
+          windows: c.windows,
+        };
+      }
+    } catch {
+      // Unreadable cache entry — recompute below.
+    }
+  }
+  const pcm = await decodeMonoPcm(songFile);
+  const env = bandOnsetEnvelope(pcm, GRID_SAMPLE_RATE, GRID_HOP, "full");
+  const windows = windowedRmsSeries(pcm, GRID_SAMPLE_RATE);
+  mkdirSync(GRID_CACHE_DIR, { recursive: true });
+  const roundedEnv = Array.from(env, (v) => Math.round(v * 1e5) / 1e5);
+  const roundedWins = windows.map((w) => ({ start: w.start, end: w.end, rms: Math.round(w.rms * 1e6) / 1e6 }));
+  writeFileSync(
+    cachePath,
+    JSON.stringify({ v: ADAPTIVE_CACHE_VERSION, sr: GRID_SAMPLE_RATE, hop: GRID_HOP, env: roundedEnv, windows: roundedWins } satisfies AdaptiveCacheFile),
+  );
+  return { onsetEnv: env, envSampleRate: GRID_SAMPLE_RATE, envHop: GRID_HOP, windows };
+}
+
 /** Resolve a grid spec into cut marks. `songFile` is the analysed song's
  *  path (needed to decode PCM for the sections grid); `song` carries the
  *  beat analysis every other source builds on. */
@@ -150,6 +197,12 @@ export async function resolveCutGrid(projectId: string, songFile: string, song: 
     ctx.onsetPeaks = await stemOnsetPeaks(path, spec.band, minGapSec, spec.threshold);
   } else if (spec.source === "sections") {
     ctx.sections = await songSections(songFile, song.sha256);
+  } else if (spec.source === "adaptive") {
+    const f = await adaptiveFeatures(songFile, song.sha256);
+    ctx.adaptive = f;
+    // Structural quiet<->loud hits reuse the same energy sections — derived
+    // from the cached RMS windows (no extra PCM decode).
+    ctx.sections = energySectionsFromWindows(f.windows, song.audio.durationSeconds);
   }
   return { ...buildCutGrid(spec, ctx), source: spec.source };
 }

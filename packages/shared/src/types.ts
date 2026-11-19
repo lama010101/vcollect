@@ -161,10 +161,10 @@ export interface BeatAnalysis {
   interval: { min: number; max: number; mean: number; stdDev: number };
 }
 
-export type EdlBoundaryKind = "audio_start" | "beat" | "bar" | "stem_onset" | "section" | "manual_grid" | "audio_end";
+export type EdlBoundaryKind = "audio_start" | "beat" | "bar" | "stem_onset" | "section" | "adaptive" | "manual_grid" | "audio_end";
 
 /** Where an EDL's inner cut marks came from (cut-grid feature). */
-export type CutGridSource = "beats" | "every_n_beats" | "bars" | "stem_onsets" | "sections";
+export type CutGridSource = "beats" | "every_n_beats" | "bars" | "stem_onsets" | "sections" | "adaptive";
 
 /** One precomputed inner cut mark handed to the EDL planner. */
 export interface CutMark {

@@ -1,9 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { cutGridSchema, musicEditPlanSchema, musicEditSettingsSchema, type BeatPoint, type MusicEditSettings } from "@twio/shared";
+import { cutGridSchema, musicEditPlanSchema, musicEditSettingsSchema, type BeatPoint, type CutGridSpec, type MusicEditSettings } from "@twio/shared";
 import { cutBoundaries, planEdit, type PlanSource } from "../src/musicEdit/edl.ts";
 import { bandOnsetEnvelope } from "../src/musicEdit/beatAnalyzer.ts";
 import {
+  adaptiveMarks,
   barsMarks,
   buildCutGrid,
   everyNBeatsMarks,
@@ -401,5 +402,192 @@ describe("cut grid — request schema", () => {
     assert.throws(() => musicEditPlanSchema.parse({ song: "a", assetIds: ["v"], grid: { source: "nope" } }));
     assert.throws(() => musicEditPlanSchema.parse({ song: "a", assetIds: ["v"], grid: { source: "stem_onsets", stem: "x", minGap: 99 } }));
     assert.throws(() => musicEditPlanSchema.parse({ song: "a", assetIds: ["v"], grid: { source: "bars", beatsPerBar: 5 as never } }));
+  });
+});
+
+
+// --- Adaptive ("Follow rhythm") -------------------------------------------------
+// Synthetic 24 s song: quiet sparse/low clicks (0–8 s) -> loud dense/loud
+// clicks (8–16 s) -> quiet again (16–24 s). Beats every 0.4 s.
+
+const ADAPT_DURATION = 24;
+const ADAPT_BEATS = beatPoints(Array.from({ length: 60 }, (_, i) => 0.2 + i * 0.4), 0.5);
+const ADAPT_SPEC = (o: Record<string, unknown> = {}) =>
+  cutGridSchema.parse({ source: "adaptive", ...o }) as Extract<CutGridSpec, { source: "adaptive" }>;
+
+function adaptWindows(rmsAt: (t: number) => number) {
+  const out: Array<{ start: number; end: number; rms: number }> = [];
+  for (let s = 0; s < ADAPT_DURATION - 0.25; s += 0.25) {
+    const end = Math.min(s + 0.5, ADAPT_DURATION);
+    out.push({ start: s, end, rms: rmsAt((s + end) / 2) });
+  }
+  return out;
+}
+
+/** Sparse impulse train as a frame-rate onset envelope — each impulse is a
+ *  single-frame local maximum, exactly what pickOnsetPeaks detects. */
+function adaptEnv(onsets: Array<{ t: number; amp: number }>): Float32Array {
+  const n = Math.ceil((ADAPT_DURATION * 22050) / 256);
+  const env = new Float32Array(n);
+  for (const o of onsets) {
+    const i = Math.round((o.t * 22050) / 256);
+    if (i > 0 && i < n - 1) env[i] = o.amp;
+  }
+  return env;
+}
+
+const LOUD = (t: number) => (t >= 8 && t < 16 ? 1 : 0);
+
+const adaptCtx = (over: Partial<CutGridContext> = {}): CutGridContext => ({
+  beats: ADAPT_BEATS,
+  audioDuration: ADAPT_DURATION,
+  adaptive: {
+    onsetEnv: adaptEnv([
+      // quiet sections: sparse, weak onsets (~1.25/s, amp 0.3)
+      ...Array.from({ length: 20 }, (_, i) => ({ t: 0.4 + i * 0.8, amp: 0.3 })),
+      ...Array.from({ length: 10 }, (_, i) => ({ t: 16.4 + i * 0.8, amp: 0.3 })),
+      // loud section: dense, strong onsets (~3.3/s, amp 1.0)
+      ...Array.from({ length: 27 }, (_, i) => ({ t: 8.1 + i * 0.3, amp: 1.0 })),
+    ]),
+    envSampleRate: 22050,
+    envHop: 256,
+    windows: adaptWindows((t) => (LOUD(t) ? 0.5 : 0.05)),
+  },
+  sections: [
+    { start: 0, end: 8, energy: 0.1, cls: "quiet" },
+    { start: 8, end: 16, energy: 1.0, cls: "loud" },
+    { start: 16, end: ADAPT_DURATION, energy: 0.1, cls: "quiet" },
+  ],
+  ...over,
+});
+
+const median = (xs: number[]): number => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s.length ? s[Math.floor(s.length / 2)]! : 0;
+};
+
+/** Clip durations (s) between consecutive boundaries, bucketed by the section
+ *  the clip STARTS in — mirrors how a viewer perceives the cut pace. */
+function clipDurationsBySection(marks: Array<{ time: number }>): { quiet: number[]; loud: number[] } {
+  const times = [0, ...marks.map((m) => m.time), ADAPT_DURATION];
+  const out = { quiet: [] as number[], loud: [] as number[] };
+  for (let i = 1; i < times.length; i++) {
+    const d = times[i]! - times[i - 1]!;
+    (LOUD(times[i - 1]!) ? out.loud : out.quiet).push(d);
+  }
+  return out;
+}
+
+describe("cut grid — adaptive (follow rhythm)", () => {
+  it("cuts shorter in loud parts than quiet parts", () => {
+    const { marks } = adaptiveMarks(adaptCtx(), ADAPT_SPEC());
+    const { quiet, loud } = clipDurationsBySection(marks);
+    assert.ok(quiet.length >= 4 && loud.length >= 4, "need clips in both sections (q=" + quiet.length + " l=" + loud.length + ")");
+    const mq = median(quiet);
+    const ml = median(loud);
+    assert.ok(ml <= mq / 2, "loud median " + ml.toFixed(2) + "s should be <= half quiet median " + mq.toFixed(2) + "s");
+  });
+
+  it("ramp is smooth: consecutive rung indices differ by at most 1", () => {
+    const { rungIdx } = adaptiveMarks(adaptCtx(), ADAPT_SPEC());
+    assert.ok(rungIdx.length > 4);
+    for (let i = 1; i < rungIdx.length; i++) {
+      assert.ok(Math.abs(rungIdx[i]! - rungIdx[i - 1]!) <= 1, "rung jump " + rungIdx[i - 1] + " -> " + rungIdx[i] + " at cut " + i);
+    }
+  });
+
+  it("every mark lands on a detected beat and times are strictly increasing", () => {
+    const { marks } = adaptiveMarks(adaptCtx(), ADAPT_SPEC());
+    const beatTimes = new Set(ADAPT_BEATS.map((b) => b.time));
+    for (let i = 0; i < marks.length; i++) {
+      assert.ok(beatTimes.has(marks[i]!.time), "mark " + i + " at " + marks[i]!.time + " is not a beat");
+      assert.equal(marks[i]!.kind, "adaptive");
+      if (i > 0) assert.ok(marks[i]!.time > marks[i - 1]!.time);
+    }
+  });
+
+  it("flat/steady song holds a near-constant clip length (flat guard)", () => {
+    const flatEnv = adaptEnv(Array.from({ length: 60 }, (_, i) => ({ t: 0.2 + i * 0.4, amp: 0.5 })));
+    const ctx = adaptCtx({
+      adaptive: {
+        onsetEnv: flatEnv,
+        envSampleRate: 22050,
+        envHop: 256,
+        windows: adaptWindows(() => 0.2),
+      },
+      sections: [{ start: 0, end: ADAPT_DURATION, energy: 0.5, cls: "medium" }],
+    });
+    const { marks } = adaptiveMarks(ctx, ADAPT_SPEC());
+    const diffs = marks.slice(1).map((m, i) => m.time - marks[i]!.time);
+    assert.ok(diffs.length > 4);
+    for (const d of diffs) assert.ok(Math.abs(d - diffs[0]!) < 1e-6, "clip lengths vary: " + diffs.join(","));
+  });
+
+  it("is deterministic — same input produces identical marks", () => {
+    const a = adaptiveMarks(adaptCtx(), ADAPT_SPEC());
+    const b = adaptiveMarks(adaptCtx(), ADAPT_SPEC());
+    assert.deepEqual(a.marks, b.marks);
+    assert.deepEqual(a.rungIdx, b.rungIdx);
+  });
+
+  it("respects minBeats/maxBeats and maxClipSec", () => {
+    const narrow = adaptiveMarks(adaptCtx(), ADAPT_SPEC({ minBeats: 4, maxBeats: 8 }));
+    for (let i = 1; i < narrow.marks.length; i++) {
+      const span = narrow.marks[i]!.beat! - narrow.marks[i - 1]!.beat!;
+      // ±1 beat tolerance for the phrase/bar alignment nudge.
+      assert.ok(span >= 3 && span <= 9, "span " + span + " outside [3,9]");
+    }
+    const capped = adaptiveMarks(adaptCtx(), ADAPT_SPEC({ maxClipSec: 1.0 }));
+    for (let i = 1; i < capped.marks.length; i++) {
+      const d = capped.marks[i]!.time - capped.marks[i - 1]!.time;
+      assert.ok(d <= 1.0 + 1e-6, "clip " + d.toFixed(2) + "s exceeds maxClipSec");
+      assert.ok(d >= 0.3 - 1e-6, "clip " + d.toFixed(2) + "s below 0.3s floor");
+    }
+  });
+
+  it("buildCutGrid labels it 'Follow rhythm' with a stats detail string", () => {
+    const g = buildCutGrid(ADAPT_SPEC(), adaptCtx());
+    assert.equal(g.label, "Follow rhythm");
+    assert.match(g.detail ?? "", /beats per cut · \d+ cuts · shortest [\d.]+s \/ longest [\d.]+s/);
+    assert.ok(g.marks.every((m) => m.kind === "adaptive"));
+  });
+
+  it("planEdit consumes adaptive marks — varying durations, valid EDL", () => {
+    const { marks } = adaptiveMarks(adaptCtx(), ADAPT_SPEC());
+    const p = planEdit({
+      beatTimes: ADAPT_BEATS.map((b) => b.time),
+      bpm: 150,
+      audioDuration: ADAPT_DURATION,
+      sources: [src("a", 60), src("b", 60)],
+      settings: settings(),
+      cutMarks: marks,
+      grid: { source: "adaptive", label: "Follow rhythm" },
+    });
+    assert.equal(p.timing, "cut_grid");
+    assert.equal(p.grid?.source, "adaptive");
+    const durs = new Set(p.entries.map((e) => e.outputDuration));
+    assert.ok(durs.size > 3, "expected varying clip durations, got " + durs.size + " distinct");
+    for (let i = 1; i < p.entries.length; i++) {
+      assert.equal(p.entries[i]!.frameStart, p.entries[i - 1]!.frameEnd);
+    }
+  });
+});
+
+describe("cut grid — adaptive schema", () => {
+  it("defaults parse, min>max rejected, bounds enforced", () => {
+    const d = cutGridSchema.parse({ source: "adaptive" });
+    assert.equal(d.source, "adaptive");
+    if (d.source === "adaptive") {
+      assert.equal(d.minBeats, 1);
+      assert.equal(d.maxBeats, 8);
+      assert.equal(d.smoothSec, 3);
+      assert.equal(d.contrast, 1);
+      assert.equal(d.maxClipSec, undefined);
+    }
+    assert.throws(() => cutGridSchema.parse({ source: "adaptive", minBeats: 8, maxBeats: 1 }));
+    assert.throws(() => cutGridSchema.parse({ source: "adaptive", smoothSec: 0.1 }));
+    assert.throws(() => cutGridSchema.parse({ source: "adaptive", contrast: 3 }));
+    assert.throws(() => cutGridSchema.parse({ source: "adaptive", maxClipSec: 0.1 }));
+    assert.throws(() => musicEditPlanSchema.parse({ song: "a", assetIds: ["v"], grid: { source: "adaptive", minBeats: 8, maxBeats: 4 } }));
   });
 });
