@@ -142,7 +142,12 @@ export async function resolveCutGrid(projectId: string, songFile: string, song: 
   if (spec.source === "stem_onsets") {
     // stemPath throws 404 STEM_NOT_FOUND when the name isn't in the pool.
     const path = stemPath(projectId, spec.stem);
-    ctx.onsetPeaks = await stemOnsetPeaks(path, spec.band, spec.minGap, spec.threshold);
+    // minGapBeats (the UI "N beats" unit) resolves against the mean
+    // inter-beat interval; plain minGap stays seconds.
+    const meanBeat = song.analysis.interval?.mean;
+    const beatSec = typeof meanBeat === "number" && meanBeat > 0 ? meanBeat : 60 / Math.max(1, song.analysis.bpm);
+    const minGapSec = spec.minGapBeats != null ? spec.minGapBeats * beatSec : spec.minGap;
+    ctx.onsetPeaks = await stemOnsetPeaks(path, spec.band, minGapSec, spec.threshold);
   } else if (spec.source === "sections") {
     ctx.sections = await songSections(songFile, song.sha256);
   }

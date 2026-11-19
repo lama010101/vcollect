@@ -190,6 +190,9 @@ export const cutGridSchema = z.discriminatedUnion("source", [
     stem: z.string().min(1).max(255),
     band: z.enum(["full", "kick", "snare_hat"]).default("full"),
     minGap: z.number().min(0.05).max(2).default(0.25),
+    // Beats-unit alternative to minGap (the UI "N beats" unit): resolved
+    // server-side against the detected beat spacing; takes precedence.
+    minGapBeats: z.number().min(0.1).max(64).optional(),
     threshold: z.number().min(0).max(1).default(0.12),
   }),
   // Energy-section-aware density: the song is segmented by RMS energy and

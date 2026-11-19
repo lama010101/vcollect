@@ -40,10 +40,12 @@ type Settings = Pick<
   | "maxSlowDown"
   | "allowExtremeRetime"
   | "loopSource"
-  | "fps"
   | "maxOutputHeight"
   | "aspect"
 > & {
+  // "auto" resolves to the sources' frame rate when they all match (e.g.
+  // every clip 24 fps), else 30 — resolved to a concrete number in `request`.
+  fps: number | "auto";
   manualBpm: number | undefined;
   // --- Cut grid (only used while autoBeats is on) -------------------------
   cutSource: CutSource;
@@ -51,7 +53,8 @@ type Settings = Pick<
   barsMeter: 3 | 4; // bars: beats per bar
   stemName: string; // stem: file name in the visualizer stem pool
   stemBand: "full" | "kick" | "snare_hat";
-  stemMinGap: number; // seconds between stem-hit cuts
+  stemMinGap: number; // value of the min-gap setting
+  stemMinGapUnit: "sec" | "beats"; // unit stemMinGap is expressed in
   stemThreshold: number; // 0..1 relative onset threshold
   sectionAuto: boolean; // sections: auto density vs per-class overrides
   sectionQuiet: number; // beats per cut in quiet sections (1,2,4,8)
@@ -78,15 +81,16 @@ const DEFAULT_SETTINGS: Settings = {
   maxSlowDown: 0.8,
   allowExtremeRetime: false,
   loopSource: false,
-  fps: 30,
+  fps: "auto",
   maxOutputHeight: 1080,
   aspect: "16:9",
-  cutSource: "every_n",
+  cutSource: "stem",
   cutEvery: 2,
   barsMeter: 4,
-  stemName: "",
+  stemName: "Drums.wav",
   stemBand: "full",
-  stemMinGap: 0.25,
+  stemMinGap: 2,
+  stemMinGapUnit: "beats",
   stemThreshold: 0.12,
   sectionAuto: true,
   sectionQuiet: 4,
@@ -117,13 +121,51 @@ const EDL_PREVIEW_ROWS = 300;
 const boundaryLabel = (kind: EdlBoundaryKind): string =>
   kind === "audio_start" ? "start" : kind === "audio_end" ? "end" : kind === "manual_grid" ? "grid" : kind;
 
+/** Preferred stem for the "Stem hits" grid — exact "Drums.wav" first, then
+ *  any WAV whose name smells like drums, then kick/perc, then the first WAV;
+ *  MP3s only when the pool has no WAV at all. */
+function defaultStemName(stems: VizStem[]): string {
+  const wavs = stems.filter((x) => x.name.toLowerCase().endsWith(".wav"));
+  const pool = wavs.length > 0 ? wavs : stems;
+  return (
+    pool.find((x) => x.name.toLowerCase() === "drums.wav")?.name ??
+    pool.find((x) => /drum/i.test(x.name))?.name ??
+    pool.find((x) => /kick|perc/i.test(x.name))?.name ??
+    pool[0]?.name ??
+    ""
+  );
+}
+
+/** fps:"auto" resolution — the sources' shared frame rate when every clip
+ *  agrees (23.976 ≈ 24, 29.97 ≈ 30), else the 30 fps default. */
+function autoSourceFps(sources: Asset[]): number {
+  if (sources.length === 0) return 30;
+  const rates: number[] = [];
+  for (const a of sources) {
+    const f = a.fps;
+    if (typeof f !== "number" || !Number.isFinite(f) || f <= 0) return 30;
+    rates.push(f);
+  }
+  const first = rates[0]!;
+  if (!rates.every((f) => Math.abs(f - first) < 0.6)) return 30;
+  const rounded = Math.round(first);
+  return rounded >= 12 && rounded <= 60 ? rounded : 30;
+}
+
 // --- Per-project session persistence ------------------------------------------
 // All Music Edit work (song choice, clip order, settings, analysis, built EDL,
 // active render job) is stored in localStorage so a refresh loses nothing.
 
 const storageKey = (projectId: string) => `twio.musicEdit.${projectId}`;
 
+/** Bump when DEFAULT_SETTINGS change — blobs saved by an older version get
+ *  the new defaults for keys still holding their OLD default (untouched);
+ *  a deliberate pick is kept. */
+const SETTINGS_VERSION = 3;
+
 interface PersistedMusicEdit {
+  /** Settings-schema version — absent on pre-v2 blobs. */
+  v?: number;
   song: string;
   orderAssets: Asset[];
   settings: Settings;
@@ -141,10 +183,30 @@ function loadPersisted(projectId: string): PersistedMusicEdit | null {
     const raw = localStorage.getItem(storageKey(projectId));
     if (!raw) return null;
     const p = JSON.parse(raw) as Partial<PersistedMusicEdit>;
+    const savedSettings = (typeof p.settings === "object" && p.settings ? p.settings : {}) as Partial<Settings>;
+    const settings: Settings = { ...DEFAULT_SETTINGS, ...savedSettings };
+    if (p.v !== SETTINGS_VERSION) {
+      // v1 → v2: a key still holding its OLD default is treated as untouched
+      // and adopts the new default; deliberate picks are kept.
+      if (savedSettings.cutSource === "every_n") settings.cutSource = DEFAULT_SETTINGS.cutSource;
+      if (savedSettings.stemName === "") settings.stemName = DEFAULT_SETTINGS.stemName;
+      if (savedSettings.fps === 30) settings.fps = DEFAULT_SETTINGS.fps;
+      // v<=2 -> v3: stemMinGap gained a unit — legacy values were seconds,
+      // so they stay "sec" unless the untouched 0.25 s default, which
+      // becomes the new 2-beats default.
+      if (savedSettings.stemMinGapUnit === undefined) {
+        if (savedSettings.stemMinGap === undefined || savedSettings.stemMinGap === 0.25) {
+          settings.stemMinGap = DEFAULT_SETTINGS.stemMinGap;
+          settings.stemMinGapUnit = DEFAULT_SETTINGS.stemMinGapUnit;
+        } else {
+          settings.stemMinGapUnit = "sec";
+        }
+      }
+    }
     return {
       song: typeof p.song === "string" ? p.song : "",
       orderAssets: Array.isArray(p.orderAssets) ? (p.orderAssets as Asset[]) : [],
-      settings: { ...DEFAULT_SETTINGS, ...(typeof p.settings === "object" && p.settings ? p.settings : {}) },
+      settings,
       analysis: p.analysis ?? null,
       plan: p.plan ?? null,
       planKey: typeof p.planKey === "string" ? p.planKey : null,
@@ -332,6 +394,7 @@ export function MusicEdit({
       plan,
       planKey: planKeyRef.current,
       jobId: job?.id ?? null,
+      v: SETTINGS_VERSION,
     };
     try {
       localStorage.setItem(storageKey(projectId), JSON.stringify(payload));
@@ -412,6 +475,19 @@ export function MusicEdit({
     };
   }, [projectId]);
 
+  // "Stem hits" is the default cut source — once the pool loads, fill an
+  // empty or stale stem selection with the preferred default (Drums.wav,
+  // WAV over MP3). A stem still present in the pool is never overridden.
+  useEffect(() => {
+    if (vizStemList.length === 0) return;
+    setSettings((s) => {
+      if (s.cutSource !== "stem") return s;
+      if (s.stemName !== "" && vizStemList.some((x) => x.name === s.stemName)) return s;
+      const pick = defaultStemName(vizStemList);
+      return pick !== "" && pick !== s.stemName ? { ...s, stemName: pick } : s;
+    });
+  }, [vizStemList]);
+
   // Poll the active render.
   useEffect(() => {
     if (!job || job.status !== "running") return;
@@ -453,7 +529,10 @@ export function MusicEdit({
               source: "stem_onsets",
               stem: settings.stemName,
               band: settings.stemBand,
-              minGap: settings.stemMinGap,
+              // "beats" unit rides in minGapBeats (the server resolves it
+              // against the detected beat spacing); minGap stays seconds.
+              minGap: settings.stemMinGapUnit === "sec" ? settings.stemMinGap : 0.25,
+              ...(settings.stemMinGapUnit === "beats" ? { minGapBeats: settings.stemMinGap } : {}),
               threshold: settings.stemThreshold,
             };
           }
@@ -493,7 +572,7 @@ export function MusicEdit({
     return {
       song,
       assetIds: order.map((a) => a.id),
-      settings: { ...settings, manualBpm: settings.autoBeats ? undefined : settings.manualBpm },
+      settings: { ...settings, fps: settings.fps === "auto" ? autoSourceFps(order) : settings.fps, manualBpm: settings.autoBeats ? undefined : settings.manualBpm },
       grid,
       intercut,
     };
@@ -1005,7 +1084,16 @@ export function MusicEdit({
               <select
                 className="ui-input"
                 value={settings.cutSource}
-                onChange={(e) => set("cutSource", e.target.value as CutSource)}
+                onChange={(e) => {
+                  const v = e.target.value as CutSource;
+                  set("cutSource", v);
+                  // Switching to "Stem hits" with nothing selected — prefill
+                  // the preferred stem so the grid isn't dead on arrival.
+                  if (v === "stem" && !settings.stemName) {
+                    const pick = defaultStemName(vizStemList);
+                    if (pick) set("stemName", pick);
+                  }
+                }}
                 aria-label="Cut on"
               >
                 <option value="beats">Beats — every detected beat</option>
@@ -1080,8 +1168,30 @@ export function MusicEdit({
                   </select>
                 </label>
                 <label className="space-y-1">
-                  <span className="text-slate-400">Min gap (s)</span>
-                  <NumberInput min={0.05} max={2} step={0.05} value={settings.stemMinGap} onCommit={(v) => set("stemMinGap", v)} />
+                  <span className="text-slate-400">Min gap</span>
+                  <span className="flex items-center gap-1">
+                    <span className="flex-1">
+                      <NumberInput
+                        min={settings.stemMinGapUnit === "sec" ? 0.05 : 0.5}
+                        max={settings.stemMinGapUnit === "sec" ? 2 : 16}
+                        step={settings.stemMinGapUnit === "sec" ? 0.05 : 0.5}
+                        value={settings.stemMinGap}
+                        onCommit={(v) => set("stemMinGap", v)}
+                      />
+                    </span>
+                    <select
+                      className="ui-input !w-auto"
+                      value={settings.stemMinGapUnit}
+                      onChange={(e) => set("stemMinGapUnit", e.target.value as "sec" | "beats")}
+                      aria-label="Min gap unit"
+                    >
+                      <option value="sec">s</option>
+                      <option value="beats">beats</option>
+                    </select>
+                  </span>
+                  {settings.stemMinGapUnit === "beats" && analysis && analysis.bpm > 0 && (
+                    <span className="block text-[10px] text-slate-500">≈ {(settings.stemMinGap * 60 / analysis.bpm).toFixed(2)} s</span>
+                  )}
                 </label>
                 <label className="space-y-1">
                   <span className="text-slate-400">Threshold (0–1)</span>
@@ -1175,13 +1285,22 @@ export function MusicEdit({
           </label>
           <label className="space-y-1">
             <span className="text-slate-400">FPS</span>
-            <select className="ui-input w-full" value={settings.fps} onChange={(e) => set("fps", Number(e.target.value))}>
+            <select
+              className="ui-input w-full"
+              value={settings.fps}
+              onChange={(e) => set("fps", e.target.value === "auto" ? "auto" : Number(e.target.value))}
+              title="Auto uses the sources' frame rate when they all match (e.g. all 24 fps), else 30"
+            >
+              <option value="auto">Auto — match sources</option>
               {[24, 25, 30, 50, 60].map((f) => (
                 <option key={f} value={f}>
                   {f}
                 </option>
               ))}
             </select>
+            {settings.fps === "auto" && order.length > 0 && (
+              <span className="block text-[10px] text-slate-500">→ {autoSourceFps(order)} fps</span>
+            )}
           </label>
         </div>
         <div className="flex flex-wrap gap-6 text-sm">

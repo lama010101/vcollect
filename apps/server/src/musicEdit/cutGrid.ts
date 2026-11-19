@@ -304,7 +304,7 @@ export function buildCutGrid(spec: CutGridSpec, ctx: CutGridContext): BuiltCutGr
         .filter((p) => p.time < ctx.audioDuration)
         .map((p) => ({ time: p.time, beat: null, kind: "stem_onset" as EdlBoundaryKind }));
       label = `Stem hits · ${spec.stem}`;
-      detail = `${BAND_LABEL[spec.band] ?? spec.band} · ≥${spec.minGap}s apart · threshold ${spec.threshold}`;
+      detail = `${BAND_LABEL[spec.band] ?? spec.band} · ≥${spec.minGapBeats != null ? `${spec.minGapBeats} beats` : `${spec.minGap}s`} apart · threshold ${spec.threshold}`;
       break;
     }
     case "sections": {
