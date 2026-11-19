@@ -16,7 +16,7 @@ import fastifyCors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { config, OUTPUT_ROOT } from "./config.js";
+import { config, isActiveContentFile, OUTPUT_ROOT } from "./config.js";
 import { ffmpegService } from "./video/ffmpeg.js";
 import { migrate } from "./db/migrate.js";
 import { registerMusicEditRoutes } from "./routes/musicEdit.js";
@@ -64,6 +64,15 @@ export async function buildServer() {
     root: OUTPUT_ROOT,
     prefix: "/files/",
     decorateReply: false,
+    setHeaders: (res, path) => {
+      // Never let the browser second-guess a declared type, and sandbox any
+      // file type that can run script when opened top-level (a stray .html or
+      // .svg under output/ must not execute on the API origin).
+      res.header("X-Content-Type-Options", "nosniff");
+      if (isActiveContentFile(path)) {
+        res.header("Content-Security-Policy", "sandbox");
+      }
+    },
   });
 
   // --- Music edit (beat-aligned music-video editor) ---------------------------

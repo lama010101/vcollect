@@ -10,7 +10,7 @@
 // project it aggregates every project's assets and tags each with its project.
 // =============================================================================
 
-import { exec } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { basename, dirname, resolve } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { OUTPUT_ROOT, projectPaths, type ProjectPaths } from "../config.js";
@@ -253,31 +253,36 @@ export function revealInExplorer(absolutePath: string): { ok: boolean; error?: s
   }
   const isDir = statSync(absolutePath).isDirectory();
   const platform = process.platform;
+  // execFile (no shell) — the path travels as a discrete argv entry, never
+  // interpolated into a command string, so filenames cannot inject shell
+  // metacharacters on any platform.
+  const onDone = (err: ExecFileException | null): void => {
+    // explorer.exe exits 1 even on success — only real spawn failures matter.
+    if (err && !(platform === "win32" && err.code === 1)) {
+      console.error(`[reveal] failed: ${err.message}`);
+    }
+  };
   if (platform === "win32") {
     // explorer.exe is not always on PATH when spawned from Node; resolve it
     // from %SystemRoot% (typically C:\Windows). Use backslashes for the path.
     const winPath = absolutePath.replace(/\//g, "\\");
     const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
     const explorer = `${systemRoot}\\explorer.exe`;
-    // explorer.exe returns exit code 1 even on success, so don't treat a
-    // non-zero code as failure — only surface spawn errors.
-    exec(isDir ? `"${explorer}" "${winPath}"` : `"${explorer}" /select,"${winPath}"`, (err) => {
-      if (err) console.error(`[reveal] failed: ${err.message}`);
-    });
+    execFile(explorer, isDir ? [winPath] : ["/select,", winPath], onDone);
     return { ok: true };
   } else if (platform === "darwin") {
-    exec(isDir ? `open "${absolutePath}"` : `open -R "${absolutePath}"`, (err) => {
-      if (err) console.error(`[reveal] failed: ${err.message}`);
-    });
+    execFile("open", isDir ? [absolutePath] : ["-R", absolutePath], onDone);
     return { ok: true };
   } else {
     // Linux: open the dir itself, or the containing dir for a file.
-    exec(`xdg-open "${isDir ? absolutePath : dirname(absolutePath)}"`, (err) => {
-      if (err) console.error(`[reveal] failed: ${err.message}`);
-    });
+    execFile("xdg-open", [isDir ? absolutePath : dirname(absolutePath)], onDone);
     return { ok: true };
   }
 }
+
+/** Resolve a local_path (relative to OUTPUT_ROOT) to an absolute filesystem path.
+ * local_path is relative to OUTPUT_ROOT (e.g. "<query>/PEXELS_123.mp4").
+ */
 
 /** Resolve a local_path (relative to OUTPUT_ROOT) to an absolute filesystem path.
  * local_path is relative to OUTPUT_ROOT (e.g. "<query>/PEXELS_123.mp4").

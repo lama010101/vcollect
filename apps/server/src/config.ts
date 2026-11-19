@@ -76,6 +76,15 @@ export const AUDIO_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
   ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus",
 ]);
 
+/** File extensions that can execute script when opened as a top-level
+ *  document (SVG, HTML, XML+XSLT, MHTML). Served files with these types get a
+ *  Content-Security-Policy: sandbox header so a planted file can't run JS on
+ *  the API origin. */
+const ACTIVE_CONTENT_RE = /\.(?:svg|x?html?|xht|xml|mhtml?)$/i;
+export function isActiveContentFile(path: string): boolean {
+  return ACTIVE_CONTENT_RE.test(path);
+}
+
 /** Content-Type for a stored asset file, derived from its extension. Falls
  *  back to octet-stream so unknown types still download instead of 500ing. */
 export function mediaMimeForFile(filename: string): string {

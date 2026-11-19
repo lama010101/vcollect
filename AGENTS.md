@@ -346,7 +346,9 @@
   **The server boots fine without Python** — engine features just report
   `ENGINE_UNAVAILABLE`/`ENGINE_DISABLED` (`TWIO_ENGINE_DISABLED=1`).
   Routes: `GET /api/engine/status`, `POST /api/engine/setup` (kicks
-  background provisioning), `POST /api/engine/call` (raw RPC diagnostics).
+  background provisioning), `POST /api/engine/call` (diagnostics — method
+  whitelist + all paths confined to OUTPUT_ROOT; ffmpeg/models are
+  server-chosen).
   `visualizer/features.ts` is the consumer: sha256-cached per-stem librosa
   features (tempo, onsets, 6-band envelopes, beats) under
   `OUTPUT_ROOT/cache/engine/`. The built-in TS beat tracker remains the

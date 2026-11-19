@@ -17,7 +17,7 @@ import type { FastifyInstance } from "fastify";
 import { basename, resolve } from "node:path";
 import { createReadStream, existsSync, renameSync, statSync, unlinkSync } from "node:fs";
 import sharp from "sharp";
-import { mediaMimeForFile, OUTPUT_ROOT, projectPaths, THUMBNAILS_DIR } from "../config.js";
+import { isActiveContentFile, mediaMimeForFile, OUTPUT_ROOT, projectPaths, THUMBNAILS_DIR } from "../config.js";
 import { THUMB_MAX_DIM } from "../video/thumbnails.js";
 import { copyAssetToProject } from "../db/assetCopy.js";
 import {
@@ -209,6 +209,10 @@ export async function registerAssetRoutes(app: FastifyInstance): Promise<void> {
     const abs = resolve(OUTPUT_ROOT, a.local_path);
     if (!existsSync(abs)) return reply.code(404).send({ error: "file missing" });
     reply.type(mediaMimeForFile(a.local_path));
+    reply.header("X-Content-Type-Options", "nosniff");
+    if (isActiveContentFile(a.local_path)) {
+      reply.header("Content-Security-Policy", "sandbox");
+    }
     return reply.send(createReadStream(abs));
   });
   // Legacy thumbs were written at source resolution (0.5–3 MB each) — far

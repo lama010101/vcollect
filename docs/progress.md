@@ -129,6 +129,80 @@ Last verified: `npm run typecheck` + server tests (105 incl. keying) ✅ (2026-1
 > Format: `### YYYY-MM-DD — short title` + bullets: what changed, files
 > touched, verification result.
 
+### 2026-11-19 — Security hardening: engine RPC lockdown, active-content sandbox, execFile reveal
+
+- **`POST /api/engine/call` is no longer a raw RPC passthrough.** Method
+  whitelist (`ping`, `sep_status`, `analyze_stem`, `key_video`,
+  `separate_stems` — `shutdown` excluded); every path param must resolve
+  inside `OUTPUT_ROOT`; `ffmpeg_path`/`models_dir` are always
+  server-chosen (client values dropped); scalar params clamped. Closes the
+  arbitrary-file-write / arbitrary-executable path through the Python
+  worker. File: `apps/server/src/routes/engine.ts` (+ `MODELS_DIR` now
+  exported from `visualizer/keying.ts`).
+- **Active-content sandboxing on file serving.** New
+  `isActiveContentFile()` in `config.ts` (svg/html/xhtml/xht/xml/mht);
+  `/files/` static mount (`index.ts`) now sends
+  `X-Content-Type-Options: nosniff` on every response and
+  `Content-Security-Policy: sandbox` on active types; same headers on
+  `GET /api/assets/:id/file` (`routes/assets.ts`). A planted .svg/.html
+  can no longer execute script on the API origin.
+- **`revealInExplorer` uses `execFile`** (`routes/folders.ts`) — paths
+  travel as argv entries, never interpolated into a shell command string;
+  removes the POSIX command-injection vector via crafted filenames. Also
+  stops logging explorer.exe's always-1 exit code as a failure.
+- **Docs:** AGENTS.md engine-route bullet updated to match.
+- **Verification:** `npm run typecheck` clean; server test suite green.
+### 2026-11-19 — Music Edit: Min gap unit — seconds or beats (default 2 beats)
+
+- **Stem-hits min gap** can now be expressed in seconds OR beats
+  (`MusicEdit.tsx`): the control is a value + `s`/`beats` unit picker
+  (sec 0.05–2 step 0.05, beats 0.5–16 step 0.5), default **2 beats**. In
+  beats mode a live `≈ N.NN s` hint shows the seconds equivalent from the
+  analyzed BPM.
+- **Wire format:** `cutGridSchema` stem_onsets gained optional
+  `minGapBeats`; the UI sends it (with `minGap` as the seconds field).
+  `cutGridService.resolveCutGrid` resolves beats → seconds via the song's
+  mean inter-beat interval (`analysis.interval.mean`, 60/BPM fallback);
+  `cutGrid.ts` detail text reads "≥N beats apart". Seconds-only callers
+  (CLI/tests) unchanged — `minGap` still wins when `minGapBeats` absent.
+- **Session migration:** `SETTINGS_VERSION=3` — pre-v3 blobs keep legacy
+  second values as `"sec"` unless untouched at the old 0.25 s default,
+  which becomes 2 beats.
+- **Verification:** `npm run typecheck` clean (shared + server + web).
+  Server files are CRLF — patch tooling must match `
+`.
+
+### 2026-11-19 — Favicon: W logo mark
+
+- Added `apps/web/public/favicon.svg` — the sidebar W logo recreated as
+  SVG (sky-500→violet-600 rounded tile + white W stroke) — and linked it
+  in `index.html` (`<link rel="icon" type="image/svg+xml">`). Vite serves
+  it at `/favicon.svg` in dev and copies it into `dist/` on build.
+- **Verification:** static asset only; typecheck unaffected.
+
+### 2026-11-19 — Music Edit: dance-cut defaults (stem hits · Drums.wav · auto fps)
+
+- **New defaults** (`MusicEdit.tsx` `DEFAULT_SETTINGS`): Cut on =
+  **Stem hits**, stem = **Drums.wav**, FPS = **Auto — match sources**.
+  Max speed-up 1.25× / slow-down 0.8×, 1080px / 16:9 were already the
+  defaults (schema + UI agree).
+- **Stem auto-pick.** Stems are per-project files, so a hardcoded name
+  can't be trusted: `defaultStemName()` prefers an exact `Drums.wav`,
+  then any WAV matching /drum/i, then /kick|perc/i, then the first WAV —
+  MP3s only when the pool has no WAV. An effect fills an empty/stale
+  `stemName` once the pool loads (never overrides a live pick), and the
+  Cut-on select prefills it when switching to Stem hits.
+- **FPS auto.** `Settings.fps` is now `number | "auto"`; the request
+  builder resolves it via `autoSourceFps(order)` — the shared source
+  frame rate when every clip agrees (23.976≈24, 29.97≈30, ±0.6 tolerance)
+  else 30. The FPS select shows "Auto — match sources" plus a live
+  "→ N fps" hint. Server schema unchanged (always receives a number).
+- **Session migration.** Persisted blobs gained `v` (`SETTINGS_VERSION=2`);
+  v1 sessions adopt the new defaults only for keys still holding their old
+  default (every_n / "" / 30) — deliberate picks survive.
+- **Verification:** `npm run typecheck` clean (shared + server + web).
+  Frontend-only change; no server/tests touched.
+
 ### 2026-11-19 — Music Edit: video ends when non-looped footage runs out
 
 - **End semantics.** The render now stops at whichever comes first: the end

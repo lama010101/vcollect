@@ -25,7 +25,7 @@ import { fileUrl } from "../musicEdit/service.js";
 import { VisualizerError } from "./errors.js";
 
 const KEYING_VERSION = 1; // bump when params↔output mapping changes
-const MODELS_DIR = resolve(OUTPUT_ROOT, "cache", "models");
+export const MODELS_DIR = resolve(OUTPUT_ROOT, "cache", "models");
 const KEYS_DIR = resolve(OUTPUT_ROOT, "cache", "keys");
 
 export interface KeyedVideoResult {
